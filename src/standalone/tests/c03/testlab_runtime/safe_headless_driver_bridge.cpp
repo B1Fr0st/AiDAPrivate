@@ -27,14 +27,6 @@ bool load_kernel_driver()
     return false;
 }
 
-void invalidate_kernel_session(const char*)
-{
-}
-
-void install_kernel_demote_kick_callback(kernel_demote_kick_callback_t)
-{
-}
-
 bool is_loaded()
 {
     return false;
@@ -244,11 +236,6 @@ bool read_kernel_memory(uint64_t, size_t, std::vector<uint8_t>& out)
 }
 
 bool write_kernel_memory(uint64_t, const std::vector<uint8_t>&)
-{
-    return false;
-}
-
-bool verify_cross_ring_evidence(const uint8_t*, uint32_t)
 {
     return false;
 }
@@ -619,171 +606,6 @@ bool spoof_debug_flags(uint32_t* result_flags)
     return false;
 }
 
-bool refresh_heartbeat()
-{
-    return false;
-}
-
-bool sentinel_bridge_ready()
-{
-    return false;
-}
-
-uint64_t sentinel_ready_since_tsc()
-{
-    return 0;
-}
-
-dynamic_ioctl_state_t dynamic_ioctl_state()
-{
-    return {};
-}
-
-bool dynamic_ioctls_ready()
-{
-    return false;
-}
-
-bool register_self_dll_protection(uint64_t, uint64_t, uint32_t, uint64_t, uint32_t)
-{
-    return false;
-}
-
-bool trigger_kernel_bsod(uint32_t, uint64_t)
-{
-    return false;
-}
-
-bool latch_targeting_from_usermode(uint32_t)
-{
-    return false;
-}
-
-bool tier_a_driver_present_query(bool* out_present, uint32_t* out_mask, uint64_t* out_first_base)
-{
-    if (out_present)
-        *out_present = false;
-    if (out_mask)
-        *out_mask = 0;
-    if (out_first_base)
-        *out_first_base = 0;
-    return false;
-}
-
-bool canary_register(void*, size_t)
-{
-    return false;
-}
-
-bool update_re_tool_hashes(const uint8_t*, uint32_t)
-{
-    return false;
-}
-
-bool update_werfault_hashes(const uint8_t*, uint32_t)
-{
-    return false;
-}
-
-bool update_ce_driver_hashes(const uint8_t*, uint32_t)
-{
-    return false;
-}
-
-bool kernel_anti_debug_query(anti_debug_result_t& out)
-{
-    out = {};
-    return false;
-}
-
-bool kernel_anti_debug_clear_dr(uint64_t* out_clear_count)
-{
-    if (out_clear_count)
-        *out_clear_count = 0;
-    return false;
-}
-
-bool kernel_anti_debug_clear_process_dr(uint32_t, uint64_t* out_clear_count)
-{
-    if (out_clear_count)
-        *out_clear_count = 0;
-    return false;
-}
-
-bool kernel_anti_debug_scan_debuggers(uint64_t* out_debugger_pid)
-{
-    if (out_debugger_pid)
-        *out_debugger_pid = 0;
-    return false;
-}
-
-bool kernel_anti_debug_scan_text(uint64_t, uint64_t, uint32_t, uint64_t* hit_rva)
-{
-    if (hit_rva)
-        *hit_rva = 0;
-    return false;
-}
-
-bool kernel_anti_debug_hide_all_threads(uint32_t)
-{
-    return false;
-}
-
-bool kernel_anti_dump_full(uint32_t)
-{
-    return false;
-}
-
-bool kernel_anti_dump_start_continuous(uint32_t)
-{
-    return false;
-}
-
-bool relay_server_token_v2(uint32_t, uint64_t, uint64_t* out_driver_proof)
-{
-    if (out_driver_proof)
-        *out_driver_proof = 0;
-    return false;
-}
-
-bool initiate_driver_handshake(uint8_t out_driver_challenge[32])
-{
-    if (out_driver_challenge)
-        std::fill_n(out_driver_challenge, 32, static_cast<uint8_t>(0));
-    return false;
-}
-
-bool complete_driver_challenge(const uint8_t[32])
-{
-    return false;
-}
-
-bool run_kernel_hv_detection(hv_kernel_detect_result_t& result)
-{
-    result = {};
-    return false;
-}
-
-bool kernel_read_prologue_hash(uint64_t, uint32_t, uint64_t& out_hash)
-{
-    out_hash = 0;
-    return false;
-}
-
-bool query_sentinel_dispatch_guard(uint8_t& hook_detected, uint64_t& hook_target)
-{
-    hook_detected = 0;
-    hook_target = 0;
-    return false;
-}
-
-bool query_sentinel_callback_scan(uint8_t& hostile_drivers, uint8_t& modified_callbacks)
-{
-    hostile_drivers = 0;
-    modified_callbacks = 0;
-    return false;
-}
-
 }
 
 namespace voyager {
@@ -1034,88 +856,15 @@ void device_t::disconnect() noexcept
     kernel_dtb_ = 0;
     shellcode_address_ = 0;
     spoof_gadget_ = 0;
-    session_key_ = 0;
-    server_seed_ = 0;
-    server_ioctl_seed_ = 0;
-    last_heartbeat_tsc_.store(0, std::memory_order_release);
-    last_bridge_whoswho_tsc_ = 0;
-    last_bridge_sentinel_tsc_ = 0;
-    first_sentinel_ready_tsc_ = 0;
     last_failed_tid_ = 0;
     last_hijacked_tid_ = 0;
     last_connect_error_ = 0;
-    last_heartbeat_error_.store(0, std::memory_order_release);
-    last_heartbeat_bytes_ = 0;
-    last_heartbeat_response_ = 0;
-    last_heartbeat_ioctl_code_ = 0;
-    last_heartbeat_magic_ = 0;
-    last_heartbeat_dioctl_result_ = FALSE;
-    last_heartbeat_base_ = 0;
-    last_heartbeat_key_hash_ = 0;
-    last_heartbeat_ioctl_seed_hash_ = 0;
-    last_heartbeat_server_seed_present_ = 0;
-    last_heartbeat_ioctl_seed_present_ = 0;
-    last_heartbeat_global_server_seed_present_ = 0;
-    last_heartbeat_global_ioctl_seed_present_ = 0;
-    last_heartbeat_offset_ = 0;
     inflight_capture_thread_.store(nullptr, std::memory_order_release);
     inflight_capture_cancel_pending_.store(false, std::memory_order_release);
     ntdll_base_ = 0;
     ntdll_size_ = 0;
-    server_token_relay_priority_request_.store(0, std::memory_order_release);
-    server_token_relay_priority_yields_observed_.store(0, std::memory_order_release);
-    last_acquiring_reader_tid_.store(0, std::memory_order_release);
-    last_acquiring_reader_ioctl_.store(0, std::memory_order_release);
-    last_acquiring_reader_tsc_.store(0, std::memory_order_release);
-    relay_v2_attempts_.store(0, std::memory_order_release);
-    relay_v2_commits_.store(0, std::memory_order_release);
-    relay_v2_writer_timeouts_.store(0, std::memory_order_release);
-    relay_v2_last_attempt_tick_.store(0, std::memory_order_release);
-    relay_v2_last_commit_tick_.store(0, std::memory_order_release);
-    relay_v2_last_writer_timeout_tick_.store(0, std::memory_order_release);
-    seed_rotation_writer_acquiring_.store(0, std::memory_order_release);
-    shared_send_request_inflight_count_.store(0, std::memory_order_release);
-    shared_lock_oldest_holder_tid_.store(0, std::memory_order_release);
-    shared_lock_oldest_holder_acquired_tsc_.store(0, std::memory_order_release);
-    session_pending_recovery_.store(0, std::memory_order_release);
-    session_pending_recovery_since_tick_.store(0, std::memory_order_release);
-    session_relay_cache_provider_.store(nullptr, std::memory_order_release);
     shellcode_pid_ = 0;
     shellcode_dtb_at_alloc_ = 0;
-}
-
-std::uint32_t device_t::compute_dynamic_key_snapshot() const noexcept
-{
-    return 0;
-}
-
-std::uint32_t device_t::compute_ioctl_base_snapshot() const noexcept
-{
-    return 0;
-}
-
-DWORD device_t::make_ioctl_snapshot(std::uint32_t) const noexcept
-{
-    return 0;
-}
-
-std::uint32_t device_t::heartbeat_magic_snapshot() const noexcept
-{
-    return 0;
-}
-
-void device_t::capture_heartbeat_security_snapshot(std::uint32_t, DWORD, std::uint32_t) const noexcept
-{
-    last_heartbeat_ioctl_code_ = 0;
-    last_heartbeat_magic_ = 0;
-    last_heartbeat_base_ = 0;
-    last_heartbeat_key_hash_ = 0;
-    last_heartbeat_ioctl_seed_hash_ = 0;
-    last_heartbeat_server_seed_present_ = 0;
-    last_heartbeat_ioctl_seed_present_ = 0;
-    last_heartbeat_global_server_seed_present_ = 0;
-    last_heartbeat_global_ioctl_seed_present_ = 0;
-    last_heartbeat_offset_ = 0;
 }
 
 }

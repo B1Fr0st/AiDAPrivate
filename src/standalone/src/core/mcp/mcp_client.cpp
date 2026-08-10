@@ -14,8 +14,6 @@
 #include "mcp_client.hpp"
 #include "auth_store.hpp"
 #include "event_bus.hpp"
-#include "anti-tamper/webhook.hpp"
-#include "../anti-tamper/mcp_posture.hpp"
 #include "../infra/executor.hpp"
 #include "../network/burp/camoufox_bridge.hpp"
 #include "../../helpers/diag_log.hpp"
@@ -242,7 +240,7 @@ static void set_global_last_error(const std::string& text)
 #if !defined(AIDA_C03_MCP_OAUTH_FIXTURE)
     if (!text.empty()) {
         const std::string line = std::string("[mcp.oauth] ") + text;
-        anti_tamper::webhook::write_log("mcp.oauth", line.c_str());
+        diag::log_tagged("mcp.oauth", line.c_str());
     }
 #endif
 }
@@ -722,12 +720,12 @@ static bool open_browser(const std::string& url)
     return oauth_fixture_runtime().browser_result;
 #else
     if (!aida::burp::camoufox::ensure_ready()) {
-        anti_tamper::webhook::write_log("mcp.oauth",
+        diag::log_tagged("mcp.oauth",
             "[mcp.oauth] Camoufox ensure_ready failed; refusing default-browser fallback");
         return false;
     }
     const bool opened = aida::burp::camoufox::navigate(url, "domcontentloaded", 45000);
-    anti_tamper::webhook::write_log("mcp.oauth",
+    diag::log_tagged("mcp.oauth",
         opened
             ? "[mcp.oauth] authorization_url opened in Camoufox"
             : "[mcp.oauth] Camoufox navigate failed; refusing default-browser fallback");
@@ -2824,22 +2822,6 @@ client_t& client_t::operator=(client_t&& o) noexcept
 
 bool client_t::connect(const server_config_t& cfg)
 {
-#if !defined(AIDA_C03_MCP_OAUTH_FIXTURE)
-    if (!anti_tamper::mcp_posture::is_runtime_trusted_server(cfg, true)) {
-        std::lock_guard<std::mutex> lk(_mtx);
-        scrub_sensitive_state_locked();
-        _cfg = cfg;
-        _state = connection_state_t::error;
-        _last_error = "MCP posture blocked this server";
-        diag::log_tagged_fmt("mcp",
-            "connect_blocked_mcp_posture name_hash=0x%016llX name_len=%zu transport=%d",
-            static_cast<unsigned long long>(mcp_log_hash(cfg.name)),
-            cfg.name.size(),
-            static_cast<int>(cfg.transport));
-        return false;
-    }
-#endif
-
     bool need_disconnect = false;
     {
         std::lock_guard<std::mutex> peek(_mtx);
@@ -3123,11 +3105,6 @@ std::vector<remote_tool_t> client_t::list_tools()
             if (tool.original_name.empty()) continue;
             tool.name         = make_qualified_tool_name(server_label, tool.original_name);
             tool.description  = t.value("description", "");
-            if (!anti_tamper::mcp_posture::is_remote_tool_metadata_trusted(server_label, tool.original_name, tool.description)) {
-                _last_error = "tools/list blocked by MCP tool metadata posture";
-                _cached_tools.clear();
-                return _cached_tools;
-            }
             if (t.contains("inputSchema"))
                 tool.input_schema = t["inputSchema"];
             if (t.contains("annotations"))
@@ -3996,11 +3973,6 @@ void client_t::process_notification(const json& notif)
                     if (tool.original_name.empty()) continue;
                     tool.name          = make_qualified_tool_name(server_label, tool.original_name);
                     tool.description   = t.value("description", "");
-                    if (!anti_tamper::mcp_posture::is_remote_tool_metadata_trusted(server_label, tool.original_name, tool.description)) {
-                        _last_error = "tools/list refresh blocked by MCP tool metadata posture";
-                        _cached_tools.clear();
-                        return;
-                    }
                     if (t.contains("inputSchema")) tool.input_schema = t["inputSchema"];
                     if (t.contains("annotations")) tool.annotations = t["annotations"];
                     next_tools.push_back(std::move(tool));
@@ -4054,15 +4026,6 @@ bool client_t::launch_stdio_process()
 
     if (_cfg.command.empty()) {
         _last_error = "No command specified for stdio transport";
-        return false;
-    }
-
-    if (!anti_tamper::mcp_posture::is_runtime_trusted_server(_cfg, true)) {
-        _last_error = "MCP posture blocked stdio launch";
-        diag::log_tagged_fmt("mcp_stdio",
-            "launch_blocked_mcp_posture server_hash=0x%016llX name_len=%zu",
-            static_cast<unsigned long long>(mcp_log_hash(_cfg.name)),
-            _cfg.name.size());
         return false;
     }
 
@@ -4389,16 +4352,6 @@ manager_t::entry_t::~entry_t()
 
 void manager_t::add_server(const server_config_t& cfg)
 {
-    if (!anti_tamper::mcp_posture::is_runtime_trusted_server(cfg, false)) {
-        diag::log_tagged_fmt("mcp",
-            "add_server_blocked_mcp_posture name_hash=0x%016llX name_len=%zu enabled=%d transport=%d",
-            static_cast<unsigned long long>(mcp_log_hash(cfg.name)),
-            cfg.name.size(),
-            static_cast<int>(cfg.enabled),
-            static_cast<int>(cfg.transport));
-        return;
-    }
-
     std::string config_fingerprint;
     secure_string_scope_t config_fingerprint_guard{config_fingerprint};
     try {
@@ -5706,7 +5659,7 @@ bool start_auth(const std::string& server_name, oauth_state_t& out_state)
                 "OAuth flow activation lost its configuration generation or was cancelled");
         if (!open_browser(out_state.authorization_url)) {
 #if !defined(AIDA_C03_MCP_OAUTH_FIXTURE)
-            anti_tamper::webhook::write_log("mcp.oauth",
+            diag::log_tagged("mcp.oauth",
                 "[mcp.oauth] Camoufox open failed; non-Camoufox browser fallback is disabled");
 #endif
             return fail_oauth_start(out_state, flow,

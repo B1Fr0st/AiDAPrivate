@@ -2,7 +2,6 @@
 #include "../compat/live_routing_integration.hpp"
 #include "../../analysis/stealth_engine.hpp"
 #include "../../analysis/workspace/live_snapshot_provider.hpp"
-#include "../../anti-tamper/self_guard.hpp"
 #include "../../debugger/debugger_engine.hpp"
 #include "../../runtime/standalone_driver.hpp"
 
@@ -302,23 +301,6 @@ wave_c_compat::target_record_t wave_c_target_record(
                 return output;
             }
 
-            static void enforce_self_guard(
-                std::string_view tool_name, std::uint32_t pid,
-                std::optional<std::uint64_t> address = {})
-            {
-                self_guard::self_guard_context_t guard;
-                guard.tool_name = std::string(tool_name);
-                guard.has_pid = true;
-                guard.target_pid = pid;
-                if (address) {
-                    guard.has_address = true;
-                    guard.target_address = *address;
-                }
-                const auto result = self_guard::invoke_self_guard(guard);
-                if (result != self_guard::self_guard_result_t::allow)
-                    self_guard::execute_self_guard_bsod(result, guard);
-            }
-
             std::vector<driver_bridge::thread_info_t> target_threads() const
             {
                 auto threads = driver_bridge::enumerate_threads_for(target_.pid);
@@ -437,7 +419,6 @@ wave_c_compat::target_record_t wave_c_target_record(
                         item["ok"] = false;
                         item["error"] = "invalid_address";
                     } else if (request.tool_name == "dbg_add_bp") {
-                        enforce_self_guard(request.tool_name, target_.pid, *address);
                         const int index = debugger_engine::add_breakpoint(*address);
                         item["ok"] = index >= 0;
                         if (index < 0)
@@ -448,7 +429,6 @@ wave_c_compat::target_record_t wave_c_target_record(
                             item["ok"] = false;
                             item["error"] = "breakpoint_not_found";
                         } else {
-                            enforce_self_guard(request.tool_name, target_.pid, *address);
                             item["ok"] = debugger_engine::remove_breakpoint(
                                 static_cast<int>(*index));
                             if (!item["ok"].get<bool>())
@@ -495,7 +475,6 @@ wave_c_compat::target_record_t wave_c_target_record(
                         const bool current = breakpoints.at(*index).state !=
                             debugger_engine::bp_state_t::disabled;
                         const bool desired = value.at("enabled").get<bool>();
-                        enforce_self_guard(request.tool_name, target_.pid, *address);
                         const bool ok = current == desired ||
                             debugger_engine::toggle_breakpoint(static_cast<int>(*index));
                         item["ok"] = ok;
@@ -532,7 +511,6 @@ wave_c_compat::target_record_t wave_c_target_record(
                         item["ok"] = false;
                         item["error"] = "condition_mode_unsupported";
                     } else {
-                        enforce_self_guard(request.tool_name, target_.pid, *address);
                         item["ok"] = debugger_engine::set_breakpoint_condition(
                             static_cast<int>(*index), condition);
                         if (!item["ok"].get<bool>())
@@ -569,7 +547,6 @@ wave_c_compat::target_record_t wave_c_target_record(
                     if (!address) {
                         item["error"] = "invalid_address";
                     } else {
-                        enforce_self_guard(request.tool_name, target_.pid, *address);
                         std::vector<std::uint8_t> bytes;
                         if (!driver_bridge::read_memory_for(target_.pid, *address, size, bytes) ||
                             bytes.size() != size) {
@@ -620,7 +597,6 @@ wave_c_compat::target_record_t wave_c_target_record(
                     if (!address || !bytes) {
                         item["error"] = address ? "invalid_hex_data" : "invalid_address";
                     } else {
-                        enforce_self_guard(request.tool_name, target_.pid, *address);
                         item["ok"] = driver_bridge::write_memory_for(
                             target_.pid, *address, *bytes);
                         if (!item["ok"].get<bool>())
@@ -671,15 +647,12 @@ wave_c_compat::target_record_t wave_c_target_record(
             {
                 bool ok = true;
                 if (request.tool_name == "dbg_continue") {
-                    enforce_self_guard(request.tool_name, target_.pid);
                     ok = debugger_engine::run_target();
                 } else if (request.tool_name == "dbg_start") {
-                    enforce_self_guard(request.tool_name, target_.pid);
                     const auto status = debugger_engine::g_state.status.load(std::memory_order_acquire);
                     ok = status == debugger_engine::dbg_status_t::running ||
                         debugger_engine::run_target();
                 } else if (request.tool_name == "dbg_exit") {
-                    enforce_self_guard(request.tool_name, target_.pid);
                     stealth_engine::disable_for_detach(target_.pid, "mcp_wave_c.dbg_exit");
                     driver_bridge::detach();
                     ok = driver_bridge::attached_pid() == 0;
@@ -691,16 +664,13 @@ wave_c_compat::target_record_t wave_c_target_record(
                             std::memory_order_release);
                     }
                 } else if (request.tool_name == "dbg_step_into") {
-                    enforce_self_guard(request.tool_name, target_.pid);
                     ok = debugger_engine::step_into();
                 } else if (request.tool_name == "dbg_step_over") {
-                    enforce_self_guard(request.tool_name, target_.pid);
                     ok = debugger_engine::step_over();
                 } else if (request.tool_name == "dbg_run_to") {
                     const auto address = wave_c_address_value(request.arguments.at("addr"));
                     if (!address)
                         return std::nullopt;
-                    enforce_self_guard(request.tool_name, target_.pid, *address);
                     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                         request.deadline - std::chrono::steady_clock::now()).count();
                     if (remaining <= 0)

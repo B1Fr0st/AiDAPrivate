@@ -292,7 +292,6 @@ inline BOOL CloseHandle(HANDLE) { return TRUE; }
 namespace driver_bridge {
 inline bool is_loaded() { return aida::preview::debugger::driver_available; }
 inline bool using_kernel_driver() { return aida::preview::debugger::driver_available; }
-inline bool dynamic_ioctls_ready() { return aida::preview::debugger::driver_available; }
 inline bool kernel_session_available(std::string* reason) { if (reason) *reason = aida::preview::debugger::driver_available ? "Preview fixture" : "Preview driver disconnected"; return aida::preview::debugger::driver_available; }
 inline std::uint32_t attached_pid() { return aida::preview::debugger::driver_available ? debugger_engine::g_state.target_pid : 0; }
 inline std::string status() { return aida::preview::debugger::driver_available

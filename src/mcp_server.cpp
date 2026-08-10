@@ -1596,10 +1596,6 @@ static agent_tools::tool_result_t execute_tool_in_main_thread(
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("ida_mcp_exec_tool_enter name=%s cancel=%d", name.c_str(), cancel_flag ? 1 : 0);
 #endif
-    /*
-    if (ida_utils::is_self_target_database())
-        return agent_tools::tool_result_t::error("Operation blocked.");
-    */
 
     const auto* tool_def = agent_tools::ToolRegistry::instance().get_tool(name);
     if (!tool_def)
@@ -3301,14 +3297,6 @@ bool mcp_server_t::start(int port)
     aida_ipc::trace_breadcrumb("ida_mcp_start_enter port=%d running=%d bind_failed=%d stop_requested=%d",
                                port, _running.load() ? 1 : 0, _bind_failed.load() ? 1 : 0,
                                _stop_requested.load() ? 1 : 0);
-#endif
-#ifdef __NT__
-    if (!aida_ipc::is_standalone_alive())
-    {
-        msg(OBFSTR_C("AiDA MCP: Cannot start - AiDAStandalone.exe is not authenticated.\n"));
-        aida_ipc::trace_breadcrumb("ida_mcp_start_fail_standalone_not_alive port=%d", port);
-        return false;
-    }
 #endif
 
     if (_running.load())

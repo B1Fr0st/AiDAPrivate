@@ -211,10 +211,6 @@ namespace aida::preview
 		globals::ui::window_h = display_size.y > 0.f ? display_size.y : 760.f;
 		globals::ui::welcome_done = active_phase == shell_phase_t::ide || active_phase == shell_phase_t::license;
 		globals::ui::ui_alpha = active_phase == shell_phase_t::ide ? 1.f : 0.f;
-		license::validated = active_phase == shell_phase_t::ide;
-		license::checking = false;
-		license::activation_worker_active.store(false, std::memory_order_release);
-		license::check_failed = false;
 		if (initialized.exchange(true, std::memory_order_acq_rel)) {
 			if (!desktop_focus_applied.exchange(true, std::memory_order_acq_rel)) {
 				aida::ui::application_views::open_or_focus(

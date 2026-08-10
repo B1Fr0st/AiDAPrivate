@@ -4,7 +4,6 @@
 #include "provider_snapshot_harness.hpp"
 #include "schema_v9_harness.hpp"
 #include "search_query_harness.hpp"
-#include "mcp_client_auth_harness.hpp"
 #include "analysis_handlers_harness.hpp"
 #include "composite_handlers_harness.hpp"
 #include "contract_generation_harness.hpp"
@@ -129,9 +128,6 @@ int main()
     run("type_handlers", run_type_handlers_harness);
     run("routing_extensions", run_routing_extensions_harness);
     return passed ? 0 : 1;
-#elif defined(AIDA_C03_ENTRY_MCP_CLIENT_AUTH)
-    std::string failure;
-    return report(aida::standalone::tests::c03::security::run_mcp_client_auth_harness(failure), failure) ? 0 : 1;
 #else
 #error An AiDA C03 generated entrypoint identity is required
 #endif

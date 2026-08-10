@@ -6,7 +6,6 @@
 #include "memory_scanner.hpp"
 #include "standalone_driver.hpp"
 #include "../runtime/standalone_driver_identity.hpp"
-#include "../anti-tamper/state.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
 #include "../infra/taskflow_runtime.hpp"
@@ -908,7 +907,10 @@ static void first_scan_thread(scan_config_t config,
 	};
 
 
-	const bool full_test_running = anti_tamper::state::get().full_test_running.load(std::memory_order_acquire);
+	char full_test_env[8] = {};
+	const DWORD full_test_env_len = GetEnvironmentVariableA("AIDA_FULL_TEST_RUNNING", full_test_env, static_cast<DWORD>(sizeof(full_test_env)));
+	const bool full_test_running = full_test_env_len > 0 &&
+		(full_test_env[0] == '1' || full_test_env[0] == 't' || full_test_env[0] == 'T' || full_test_env[0] == 'y' || full_test_env[0] == 'Y');
 	const std::size_t scanner_wg_size = mcp_standalone::downstream::governor_t::instance().quotas().scanner_worker_group_size;
 	const int worker_count = full_test_running ? 0 : static_cast<int>(scanner_wg_size);
 	if (full_test_running) {

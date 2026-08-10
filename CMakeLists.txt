@@ -65,189 +65,14 @@ if(MSVC)
     endif()
 endif()
 
-option(AIDA_ENABLE_LTCG "Enable /GL + /LTCG on AiDA.dll and aida_core.dll (slower link, marginally faster runtime)" OFF)
+option(AIDA_ENABLE_LTCG "Enable /GL + /LTCG on AiDA.dll (slower link, marginally faster runtime)" OFF)
 option(AIDA_FAST_LINK   "Use /DEBUG (default) instead of /DEBUG:FULL for faster linking" ON)
-option(AIDA_ARC_ENCRYPT_IMPORTS "Enable --encrypt-imports for ARC (requires api-set resolver in payload.c — W1c-payload)" OFF)
 option(AIDA_HARDEN_RELEASE "Enable MSVC compiler/linker hardening (/GS /guard:cf /guard:ehcont /guard:xfg /Qspectre /sdl /CETCOMPAT /HIGHENTROPYVA /NXCOMPAT /DYNAMICBASE)" ON)
 option(AIDA_HARDEN_XFG "Enable /guard:xfg (Extended Control Flow Guard, requires Win11 22H2+ runtime)" ON)
 set(AIDA_BENCHMARK_REAL_PE "" CACHE FILEPATH
     "300-500MB PE fixture that enables the aida_c03_benchmark_real_harness ctest target (mirrors Test Lab AIDA_BENCHMARK_REAL_PE)")
 
-set(AIDA_BUILD_SEED_FILE "${CMAKE_BINARY_DIR}/build_seed.txt")
-set(AIDA_BUILD_SEED "")
-if(DEFINED ENV{AIDA_BUILD_SEED} AND NOT "$ENV{AIDA_BUILD_SEED}" STREQUAL "")
-    set(AIDA_BUILD_SEED "$ENV{AIDA_BUILD_SEED}")
-    string(STRIP "${AIDA_BUILD_SEED}" AIDA_BUILD_SEED)
-    file(WRITE "${AIDA_BUILD_SEED_FILE}" "${AIDA_BUILD_SEED}")
-    message(STATUS "AiDA: AIDA_BUILD_SEED supplied via environment")
-elseif(EXISTS "${AIDA_BUILD_SEED_FILE}")
-    file(READ "${AIDA_BUILD_SEED_FILE}" AIDA_BUILD_SEED)
-    string(STRIP "${AIDA_BUILD_SEED}" AIDA_BUILD_SEED)
-endif()
-
-set(_aida_build_seed_needs_regen FALSE)
-if("${AIDA_BUILD_SEED}" STREQUAL "")
-    set(_aida_build_seed_needs_regen TRUE)
-elseif(NOT "${AIDA_BUILD_SEED}" MATCHES "^[0-9a-fA-F]+$")
-    set(_aida_build_seed_needs_regen TRUE)
-else()
-    string(LENGTH "${AIDA_BUILD_SEED}" _aida_build_seed_len_pre)
-    if(NOT _aida_build_seed_len_pre EQUAL 64)
-        set(_aida_build_seed_needs_regen TRUE)
-    endif()
-endif()
-if(_aida_build_seed_needs_regen)
-    if(WIN32)
-        find_program(AIDA_POWERSHELL_EXECUTABLE NAMES pwsh powershell)
-        if(NOT AIDA_POWERSHELL_EXECUTABLE)
-            message(FATAL_ERROR
-                "AiDA build seed missing and PowerShell not found. Provide a 64-character "
-                "lowercase hex AIDA_BUILD_SEED environment variable, or install PowerShell.")
-        endif()
-        execute_process(
-            COMMAND "${AIDA_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive -Command
-                "$bytes=New-Object byte[] 32; $rng=[System.Security.Cryptography.RandomNumberGenerator]::Create(); $rng.GetBytes($bytes); $rng.Dispose(); -join ($bytes | ForEach-Object { $_.ToString('x2') })"
-            OUTPUT_VARIABLE AIDA_BUILD_SEED_RAW
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            RESULT_VARIABLE AIDA_BUILD_SEED_RC
-        )
-        if(NOT AIDA_BUILD_SEED_RC EQUAL 0)
-            message(FATAL_ERROR
-                "AiDA: failed to generate build seed via BCryptGenRandom-backed RNG (rc=${AIDA_BUILD_SEED_RC}).")
-        endif()
-        if(NOT AIDA_BUILD_SEED_RAW MATCHES "^[0-9a-fA-F]+$")
-            message(FATAL_ERROR
-                "AiDA: generated build seed contains invalid characters: ${AIDA_BUILD_SEED_RAW}")
-        endif()
-        string(LENGTH "${AIDA_BUILD_SEED_RAW}" AIDA_BUILD_SEED_LEN)
-        if(NOT AIDA_BUILD_SEED_LEN EQUAL 64)
-            message(FATAL_ERROR
-                "AiDA: generated build seed has unexpected length ${AIDA_BUILD_SEED_LEN} (expected 64).")
-        endif()
-        set(AIDA_BUILD_SEED "${AIDA_BUILD_SEED_RAW}")
-        file(WRITE "${AIDA_BUILD_SEED_FILE}" "${AIDA_BUILD_SEED}")
-        message(STATUS "AiDA: generated 256-bit build seed via system RNG -> ${AIDA_BUILD_SEED_FILE}")
-    else()
-        message(FATAL_ERROR
-            "AiDA: AIDA_BUILD_SEED missing or malformed; non-Windows configure must export "
-            "a 64-character hex AIDA_BUILD_SEED environment variable.")
-    endif()
-endif()
-
-string(LENGTH "${AIDA_BUILD_SEED}" _aida_build_seed_len_check)
-if(NOT _aida_build_seed_len_check EQUAL 64)
-    message(FATAL_ERROR
-        "AiDA: build seed length is ${_aida_build_seed_len_check}; expected 64-character hex.")
-endif()
-if(NOT "${AIDA_BUILD_SEED}" MATCHES "^[0-9a-fA-F]+$")
-    message(FATAL_ERROR
-        "AiDA: build seed contains non-hex characters: ${AIDA_BUILD_SEED}")
-endif()
-
-string(TOLOWER "${AIDA_BUILD_SEED}" AIDA_BUILD_SEED)
-
-set(AIDA_BUILD_SEED_BIN "${CMAKE_BINARY_DIR}/build_seed.bin")
-set(_aida_build_seed_byte_index 0)
-set(_aida_build_seed_byte_list "")
-while(_aida_build_seed_byte_index LESS 32)
-    math(EXPR _aida_build_seed_offset "${_aida_build_seed_byte_index} * 2")
-    string(SUBSTRING "${AIDA_BUILD_SEED}" ${_aida_build_seed_offset} 2 _aida_build_seed_byte_hex)
-    list(APPEND _aida_build_seed_byte_list "0x${_aida_build_seed_byte_hex}")
-    math(EXPR _aida_build_seed_byte_index "${_aida_build_seed_byte_index} + 1")
-endwhile()
-string(REPLACE ";" ", " AIDA_ARC_BUILD_SEED_BYTES_INLINE "${_aida_build_seed_byte_list}")
-set(AIDA_ARC_BUILD_SEED_BYTES "        ${AIDA_ARC_BUILD_SEED_BYTES_INLINE}")
-
-if(WIN32)
-    if(NOT DEFINED AIDA_POWERSHELL_EXECUTABLE OR NOT AIDA_POWERSHELL_EXECUTABLE)
-        find_program(AIDA_POWERSHELL_EXECUTABLE NAMES pwsh powershell)
-    endif()
-    if(NOT AIDA_POWERSHELL_EXECUTABLE)
-        message(FATAL_ERROR "AiDA: PowerShell required to materialize build_seed.bin and compute commitment.")
-    endif()
-    execute_process(
-        COMMAND "${AIDA_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive -Command
-            "$hex='${AIDA_BUILD_SEED}'; $bytes=for ($i=0; $i -lt $hex.Length; $i+=2) { [Convert]::ToByte($hex.Substring($i,2),16) }; [System.IO.File]::WriteAllBytes('${AIDA_BUILD_SEED_BIN}', [byte[]]$bytes); $acl=New-Object System.Security.AccessControl.FileSecurity; $acl.SetAccessRuleProtection($true, $false); $rule=New-Object System.Security.AccessControl.FileSystemAccessRule([System.Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'Allow'); $acl.SetAccessRule($rule); [System.IO.File]::SetAccessControl('${AIDA_BUILD_SEED_BIN}', $acl)"
-        RESULT_VARIABLE _aida_seed_bin_rc
-        OUTPUT_QUIET
-        ERROR_QUIET
-    )
-    if(NOT _aida_seed_bin_rc EQUAL 0)
-        message(WARNING "AiDA: failed to materialize build_seed.bin (rc=${_aida_seed_bin_rc}); HKDF still operates from embedded constant.")
-    endif()
-    execute_process(
-        COMMAND "${AIDA_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive -Command
-            "$hex='${AIDA_BUILD_SEED}'; $bytes=for ($i=0; $i -lt $hex.Length; $i+=2) { [Convert]::ToByte($hex.Substring($i,2),16) }; $sha=[System.Security.Cryptography.SHA256]::Create(); $h=$sha.ComputeHash([byte[]]$bytes); -join ($h | ForEach-Object { $_.ToString('x2') })"
-        OUTPUT_VARIABLE AIDA_BUILD_COMMITMENT
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        RESULT_VARIABLE _aida_commitment_rc
-    )
-    string(LENGTH "${AIDA_BUILD_COMMITMENT}" _aida_commitment_len)
-    if(NOT _aida_commitment_rc EQUAL 0 OR NOT _aida_commitment_len EQUAL 64 OR NOT "${AIDA_BUILD_COMMITMENT}" MATCHES "^[0-9a-fA-F]+$")
-        message(FATAL_ERROR "AiDA: failed to compute build seed SHA-256 commitment (rc=${_aida_commitment_rc} value='${AIDA_BUILD_COMMITMENT}').")
-    endif()
-    string(TOLOWER "${AIDA_BUILD_COMMITMENT}" AIDA_BUILD_COMMITMENT)
-else()
-    find_program(AIDA_OPENSSL_EXECUTABLE NAMES openssl)
-    if(NOT AIDA_OPENSSL_EXECUTABLE)
-        message(FATAL_ERROR "AiDA: openssl(1) not found; required to compute build seed commitment on non-Windows.")
-    endif()
-    file(WRITE "${AIDA_BUILD_SEED_BIN}.hex" "${AIDA_BUILD_SEED}")
-    execute_process(
-        COMMAND "${AIDA_OPENSSL_EXECUTABLE}" dgst -sha256 -hex
-        INPUT_FILE "${AIDA_BUILD_SEED_BIN}.hex"
-        OUTPUT_VARIABLE AIDA_BUILD_COMMITMENT_RAW
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        RESULT_VARIABLE _aida_commitment_rc
-    )
-    if(NOT _aida_commitment_rc EQUAL 0)
-        message(FATAL_ERROR "AiDA: failed to compute build seed commitment via openssl (rc=${_aida_commitment_rc}).")
-    endif()
-    string(REGEX REPLACE ".*= " "" AIDA_BUILD_COMMITMENT "${AIDA_BUILD_COMMITMENT_RAW}")
-    string(TOLOWER "${AIDA_BUILD_COMMITMENT}" AIDA_BUILD_COMMITMENT)
-endif()
-
-string(LENGTH "${AIDA_BUILD_COMMITMENT}" _aida_commitment_len_final)
-if(NOT _aida_commitment_len_final EQUAL 64 OR NOT "${AIDA_BUILD_COMMITMENT}" MATCHES "^[0-9a-f]+$")
-    message(FATAL_ERROR "AiDA: build commitment is malformed: ${AIDA_BUILD_COMMITMENT}")
-endif()
-
-set(_aida_build_commitment_byte_index 0)
-set(_aida_build_commitment_byte_list "")
-while(_aida_build_commitment_byte_index LESS 32)
-    math(EXPR _aida_build_commitment_offset "${_aida_build_commitment_byte_index} * 2")
-    string(SUBSTRING "${AIDA_BUILD_COMMITMENT}" ${_aida_build_commitment_offset} 2 _aida_build_commitment_byte_hex)
-    list(APPEND _aida_build_commitment_byte_list "0x${_aida_build_commitment_byte_hex}")
-    math(EXPR _aida_build_commitment_byte_index "${_aida_build_commitment_byte_index} + 1")
-endwhile()
-string(REPLACE ";" ", " AIDA_ARC_BUILD_COMMITMENT_BYTES_INLINE "${_aida_build_commitment_byte_list}")
-set(AIDA_ARC_BUILD_COMMITMENT_BYTES "        ${AIDA_ARC_BUILD_COMMITMENT_BYTES_INLINE}")
-
-configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src/core/arc/arc_build_seed.hpp.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/arc_build_seed.hpp"
-    @ONLY
-)
-message(STATUS "AiDA: build_seed.bin materialized; commitment=${AIDA_BUILD_COMMITMENT}")
-
-set(AIDA_BUILD_ID "${AIDA_BUILD_COMMITMENT}")
-
 find_package(Python3 COMPONENTS Interpreter QUIET)
-
-if(Python3_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/wbaes_gen/generate_wbaes_tables.py")
-    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
-    execute_process(
-        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/wbaes_gen/generate_wbaes_tables.py"
-                --seed "${AIDA_BUILD_SEED}"
-                --output "${CMAKE_BINARY_DIR}/generated/wbaes_generated_tables.hpp"
-                --build-id "${AIDA_BUILD_ID}"
-        RESULT_VARIABLE _aida_wbaes_gen_rc
-    )
-    if(NOT _aida_wbaes_gen_rc EQUAL 0)
-        message(FATAL_ERROR "AiDA: wbaes table generation failed (rc=${_aida_wbaes_gen_rc})")
-    endif()
-    message(STATUS "AiDA: whitebox AES tables generated -> ${CMAKE_BINARY_DIR}/generated/wbaes_generated_tables.hpp")
-endif()
 
 if(MSVC AND AIDA_HARDEN_RELEASE)
     add_library(aida_hardening INTERFACE)
@@ -268,27 +93,6 @@ if(MSVC AND AIDA_HARDEN_RELEASE)
         /guard:ehcont
         /force:guardehcont
     )
-endif()
-
-if(WIN32 AND MSVC)
-    add_executable(aida_build_seed_gen tools/build_seed/build_seed_gen.cpp)
-    target_compile_options(aida_build_seed_gen PRIVATE /W4 /EHsc $<IF:$<CONFIG:Debug>,/Od,/O2> /MD /Zc:__cplusplus /permissive-)
-    target_compile_definitions(aida_build_seed_gen PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_link_libraries(aida_build_seed_gen PRIVATE bcrypt)
-    set_target_properties(aida_build_seed_gen PROPERTIES
-        OUTPUT_NAME "aida_build_seed_gen"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-    )
-
-    add_executable(aida_pdb_scrubber tools/pdb_scrubber/pdb_scrubber.cpp)
-    target_compile_options(aida_pdb_scrubber PRIVATE /W4 /EHsc $<IF:$<CONFIG:Debug>,/Od,/O2> /MD /Zc:__cplusplus /permissive-)
-    target_compile_definitions(aida_pdb_scrubber PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
-    set_target_properties(aida_pdb_scrubber PROPERTIES
-        OUTPUT_NAME "aida_pdb_scrubber"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-    )
-
-    add_subdirectory(tools/share_fingerprint_baker)
 endif()
 
 set(DEPS_DIR "${CMAKE_SOURCE_DIR}/.deps")
@@ -1296,128 +1100,69 @@ set(GHIDRA_STAGED_SPEC_OUTPUTS
 
 add_custom_target(ghidra_specs ALL DEPENDS ${GHIDRA_STAGED_SPEC_OUTPUTS})
 
-# --- Auto-encrypt embedded driver/mapper byte arrays ---
-# When the built drivers/mapper change (WhosWho.sys, Sentinel.sys,
-# WindMapper.exe) -- or, as a fallback, when the legacy hex dumps
-# WhosWho.c / Sentinel.c / WindMapper.c change -- the corresponding
-# encrypted headers are regenerated so driver_loader.cpp picks up the
-# new bytes. The encrypt_*.py scripts now accept --from-binary, which
-# regenerates the legacy .c hex dump from the binary directly so the
-# manual HxD round-trip is no longer required.
+# --- Auto-embed driver byte arrays ---
+# When the built driver changes (WhosWho.sys), the embedded header
+# src/whoswho_embedded.h is regenerated by src/encrypt_whoswho.py so
+# driver_loader.cpp picks up the new bytes. If WhosWho.sys is missing at
+# configure time the rule is skipped and the checked-out header is used
+# as-is; build WhosWho.sln and re-run cmake configure to enable it.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 option(AIDA_DISABLE_LEGACY_DRIVER_MAPPER "Disable the embedded legacy WindMapper driver mapper fallback" OFF)
-option(AIDA_REGENERATE_LEGACY_DRIVER_MAPPER_FROM_BINARY "Regenerate WindMapper embedding from build-ninja/Release/WindMapper.exe instead of WindMapper.c" OFF)
 if(Python3_FOUND)
-    # The driver/mapper .vcxproj files hardcode <OutDir> to
+    # The driver .vcxproj files hardcode <OutDir> to
     # ${CMAKE_SOURCE_DIR}/build-ninja/Release/, so the built binaries
     # land at a fixed location independent of CMAKE_BINARY_DIR. Expose
-    # as cache vars so users with custom .vcxproj OutDirs can override.
+    # as a cache var so users with custom .vcxproj OutDirs can override.
     set(AIDA_DRIVER_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/build-ninja/Release"
-        CACHE PATH "Directory where WhosWho.sln / Sentinel.sln / WindMapper.sln deposit their build outputs")
-    set(WHOSWHO_BINARY    "${AIDA_DRIVER_OUTPUT_DIR}/WhosWho.sys"
+        CACHE PATH "Directory where WhosWho.sln deposits its build outputs")
+    set(WHOSWHO_BINARY "${AIDA_DRIVER_OUTPUT_DIR}/WhosWho.sys"
         CACHE FILEPATH "Path to the built WhosWho.sys")
-    set(SENTINEL_BINARY   "${AIDA_DRIVER_OUTPUT_DIR}/Sentinel.sys"
-        CACHE FILEPATH "Path to the built Sentinel.sys")
-    if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER AND AIDA_REGENERATE_LEGACY_DRIVER_MAPPER_FROM_BINARY)
-        set(WINDMAPPER_BINARY "${AIDA_DRIVER_OUTPUT_DIR}/WindMapper.exe"
-            CACHE FILEPATH "Path to the built WindMapper.exe")
-    endif()
+    set(WHOSWHO_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_whoswho.py")
 
-    set(WHOSWHO_HEX    "${CMAKE_CURRENT_SOURCE_DIR}/WhosWho.c")
-    set(SENTINEL_HEX   "${CMAKE_CURRENT_SOURCE_DIR}/Sentinel.c")
-    if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
-        set(WINDMAPPER_HEX "${CMAKE_CURRENT_SOURCE_DIR}/WindMapper.c")
-    endif()
-
-    set(WHOSWHO_SCRIPT    "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_whoswho.py")
-    set(SENTINEL_SCRIPT   "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_sentinel.py")
-    if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
-        set(WINDMAPPER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_windmapper.py")
-    endif()
-
-    set(ENCRYPT_DRIVERS_STAMPS "")
-
-    # Per-driver rule generator: prefer the built binary; fall back to
-    # the legacy .c hex dump; if neither input exists, skip the rule
-    # entirely so Ninja does not error on phantom deps and the existing
-    # encrypted header in src/ stays authoritative.
-    function(_aida_emit_encrypt_rule short_name binary_path hex_path script_path stamp_path comment_text)
-        set(rule_deps "${script_path}")
-        set(rule_command_args "")
-        set(rule_input_label "")
-        if(EXISTS "${binary_path}")
-            set(rule_command_args --from-binary "${binary_path}")
-            set(rule_input_label "${binary_path}")
-        elseif(EXISTS "${hex_path}")
-            list(APPEND rule_deps "${hex_path}")
-            set(rule_command_args "")
-            set(rule_input_label "${hex_path}")
-        else()
-            message(STATUS "encrypt_drivers: ${short_name} -- neither ${binary_path} nor ${hex_path} found; "
-                           "skipping rule (existing encrypted header will be used as-is). "
-                           "Build the .sln (or restore the .c hex dump) and re-run cmake configure to enable.")
-            return()
-        endif()
-        message(STATUS "encrypt_drivers: ${short_name} <- ${rule_input_label}")
+    set(EMBED_DRIVERS_STAMPS "")
+    if(EXISTS "${WHOSWHO_BINARY}")
+        message(STATUS "encrypt_drivers: WhosWho <- ${WHOSWHO_BINARY}")
         add_custom_command(
-            OUTPUT "${stamp_path}"
-            COMMAND ${Python3_EXECUTABLE} "${script_path}" ${rule_command_args}
-            COMMAND ${CMAKE_COMMAND} -E touch "${stamp_path}"
-            DEPENDS ${rule_deps}
+            OUTPUT "${CMAKE_BINARY_DIR}/whoswho_embedded.stamp"
+            COMMAND ${Python3_EXECUTABLE} "${WHOSWHO_SCRIPT}" --from-binary "${WHOSWHO_BINARY}"
+            COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/whoswho_embedded.stamp"
+            DEPENDS "${WHOSWHO_SCRIPT}"
             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-            COMMENT "${comment_text}"
+            COMMENT "Embedding WhosWho -> whoswho_embedded.h"
             VERBATIM
         )
-        set(ENCRYPT_DRIVERS_STAMPS "${ENCRYPT_DRIVERS_STAMPS};${stamp_path}" PARENT_SCOPE)
-    endfunction()
-
-    _aida_emit_encrypt_rule("WhosWho"
-        "${WHOSWHO_BINARY}" "${WHOSWHO_HEX}" "${WHOSWHO_SCRIPT}"
-        "${CMAKE_BINARY_DIR}/whoswho_encrypted.stamp"
-        "Encrypting WhosWho -> whoswho_encrypted.h")
-    _aida_emit_encrypt_rule("Sentinel"
-        "${SENTINEL_BINARY}" "${SENTINEL_HEX}" "${SENTINEL_SCRIPT}"
-        "${CMAKE_BINARY_DIR}/sentinel_encrypted.stamp"
-        "Encrypting Sentinel -> sentinel_encrypted.h")
-    if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
-        _aida_emit_encrypt_rule("WindMapper"
-            "${WINDMAPPER_BINARY}" "${WINDMAPPER_HEX}" "${WINDMAPPER_SCRIPT}"
-            "${CMAKE_BINARY_DIR}/windmapper_encrypted.stamp"
-            "Encrypting WindMapper -> windmapper_data.inc")
+        set(EMBED_DRIVERS_STAMPS "${CMAKE_BINARY_DIR}/whoswho_embedded.stamp")
+    else()
+        message(STATUS "encrypt_drivers: WhosWho -- ${WHOSWHO_BINARY} not found; "
+                       "skipping rule (existing src/whoswho_embedded.h will be used as-is). "
+                       "Build WhosWho.sln and re-run cmake configure to enable.")
     endif()
-    if(ENCRYPT_DRIVERS_STAMPS)
-        add_custom_target(encrypt_drivers DEPENDS ${ENCRYPT_DRIVERS_STAMPS})
+    if(EMBED_DRIVERS_STAMPS)
+        add_custom_target(encrypt_drivers DEPENDS ${EMBED_DRIVERS_STAMPS})
         add_custom_target(reencrypt_drivers
-            COMMAND ${CMAKE_COMMAND} -E remove ${ENCRYPT_DRIVERS_STAMPS}
+            COMMAND ${CMAKE_COMMAND} -E remove ${EMBED_DRIVERS_STAMPS}
             COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}" --target encrypt_drivers
-            COMMENT "Force-regenerating encrypted driver/mapper headers from current binaries"
+            COMMENT "Force-regenerating the embedded WhosWho driver header from the current binary"
             VERBATIM
         )
     else()
         add_custom_target(encrypt_drivers
             COMMAND ${CMAKE_COMMAND} -E echo
-                "encrypt_drivers: no inputs found (no .sys/.exe and no .c); using existing src/*_encrypted.h as-is."
+                "encrypt_drivers: WhosWho.sys not found; using existing src/whoswho_embedded.h as-is."
         )
     endif()
 else()
-    message(FATAL_ERROR "Python3 not found -- AiDA Phase 0 invariant guard cannot run and encrypt_drivers target is disabled.")
+    message(FATAL_ERROR "Python3 not found -- the driver embed target (encrypt_drivers) is disabled.")
 endif()
 
-# Track the generated encrypted headers so MSVC recompiles driver_loader.cpp
-# when they change (even outside the encrypt_drivers flow).
-set(ENCRYPTED_DRIVER_HEADERS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/whoswho_encrypted.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/sentinel_encrypted.h"
+# Track the generated embedded header so MSVC recompiles driver_loader.cpp
+# when it changes (even outside the encrypt_drivers flow).
+set(EMBEDDED_DRIVER_HEADERS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/whoswho_embedded.h"
 )
-if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
-    list(APPEND ENCRYPTED_DRIVER_HEADERS
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/windmapper_embedded.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/windmapper_data.inc"
-    )
-endif()
 set_source_files_properties(
     src/driver_loader.cpp
-    PROPERTIES OBJECT_DEPENDS "${ENCRYPTED_DRIVER_HEADERS}"
+    PROPERTIES OBJECT_DEPENDS "${EMBEDDED_DRIVER_HEADERS}"
 )
 
 # Track #include'd asset .c files so embedded_assets.cpp rebuilds when they change.
@@ -1499,53 +1244,6 @@ if(WIN32)
 
         set_target_properties(DriverTest PROPERTIES
             OUTPUT_NAME "test_driver"
-        )
-    endif()
-
-    option(BUILD_BINPROTO_TEST "Build the binary protocol test executable" ON)
-
-    if(BUILD_BINPROTO_TEST)
-        add_executable(BINPROTO_TEST
-            tools/binproto_test/binproto_test.cpp
-        )
-
-        target_include_directories(BINPROTO_TEST PRIVATE
-            "${CMAKE_BINARY_DIR}/generated"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src/core/anti-tamper"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src/core"
-            "${CMAKE_CURRENT_SOURCE_DIR}"
-        )
-
-        target_compile_definitions(BINPROTO_TEST PRIVATE
-            _CRT_SECURE_NO_WARNINGS
-            NOMINMAX
-            WIN32_LEAN_AND_MEAN
-            BINPROTO_TEST_BUILD=1
-        )
-
-        target_compile_options(BINPROTO_TEST PRIVATE
-            /W3
-            /EHsc
-            /Zc:__cplusplus
-            /permissive-
-            /Zp8
-            /MD
-            /bigobj
-        )
-
-        target_link_libraries(BINPROTO_TEST PRIVATE
-            aida_openssl_ssl
-            aida_openssl_crypto
-            ws2_32
-            crypt32
-            bcrypt
-            advapi32
-            user32
-            gdi32
-        )
-
-        set_target_properties(BINPROTO_TEST PROPERTIES
-            OUTPUT_NAME "BINPROTO_TEST"
         )
     endif()
 
@@ -1687,17 +1385,6 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/runtime/vm_guest_bridge.cpp"
             "${STANDALONE_ROOT}/core/ai/standalone_ai_client.cpp"
             "${STANDALONE_ROOT}/core/ai/standalone_chat.cpp"
-            "${STANDALONE_ROOT}/core/runtime/standalone_license.cpp"
-            "${STANDALONE_ROOT}/core/runtime/customer_capsule.cpp"
-            "${STANDALONE_ROOT}/core/runtime/standalone_license_transport.cpp"
-            "${STANDALONE_ROOT}/core/runtime/license_state.cpp"
-            "${STANDALONE_ROOT}/core/runtime/gate_tokens.cpp"
-            "${STANDALONE_ROOT}/core/crypto/keys_a.cpp"
-            "${STANDALONE_ROOT}/core/crypto/keys_b.cpp"
-            "${STANDALONE_ROOT}/core/crypto/keys_c.cpp"
-            "${STANDALONE_ROOT}/core/crypto/keys_d.cpp"
-            "${STANDALONE_ROOT}/core/crypto/wb_ed25519.cpp"
-            "${STANDALONE_ROOT}/core/arc/plaintext_window.cpp"
             "${STANDALONE_ROOT}/core/tools/driver_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/tools/re_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/tools/protected_re_tools_standalone.cpp"
@@ -2013,7 +1700,6 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/disasm/disasm_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/disasm/decompile_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/analysis/pdb_downloader.cpp"
-            "${STANDALONE_ROOT}/core/runtime/arc_loader.cpp"
             src/driver_loader.cpp
             driver/comm.cpp
             src/net_security.cpp
@@ -2040,7 +1726,6 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/session/compaction.cpp"
             "${STANDALONE_ROOT}/core/session/cost_calculator.cpp"
             "${STANDALONE_ROOT}/core/session/analysis_session.cpp"
-            "${STANDALONE_ROOT}/core/session/session_health.cpp"
             "${STANDALONE_ROOT}/core/tools/session_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/ai/command_registry.cpp"
             "${STANDALONE_ROOT}/core/ai/settings_overlay.cpp"
@@ -2049,23 +1734,12 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_memory.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_thread.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_remote.cpp"
-            "${STANDALONE_ROOT}/core/testlab/test_lab_features_anti_debug.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_module.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_network_query.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_network_action.cpp"
-            "${STANDALONE_ROOT}/core/testlab/test_lab_features_dll.cpp"
-            "${STANDALONE_ROOT}/core/testlab/test_lab_features_tamper.cpp"
-            "${STANDALONE_ROOT}/core/testlab/test_lab_features_session.cpp"
-            "${STANDALONE_ROOT}/core/testlab/test_lab_features_anti_dump.cpp"
-            "${STANDALONE_ROOT}/core/testlab/test_lab_features_evidence.cpp"
-            "${STANDALONE_ROOT}/core/testlab/test_lab_features_dma_canary.cpp"
-            "${STANDALONE_ROOT}/core/testlab/test_lab_features_debug_attach.cpp"
-            "${STANDALONE_ROOT}/core/testlab/test_lab_features_hv_detect.cpp"
-            "${STANDALONE_ROOT}/core/testlab/test_lab_features_target_latch.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_sandbox.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_net_logging.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_verify.cpp"
-            "${STANDALONE_ROOT}/core/testlab/test_lab_features_sentinel.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_all_features.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_all_debugger.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_all_scanner.cpp"
@@ -2076,8 +1750,6 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/testlab/test_all_mcp.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_all_ui.cpp"
             "${DEPS_DIR}/sqlite-amalgamation-3530300/sqlite3.c"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/telemetry/telemetry_client.cpp"
         )
 
         set(AIDA_CERT_PIN_BYPASS_GUARD_FILES
@@ -2256,7 +1928,6 @@ if(WIN32)
             "${Z3_INCLUDE_DIRS}"
             "${STANDALONE_ROOT}"
             "${STANDALONE_ROOT}/core"
-            "${STANDALONE_ROOT}/core/arc"
             "${STANDALONE_ROOT}/core/ai"
             "${STANDALONE_ROOT}/core/auth"
             "${STANDALONE_ROOT}/core/debugger"
@@ -2276,7 +1947,6 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/settings"
             "${STANDALONE_ROOT}/core/testlab"
             "${STANDALONE_ROOT}/core/diagnostics"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/shared"
             "${CMAKE_BINARY_DIR}/_imgui_wrapper"
             "${imgui_SOURCE_DIR}"
             "${imgui_SOURCE_DIR}/backends"
@@ -2321,7 +1991,6 @@ if(WIN32)
             _UNICODE
             SOL_ALL_SAFETIES_ON=1
             GHIDRA_SPECS_DIR=${GHIDRA_SPECS_OUTPUT_DIR}
-            AIDA_DEEP_STEAL=1
             AIDA_STANDALONE
             AIDA_IMGUI_SOURCE_SHA256=${AIDA_IMGUI_SOURCE_SHA256}
         )
@@ -2998,107 +2667,6 @@ if(WIN32)
         endif()
     endif()
 
-    # ── ARC (AiDA Runtime Core) DLL ──────────────────────────────────────
-    # Built separately, deployed on the license server, delivered after
-    # successful license validation. NOT linked into AiDAStandalone.
-
-    option(BUILD_ARC_DLL "Build the ARC (AiDA Runtime Core) DLL" ON)
-
-    if(BUILD_ARC_DLL)
-        set(ARC_SOURCES
-            "${STANDALONE_ROOT}/core/arc/arc.cpp"
-            driver/comm.cpp
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
-        )
-
-        set(ARC_ASM driver/syscall.asm)
-        set_source_files_properties(${ARC_ASM} PROPERTIES LANGUAGE ASM_MASM)
-        add_library(AiDA_ARC_asm OBJECT ${ARC_ASM})
-
-        add_library(AiDA_ARC SHARED
-            ${ARC_SOURCES}
-            $<TARGET_OBJECTS:AiDA_ARC_asm>
-        )
-
-        target_include_directories(AiDA_ARC PRIVATE
-            "${CMAKE_CURRENT_BINARY_DIR}/generated"
-            "${STANDALONE_ROOT}/core/arc"
-            "${STANDALONE_ROOT}/core"
-            "${STANDALONE_ROOT}/core/ai"
-            "${STANDALONE_ROOT}/core/auth"
-            "${STANDALONE_ROOT}/core/debugger"
-            "${STANDALONE_ROOT}/core/disasm"
-            "${STANDALONE_ROOT}/core/emulation"
-            "${STANDALONE_ROOT}/core/network"
-            "${STANDALONE_ROOT}/core/scanner"
-            "${STANDALONE_ROOT}/core/analysis"
-            "${STANDALONE_ROOT}/core/editor"
-            "${STANDALONE_ROOT}/core/tools"
-            "${STANDALONE_ROOT}/core/session"
-            "${STANDALONE_ROOT}/core/mcp"
-            "${STANDALONE_ROOT}/core/runtime"
-            "${STANDALONE_ROOT}/core/ui"
-            "${STANDALONE_ROOT}/core/infra"
-            "${STANDALONE_ROOT}/core/settings"
-            "${STANDALONE_ROOT}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/driver"
-            "${CMAKE_CURRENT_SOURCE_DIR}/libs"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/shared"
-        )
-
-        target_include_directories(AiDA_ARC SYSTEM PRIVATE
-            "${DEPS_DIR}/taskflow"
-        )
-
-        target_compile_definitions(AiDA_ARC PRIVATE
-            ARC_EXPORTS
-            _CRT_SECURE_NO_WARNINGS
-            NOMINMAX
-            WIN32_LEAN_AND_MEAN
-            AIDA_DEEP_STEAL=1
-        )
-
-        target_compile_options(AiDA_ARC PRIVATE
-            /W3
-            /EHsc
-            /Zc:__cplusplus
-            /permissive-
-            /Zp8
-            /MD
-            /O2
-            /bigobj
-            $<$<BOOL:${AIDA_ENABLE_LTCG}>:/GL>
-        )
-
-        target_link_libraries(AiDA_ARC PRIVATE
-            aida_openssl_ssl
-            aida_openssl_crypto
-            ws2_32
-            iphlpapi
-            ntdll
-            bcrypt
-            advapi32
-            winhttp
-        )
-
-        target_link_options(AiDA_ARC PRIVATE
-            $<IF:$<BOOL:${AIDA_FAST_LINK}>,/DEBUG,/DEBUG:FULL>
-            $<$<BOOL:${AIDA_ENABLE_LTCG}>:/LTCG>
-            /PDBALTPATH:none
-            /EMITTOOLVERSIONINFO:NO
-        )
-
-        if(TARGET aida_hardening)
-            target_link_libraries(AiDA_ARC PRIVATE aida_hardening)
-        endif()
-
-        set_target_properties(AiDA_ARC PROPERTIES
-            OUTPUT_NAME "aida_core"
-            PDB_NAME_RELEASE "aida_core"
-        )
-    endif()
-
 endif()
 
 if(BUILD_AIDA_PLUGIN)
@@ -3144,7 +2712,6 @@ set(AIDA_SOURCES
     src/graphrag.cpp
     src/ida_utils.cpp
     src/instance_registry.cpp
-    src/license.cpp
     src/mcp_server.cpp
     src/multibinary_index.cpp
     src/multibinary_project.cpp
@@ -3202,12 +2769,9 @@ set(AIDA_HEADERS
     src/aida_ipc.hpp
     src/aida_pro.hpp
     src/analysis_db.hpp
-    src/anti_re.hpp
-    src/game_stealth.hpp
     src/graphrag.hpp
     src/ida_utils.hpp
     src/instance_registry.hpp
-    src/license.hpp
     src/mcp_server.hpp
     src/multibinary_index.hpp
     src/multibinary_project.hpp
@@ -3249,14 +2813,8 @@ set(AIDA_HEADERS
     src/vuln/verification_engine.hpp
     src/vuln/verification_tools.hpp
     src/vuln/embedded_libz3.hpp
-    src/whoswho_encrypted.h
-    src/sentinel_encrypted.h
+    src/whoswho_embedded.h
 )
-if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
-    list(APPEND AIDA_HEADERS
-        src/windmapper_embedded.h
-    )
-endif()
 
 if(WIN32)
     set(Z3_DLL_PATH_FORWARD "${Z3_INSTALL_DIR}/bin/libz3.dll")
@@ -3330,7 +2888,6 @@ target_compile_definitions(AiDA PRIVATE
     _CRT_SECURE_NO_WARNINGS
     CPPHTTPLIB_OPENSSL_SUPPORT
     NOMINMAX
-    ATP_JIT_DISABLED=1
 )
 if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
     target_compile_definitions(AiDA PRIVATE AIDA_LEGACY_DRIVER_MAPPER_AVAILABLE)
@@ -3472,444 +3029,6 @@ elseif(UNIX)
     
 endif()
 
-endif()
-
-
-
-# -- AiDA PE Protector (build tool) ----------------------------------
-option(BUILD_PROTECTOR "Build the AiDA PE Protector tool" ON)
-if(BUILD_PROTECTOR)
-    set(_aida_asmjit_src "${CMAKE_SOURCE_DIR}/libs/asmjit")
-    if(NOT EXISTS "${_aida_asmjit_src}/CMakeLists.txt")
-        message(FATAL_ERROR "AiDAProtector requires the pinned local AsmJit source tree at ${_aida_asmjit_src}")
-    endif()
-
-    set(ASMJIT_STATIC ON CACHE BOOL "Build asmjit as static library" FORCE)
-    set(ASMJIT_NO_INSTALL ON CACHE BOOL "Disable asmjit install rules" FORCE)
-    set(ASMJIT_NO_FOREIGN ON CACHE BOOL "Compile only the x86-64 backend used by AiDAProtector" FORCE)
-    if(NOT TARGET asmjit)
-        add_subdirectory("${_aida_asmjit_src}" "${CMAKE_BINARY_DIR}/.deps/asmjit" EXCLUDE_FROM_ALL)
-    endif()
-    if(TARGET asmjit AND NOT TARGET asmjit::asmjit)
-        add_library(asmjit::asmjit ALIAS asmjit)
-    endif()
-    if(MSVC AND TARGET asmjit AND CMAKE_GENERATOR MATCHES "Ninja")
-        set_property(TARGET asmjit PROPERTY JOB_POOL_COMPILE aida_heavy_compile)
-    endif()
-
-    if(NOT TARGET asmjit::asmjit)
-        message(FATAL_ERROR "AiDAProtector failed to register the pinned local AsmJit target")
-    endif()
-
-    add_executable(AiDAProtector
-        tools/protector/main.cpp
-    )
-
-    target_include_directories(AiDAProtector PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/tools/protector
-    )
-
-    target_compile_definitions(AiDAProtector PRIVATE
-        _CRT_SECURE_NO_WARNINGS
-        NOMINMAX
-        WIN32_LEAN_AND_MEAN
-    )
-
-    target_compile_options(AiDAProtector PRIVATE
-        /W4 /EHsc /O2 /Zc:__cplusplus /permissive- /MD
-    )
-
-    target_link_libraries(AiDAProtector PRIVATE bcrypt advapi32)
-
-    target_link_libraries(AiDAProtector PRIVATE asmjit::asmjit)
-    target_include_directories(AiDAProtector PRIVATE "${_aida_asmjit_src}/src")
-
-    set_target_properties(AiDAProtector PROPERTIES
-        OUTPUT_NAME "aida_protector"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-    )
-
-    if(DEFINED STANDALONE_ROOT AND EXISTS "${STANDALONE_ROOT}/core/testlab/network_hook_sidecar.cpp")
-        add_executable(AiDA_NetworkHookSidecar_Protected
-            "${STANDALONE_ROOT}/core/testlab/network_hook_sidecar.cpp"
-        )
-
-        target_include_directories(AiDA_NetworkHookSidecar_Protected PRIVATE
-            "${STANDALONE_ROOT}"
-            "${STANDALONE_ROOT}/core"
-            "${STANDALONE_ROOT}/core/testlab"
-        )
-
-        target_compile_definitions(AiDA_NetworkHookSidecar_Protected PRIVATE
-            _CRT_SECURE_NO_WARNINGS
-            NOMINMAX
-            WIN32_LEAN_AND_MEAN
-            AIDA_SIDECAR_PROTECTED_BUILD=1
-        )
-
-        target_compile_options(AiDA_NetworkHookSidecar_Protected PRIVATE
-            /W3
-            /EHsc
-            /Zc:__cplusplus
-            /permissive-
-            /MD
-        )
-
-        target_link_libraries(AiDA_NetworkHookSidecar_Protected PRIVATE
-            ws2_32
-        )
-
-        set_target_properties(AiDA_NetworkHookSidecar_Protected PROPERTIES
-            CXX_STANDARD 17
-            CXX_STANDARD_REQUIRED YES
-            OUTPUT_NAME "AiDA_NetworkHookSidecar_Protected"
-            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-            RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
-            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
-            RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
-        )
-
-        add_dependencies(AiDA_NetworkHookSidecar_Protected AiDAProtector)
-        add_custom_command(TARGET AiDA_NetworkHookSidecar_Protected POST_BUILD
-            COMMAND ${CMAKE_COMMAND}
-                "-DRETRY_LABEL=AiDA_NetworkHookSidecar_Protected.exe-protect"
-                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA_NetworkHookSidecar_Protected>;--output;$<TARGET_FILE:AiDA_NetworkHookSidecar_Protected>;--all;--no-encrypt-imports;--tamper-level;2;--verbose"
-                -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-            COMMENT "Protecting AiDA_NetworkHookSidecar_Protected.exe..."
-            VERBATIM
-        )
-    endif()
-
-    add_executable(AiDAExtractPayload tools/protector/payload/extract_payload.cpp)
-    target_compile_options(AiDAExtractPayload PRIVATE /W4 /WX /EHsc $<IF:$<CONFIG:Debug>,/Od,/O2> /Zc:__cplusplus /std:c++17)
-    target_compile_definitions(AiDAExtractPayload PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
-
-    set(AIDA_PAYLOAD_BASE_OBJ "${CMAKE_BINARY_DIR}/aida_payload_base.obj")
-    set(AIDA_PAYLOAD_BASE_HDR "${CMAKE_BINARY_DIR}/generated/payload_blob_base.hpp")
-    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
-
-    find_program(AIDA_MSVC_CL cl.exe REQUIRED)
-
-    add_custom_command(
-        OUTPUT "${AIDA_PAYLOAD_BASE_OBJ}"
-        COMMAND "${AIDA_MSVC_CL}" /nologo /c /GS- /GR- /Od /Oi /Ob0 /Zl /EHs- /Gw /W3
-                /D_NO_CRT_STDIO_INLINE /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX
-                /Fo${AIDA_PAYLOAD_BASE_OBJ}
-                ${CMAKE_SOURCE_DIR}/tools/protector/payload/payload.c
-        DEPENDS "${CMAKE_SOURCE_DIR}/tools/protector/payload/payload.c"
-        COMMENT "Compiling AiDA base PIC payload..."
-        VERBATIM
-    )
-
-    add_custom_command(
-        OUTPUT "${AIDA_PAYLOAD_BASE_HDR}"
-        COMMAND "$<TARGET_FILE:AiDAExtractPayload>"
-                "${AIDA_PAYLOAD_BASE_OBJ}"
-                "${AIDA_PAYLOAD_BASE_HDR}"
-                kAidaUnpackBlob
-                aida_payload_base
-        DEPENDS "${AIDA_PAYLOAD_BASE_OBJ}" AiDAExtractPayload
-        COMMENT "Extracting AiDA base PIC payload blob..."
-        VERBATIM
-    )
-
-    add_custom_target(AiDAPayloadBlob DEPENDS "${AIDA_PAYLOAD_BASE_HDR}")
-    add_dependencies(AiDAProtector AiDAPayloadBlob)
-    target_include_directories(AiDAProtector PRIVATE "${CMAKE_BINARY_DIR}/generated")
-
-    add_executable(AiDAProtectorVerify tools/protector/verify.cpp)
-    target_include_directories(AiDAProtectorVerify PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/tools/protector
-    )
-    target_compile_definitions(AiDAProtectorVerify PRIVATE
-        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
-    )
-    target_compile_options(AiDAProtectorVerify PRIVATE
-        /W4 /EHsc $<IF:$<CONFIG:Debug>,/Od,/O2> /Zc:__cplusplus /permissive- /MD
-    )
-    target_link_libraries(AiDAProtectorVerify PRIVATE bcrypt advapi32)
-    set_target_properties(AiDAProtectorVerify PROPERTIES
-        OUTPUT_NAME "aida_protector_verify"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-    )
-
-    add_executable(AiDAProtectorTest tools/protector/test_runner.cpp)
-    target_compile_definitions(AiDAProtectorTest PRIVATE
-        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
-    )
-    target_compile_options(AiDAProtectorTest PRIVATE
-        /W4 /EHsc $<IF:$<CONFIG:Debug>,/Od,/O2> /Zc:__cplusplus /permissive- /MD
-    )
-    set_target_properties(AiDAProtectorTest PROPERTIES
-        OUTPUT_NAME "aida_protector_test"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-    )
-
-    option(BUILD_MATRYOSHKA_TEST "Build the Matryoshka 3-layer pack-section test harness" ON)
-    if(BUILD_MATRYOSHKA_TEST)
-        add_executable(MATRYOSHKA_TEST tools/matryoshka_test/matryoshka_test.cpp)
-        target_include_directories(MATRYOSHKA_TEST PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/tools/protector
-        )
-        target_compile_definitions(MATRYOSHKA_TEST PRIVATE
-            _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
-        )
-        target_compile_options(MATRYOSHKA_TEST PRIVATE
-            /W4 /EHsc $<IF:$<CONFIG:Debug>,/Od,/O2> /Zc:__cplusplus /permissive- /MD /std:c++17
-        )
-        target_link_libraries(MATRYOSHKA_TEST PRIVATE bcrypt advapi32)
-        set_target_properties(MATRYOSHKA_TEST PROPERTIES
-            OUTPUT_NAME "matryoshka_test"
-            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-        )
-    endif()
-
-    add_executable(AiDATestPayload tools/protector/test_payload/test_payload.c)
-    target_compile_options(AiDATestPayload PRIVATE /W3 $<IF:$<CONFIG:Debug>,/Od,/O2> /MD)
-    set_target_properties(AiDATestPayload PROPERTIES
-        OUTPUT_NAME "aida_test_payload"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-    )
-
-    add_executable(AiDAHelloLoop tools/protector/test_payload/hello_loop.cpp)
-    target_compile_options(AiDAHelloLoop PRIVATE /W3 $<IF:$<CONFIG:Debug>,/Od,/O2> /MD /EHsc /std:c++17 /Zc:threadSafeInit)
-    target_compile_definitions(AiDAHelloLoop PRIVATE
-        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
-    )
-    set_target_properties(AiDAHelloLoop PROPERTIES
-        OUTPUT_NAME "aida_hello_loop"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-    )
-    add_dependencies(AiDAHelloLoop AiDAProtector)
-
-    add_custom_command(TARGET AiDAHelloLoop POST_BUILD
-        COMMAND ${CMAKE_COMMAND}
-            "-DRETRY_LABEL=aida_hello_loop.exe-protect"
-            "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDAHelloLoop>;--output;$<TARGET_FILE:AiDAHelloLoop>;--all;--bind-machine;--tamper-level;3;--jit;--verbose"
-            -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-        COMMENT "Protecting aida_hello_loop.exe (full --all pipeline, with AV/indexer retry)..."
-        VERBATIM
-    )
-
-    add_executable(AiDAProtectorDiag tools/protector/test_payload/protector_diag.c)
-    target_compile_options(AiDAProtectorDiag PRIVATE /W3 $<IF:$<CONFIG:Debug>,/Od,/O2> /MD)
-    target_compile_definitions(AiDAProtectorDiag PRIVATE
-        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
-    )
-    set_target_properties(AiDAProtectorDiag PROPERTIES
-        OUTPUT_NAME "aida_protector_diag"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-    )
-    add_dependencies(AiDAProtectorDiag AiDAProtector)
-
-    add_custom_command(TARGET AiDAProtectorDiag POST_BUILD
-        COMMAND ${CMAKE_COMMAND}
-            "-DRETRY_LABEL=aida_protector_diag.exe-protect"
-            "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDAProtectorDiag>;--output;$<TARGET_FILE:AiDAProtectorDiag>;--all;--tamper-level;3;--jit;--verbose"
-            -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-        COMMENT "Protecting aida_protector_diag.exe with the diagnostic protector profile..."
-        VERBATIM
-    )
-
-    add_library(AiDAHelloDll SHARED tools/protector/test_payload/hello_dll.cpp)
-    target_compile_options(AiDAHelloDll PRIVATE /W3 /O2 /MD /EHsc /std:c++17 /Zc:threadSafeInit)
-    target_compile_definitions(AiDAHelloDll PRIVATE
-        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
-    )
-    set_target_properties(AiDAHelloDll PROPERTIES
-        OUTPUT_NAME "aida_hello_dll"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-    )
-    add_dependencies(AiDAHelloDll AiDAProtector)
-
-    add_executable(AiDADllLoader tools/protector/test_payload/dll_loader.cpp)
-    target_compile_options(AiDADllLoader PRIVATE /W3 /O2 /MD /EHsc /std:c++17)
-    target_compile_definitions(AiDADllLoader PRIVATE
-        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
-    )
-    set_target_properties(AiDADllLoader PROPERTIES
-        OUTPUT_NAME "aida_dll_loader"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-    )
-    add_dependencies(AiDADllLoader AiDAHelloDll)
-
-    # Wave 5: structured logger/reporter wrapping protector + verifier
-    add_executable(AiDAProtectorLogger tools/protector/protector_logger.cpp)
-    target_include_directories(AiDAProtectorLogger PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/tools/protector
-    )
-    target_compile_definitions(AiDAProtectorLogger PRIVATE
-        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
-    )
-    target_compile_options(AiDAProtectorLogger PRIVATE
-        /W4 /EHsc /O2 /Zc:__cplusplus /permissive- /MD
-    )
-    target_link_libraries(AiDAProtectorLogger PRIVATE bcrypt advapi32)
-    set_target_properties(AiDAProtectorLogger PROPERTIES
-        OUTPUT_NAME "aida_protector_logger"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-    )
-    add_dependencies(AiDAProtectorLogger AiDAProtector AiDATestPayload)
-
-    add_executable(AiDAProtectorPersonalize
-        tools/protector/personalize_main.cpp
-    )
-    target_include_directories(AiDAProtectorPersonalize PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/tools/protector
-    )
-    target_compile_definitions(AiDAProtectorPersonalize PRIVATE
-        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
-    )
-    target_compile_options(AiDAProtectorPersonalize PRIVATE
-        /W4 /EHsc /O2 /Zc:__cplusplus /permissive- /MD
-    )
-    target_link_libraries(AiDAProtectorPersonalize PRIVATE bcrypt advapi32)
-    set_target_properties(AiDAProtectorPersonalize PROPERTIES
-        OUTPUT_NAME "aida_protector_personalize"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
-    )
-    add_dependencies(AiDAProtectorPersonalize AiDAProtector)
-
-    option(BUILD_PROTECTOR_TESTS "Register CTest for the AiDA protector full matrix" ON)
-    if(BUILD_PROTECTOR_TESTS OR BUILD_TESTING)
-        enable_testing()
-        add_test(NAME protector_full_matrix
-                 COMMAND $<TARGET_FILE:AiDAProtectorLogger>
-                         --input  $<TARGET_FILE:AiDATestPayload>
-                         --output ${CMAKE_BINARY_DIR}/Release/protector_report.json
-                         --protector $<TARGET_FILE:AiDAProtector>)
-        set_tests_properties(protector_full_matrix PROPERTIES
-            PASS_REGULAR_EXPRESSION "\"probes_passed\": 32")
-    endif()
-
-    option(BUILD_WBAES_TEST "Build white-box AES-128 self-test executable" ON)
-    if(BUILD_WBAES_TEST)
-        add_subdirectory(tools/wbaes_test)
-        if(BUILD_PROTECTOR_TESTS OR BUILD_TESTING)
-            add_test(NAME wbaes_self_test COMMAND $<TARGET_FILE:WBAES_TEST>)
-            set_tests_properties(wbaes_self_test PROPERTIES
-                PASS_REGULAR_EXPRESSION "WBAES_TEST_PASSED")
-        endif()
-    endif()
-endif()
-
-if(BUILD_PROTECTOR)
-    if(TARGET AiDAStandalone)
-        if(TARGET aida_share_fingerprint_baker)
-            add_custom_command(TARGET AiDAStandalone POST_BUILD
-                COMMAND ${CMAKE_COMMAND}
-                    "-DRETRY_LABEL=AiDAStandalone.exe-bake-share-fingerprints"
-                    "-DRETRY_CMD=$<TARGET_FILE:aida_share_fingerprint_baker>;--input;$<TARGET_FILE:AiDAStandalone>;--output;$<TARGET_FILE:AiDAStandalone>"
-                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-                COMMENT "Baking per-share self-fingerprints into AiDAStandalone.exe (must run BEFORE protector: pack_sections zeroes .text)..."
-                VERBATIM
-            )
-            add_dependencies(AiDAStandalone aida_share_fingerprint_baker)
-        endif()
-        if(TARGET aida_pdb_scrubber)
-            add_custom_command(TARGET AiDAStandalone POST_BUILD
-                COMMAND ${CMAKE_COMMAND}
-                    "-DRETRY_LABEL=AiDAStandalone.exe-pre-protect-scrub"
-                    "-DRETRY_CMD=$<TARGET_FILE:aida_pdb_scrubber>;$<TARGET_FILE:AiDAStandalone>"
-                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-                COMMENT "Scrubbing Rich header and PDB paths from AiDAStandalone.exe before protection..."
-                VERBATIM
-            )
-            add_dependencies(AiDAStandalone aida_pdb_scrubber)
-        endif()
-        add_custom_command(TARGET AiDAStandalone POST_BUILD
-            COMMAND ${CMAKE_COMMAND}
-                "-DRETRY_LABEL=AiDAStandalone.exe-protect"
-                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDAStandalone>;--output;$<TARGET_FILE:AiDAStandalone>;--all;--target-standalone;--tamper-level;3;--jit;--verbose"
-            -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-            COMMENT "Protecting AiDAStandalone.exe (with AV/indexer retry)..."
-            VERBATIM
-        )
-        add_dependencies(AiDAStandalone AiDAProtector)
-        if(TARGET AiDAProtectorVerify)
-            add_custom_target(AiDAStandaloneNoIATVerify ALL
-                COMMAND ${CMAKE_COMMAND}
-                    "-DRETRY_LABEL=AiDAStandalone.exe-standalone-no-imports-verify"
-                    "-DRETRY_CMD=$<TARGET_FILE:AiDAProtectorVerify>;--profile;standalone-no-imports;$<TARGET_FILE:AiDAStandalone>"
-                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-                DEPENDS AiDAStandalone AiDAProtectorVerify
-                COMMENT "Verifying AiDAStandalone.exe standalone no-imports profile..."
-                VERBATIM
-            )
-        endif()
-    endif()
-
-    if(TARGET AiDA_ARC)
-        string(SUBSTRING "${AIDA_BUILD_SEED}" 0 32 AIDA_ARC_WATERMARK)
-        string(TOLOWER "${AIDA_ARC_WATERMARK}" AIDA_ARC_WATERMARK)
-        if(TARGET aida_pdb_scrubber)
-            add_custom_command(TARGET AiDA_ARC POST_BUILD
-                COMMAND ${CMAKE_COMMAND}
-                    "-DRETRY_LABEL=aida_core.dll-pre-protect-scrub"
-                    "-DRETRY_CMD=$<TARGET_FILE:aida_pdb_scrubber>;$<TARGET_FILE:AiDA_ARC>"
-                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-                COMMENT "Scrubbing Rich header and PDB paths from aida_core.dll before protection..."
-                VERBATIM
-            )
-            add_dependencies(AiDA_ARC aida_pdb_scrubber)
-        endif()
-        if(AIDA_ARC_ENCRYPT_IMPORTS)
-            add_custom_command(TARGET AiDA_ARC POST_BUILD
-                COMMAND ${CMAKE_COMMAND}
-                    "-DRETRY_LABEL=aida_core.dll-protect"
-                    "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA_ARC>;--output;$<TARGET_FILE:AiDA_ARC>;--all;--tamper-level;2;--deep-steal;--jit;--target-arc;--watermark;${AIDA_ARC_WATERMARK};--embed-watermark;--verbose"
-                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-                COMMENT "Protecting aida_core.dll (target-arc, encrypt-imports ON, with AV/indexer retry)..."
-                VERBATIM
-            )
-        else()
-            add_custom_command(TARGET AiDA_ARC POST_BUILD
-                COMMAND ${CMAKE_COMMAND}
-                    "-DRETRY_LABEL=aida_core.dll-protect"
-                    "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA_ARC>;--output;$<TARGET_FILE:AiDA_ARC>;--all;--no-encrypt-imports;--tamper-level;2;--deep-steal;--jit;--target-arc;--watermark;${AIDA_ARC_WATERMARK};--embed-watermark;--verbose"
-                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-                COMMENT "Protecting aida_core.dll (target-arc, encrypt-imports OFF, with AV/indexer retry)..."
-                VERBATIM
-            )
-        endif()
-        add_dependencies(AiDA_ARC AiDAProtector)
-    endif()
-
-    if(TARGET AiDA)
-        # if(TARGET aida_pdb_scrubber)
-        #     add_custom_command(TARGET AiDA POST_BUILD
-        #         COMMAND ${CMAKE_COMMAND}
-        #             "-DRETRY_LABEL=AiDA.dll-pre-protect-scrub"
-        #             "-DRETRY_CMD=$<TARGET_FILE:aida_pdb_scrubber>;$<TARGET_FILE:AiDA>"
-        #             -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-        #         COMMENT "Scrubbing Rich header and PDB paths from AiDA.dll before protection..."
-        #         VERBATIM
-        #     )
-        #     add_dependencies(AiDA aida_pdb_scrubber)
-        # endif()
-        # add_custom_command(TARGET AiDA POST_BUILD
-        #     COMMAND ${CMAKE_COMMAND}
-        #         "-DRETRY_LABEL=AiDA.dll-protect"
-        #         "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA>;--output;$<TARGET_FILE:AiDA>;--all;--no-encrypt-imports;--tamper-level;2;--no-jit;--preserve-loader-relocations;--verbose"
-        #         -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-        #     COMMENT "Protecting AiDA.dll (with AV/indexer retry)..."
-        #     VERBATIM
-        # )
-        # add_dependencies(AiDA AiDAProtector)
-    endif()
-endif()
-
-if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/nanomite_drx_test/CMakeLists.txt")
-    add_subdirectory(tools/nanomite_drx_test)
-endif()
-
-if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/dag_dispatch_test/CMakeLists.txt")
-    add_subdirectory(tools/dag_dispatch_test)
-endif()
-
-if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/overlap_test/CMakeLists.txt")
-    add_subdirectory(tools/overlap_test)
 endif()
 
 if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/test_target/CMakeLists.txt")

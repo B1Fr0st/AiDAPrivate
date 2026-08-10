@@ -116,16 +116,6 @@ static bool test_connect() {
     return true;
 }
 
-static void test_heartbeat() {
-    section("CORE: Heartbeat");
-
-    bool ok = device->send_heartbeat();
-    report("send_heartbeat()", ok);
-
-    ok = device->refresh_heartbeat();
-    report("refresh_heartbeat()", ok);
-}
-
 static std::uint32_t test_find_process() {
     section("CORE: Find Process");
 
@@ -1436,89 +1426,6 @@ static void test_fingerprinting() {
     report("fingerprint_op(stop)", ok);
 }
 
-static void test_dll_protection() {
-    section("DLL PROTECTION: Register / Query / Unregister");
-
-    std::uint64_t base = device->get_base_address();
-    if (base == 0) {
-        skip("register_dll_protection()", "no base address");
-        skip("query_dll_protection()", "no base address");
-        skip("unregister_dll_protection()", "no base address");
-        return;
-    }
-
-
-    std::uint32_t e_lfanew = device->read<std::uint32_t>(base + 0x3C);
-    if (e_lfanew == 0 || e_lfanew > 0x1000) {
-        char detail[128];
-        snprintf(detail, sizeof(detail), "e_lfanew=0x%X (invalid, process may have exited)", e_lfanew);
-        skip("register_dll_protection()", detail);
-        skip("query_dll_protection()", "no registration");
-        skip("unregister_dll_protection()", "no registration");
-        return;
-    }
-    std::uint64_t nt_hdr = base + e_lfanew;
-
-    std::uint16_t num_sections = device->read<std::uint16_t>(nt_hdr + 4 + 2);
-    std::uint16_t opt_hdr_size = device->read<std::uint16_t>(nt_hdr + 4 + 16);
-    std::uint64_t first_section = nt_hdr + 4 + 20 + opt_hdr_size;
-
-    std::uint32_t text_vsize = 0;
-    std::uint32_t text_rva = 0;
-
-    for (std::uint16_t s = 0; s < num_sections && s < 64; s++) {
-        std::uint64_t sec = first_section + static_cast<std::uint64_t>(s) * 40;
-        char sec_name[9] = {};
-        for (int c = 0; c < 8; c++)
-            sec_name[c] = static_cast<char>(device->read<std::uint8_t>(sec + c));
-
-        std::uint32_t vsize = device->read<std::uint32_t>(sec + 8);
-        std::uint32_t rva   = device->read<std::uint32_t>(sec + 12);
-        std::uint32_t chars = device->read<std::uint32_t>(sec + 36);
-
-        printf("  [INFO] Section[%u]: name=%.8s vsize=0x%X rva=0x%X chars=0x%X\n",
-               s, sec_name, vsize, rva, chars);
-
-        if (std::strcmp(sec_name, ".text") == 0 ||
-            (text_vsize == 0 && (chars & 0x20))) {
-            text_vsize = vsize;
-            text_rva = rva;
-            if (text_vsize == 0)
-                text_vsize = device->read<std::uint32_t>(sec + 16);
-        }
-    }
-
-    std::uint64_t text_va = base + text_rva;
-
-    char detail[256];
-    snprintf(detail, sizeof(detail), "text_va=0x%llX text_size=0x%X",
-             (unsigned long long)text_va, text_vsize);
-    printf("  [INFO] PE sections: %s\n", detail);
-
-    if (text_vsize == 0) {
-        skip("register_dll_protection()", "could not find .text section (vsize=0)");
-        skip("query_dll_protection()", "no registration");
-        skip("unregister_dll_protection()", "no registration");
-        return;
-    }
-
-
-    bool ok = device->register_dll_protection(base, text_va, text_vsize,
-                                               0x12345678AABBCCDDULL, 60000);
-    report("register_dll_protection()", ok);
-
-    voyager::device_t::dll_protect_status status{};
-    ok = device->query_dll_protection(status);
-    snprintf(detail, sizeof(detail), "status=%u current_hash=0x%llX expected=0x%llX",
-             status.status, (unsigned long long)status.current_hash,
-             (unsigned long long)status.expected_hash);
-    report("query_dll_protection()", ok, detail);
-
-    ok = device->unregister_dll_protection();
-    report("unregister_dll_protection()", ok);
-}
-
-
 int main() {
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
@@ -1572,9 +1479,6 @@ int main() {
         return 1;
     }
 
-    test_heartbeat();
-
-
     std::uint32_t found_pid = test_find_process();
     if (found_pid == 0) {
         printf("\n[FATAL] Cannot find test_target.exe via driver. Aborting.\n");
@@ -1617,9 +1521,6 @@ int main() {
 
 
     test_process_info(base);
-
-
-    test_dll_protection();
 
 
     test_remote_call(base, found_pid);

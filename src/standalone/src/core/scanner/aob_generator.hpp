@@ -29,7 +29,6 @@
 #include "zydis_disasm.hpp"
 #include "disasm_view.hpp"
 #include "../helpers/diag_log.hpp"
-#include "../anti-tamper/webhook.hpp"
 #include "../ui/toast_notification.hpp"
 
 #ifdef AIDA_STANDALONE
@@ -383,14 +382,14 @@ inline void generate_from_address_with_state(
 		"generate_from_address called va=0x%llX len=%d auto_wildcard=%d",
 		static_cast<unsigned long long>(address), num_instructions, static_cast<int>(auto_wildcard));
 	diag::log_tagged("aob", dbg_buf);
-	anti_tamper::webhook::write_log("aob", dbg_buf);
+	diag::log_tagged("aob", dbg_buf);
 
 	if (num_instructions < 1) num_instructions = 1;
 	if (num_instructions > 128) num_instructions = 128;
 
 	if (state->generating.load()) {
 		diag::log_tagged("aob", "generate_from_address refused already_generating");
-		anti_tamper::webhook::write_log("aob", "refused already_generating");
+		diag::log_tagged("aob", "refused already_generating");
 		{
 			std::lock_guard<std::mutex> lk(state->mutex);
 			state->last_error = "Generator is already busy with another address.";
@@ -402,7 +401,7 @@ inline void generate_from_address_with_state(
 			"failed reason=zero_address addr=0x%llX",
 			static_cast<unsigned long long>(address));
 		diag::log_tagged("aob", dbg_buf);
-		anti_tamper::webhook::write_log("aob", dbg_buf);
+		diag::log_tagged("aob", dbg_buf);
 		{
 			std::lock_guard<std::mutex> lk(state->mutex);
 			state->last_error = "No address selected. Click an instruction in the disassembly first.";
@@ -436,7 +435,7 @@ inline void generate_from_address_with_state(
 			static_cast<unsigned long long>(static_image_base));
 	}
 	diag::log_tagged("aob", dbg_buf);
-	anti_tamper::webhook::write_log("aob", dbg_buf);
+	diag::log_tagged("aob", dbg_buf);
 
 	if (!driver_attached && !static_pe_available) {
 		std::snprintf(dbg_buf, sizeof(dbg_buf),
@@ -445,7 +444,7 @@ inline void generate_from_address_with_state(
 			static_cast<int>(driver_attached), drv_pid,
 			static_cast<int>(static_pe_available));
 		diag::log_tagged("aob", dbg_buf);
-		anti_tamper::webhook::write_log("aob", dbg_buf);
+		diag::log_tagged("aob", dbg_buf);
 		{
 			std::lock_guard<std::mutex> lk(state->mutex);
 			state->last_error = "No data source available. Attach a process or open a PE file.";
@@ -458,7 +457,7 @@ inline void generate_from_address_with_state(
 		static_cast<int>(auto_wildcard),
 		driver_attached ? "live" : "static_pe");
 	diag::log_tagged("aob", dbg_buf);
-	anti_tamper::webhook::write_log("aob", dbg_buf);
+	diag::log_tagged("aob", dbg_buf);
 
 	state->generating.store(true);
 
@@ -474,7 +473,7 @@ inline void generate_from_address_with_state(
 			static_cast<int>(driver_attached),
 			static_cast<int>(static_pe_available));
 		diag::log_tagged("aob", lbuf);
-		anti_tamper::webhook::write_log("aob", lbuf);
+		diag::log_tagged("aob", lbuf);
 
 		signature_t sig;
 		sig.id = allocate_signature_id();
@@ -525,7 +524,7 @@ inline void generate_from_address_with_state(
 				static_cast<unsigned long long>(address),
 				static_pe_available ? context.image->sections().size() : 0);
 			diag::log_tagged("aob", lbuf);
-			anti_tamper::webhook::write_log("aob", lbuf);
+			diag::log_tagged("aob", lbuf);
 		}
 		if (!read_ok || code.empty()) {
 			std::snprintf(lbuf, sizeof(lbuf),
@@ -534,7 +533,7 @@ inline void generate_from_address_with_state(
 				static_cast<int>(driver_attached),
 				static_cast<int>(static_pe_available));
 			diag::log_tagged("aob", lbuf);
-			anti_tamper::webhook::write_log("aob", lbuf);
+			diag::log_tagged("aob", lbuf);
 			{
 				std::lock_guard<std::mutex> lk(state->mutex);
 				state->last_error = "Failed to read bytes at the requested address.";
@@ -588,7 +587,7 @@ inline void generate_from_address_with_state(
 				static_cast<unsigned long long>(address), code.size(), source_label,
 				code.empty() ? 0u : code[0]);
 			diag::log_tagged("aob", lbuf);
-			anti_tamper::webhook::write_log("aob", lbuf);
+			diag::log_tagged("aob", lbuf);
 			{
 				std::lock_guard<std::mutex> lk(state->mutex);
 				state->last_error = "Zydis failed to decode any instruction at this address.";
@@ -620,7 +619,7 @@ inline void generate_from_address_with_state(
 				"failed reason=empty_pattern addr=0x%llX decoded=%zu",
 				static_cast<unsigned long long>(address), instrs.size());
 			diag::log_tagged("aob", lbuf);
-			anti_tamper::webhook::write_log("aob", lbuf);
+			diag::log_tagged("aob", lbuf);
 			{
 				std::lock_guard<std::mutex> lk(state->mutex);
 				state->last_error = "Decoded instructions produced no signature bytes.";
@@ -663,7 +662,7 @@ inline void generate_from_address_with_state(
 			static_cast<unsigned long long>(address), decoded_instrs,
 			static_cast<double>(qs), static_cast<unsigned long long>(dur_ms));
 		diag::log_tagged("aob", lbuf);
-		anti_tamper::webhook::write_log("aob", lbuf);
+		diag::log_tagged("aob", lbuf);
 
 		{
 			char toast_buf[160];
@@ -703,7 +702,7 @@ inline void generate_from_address_with_state(
 	const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
 	if (!posted) {
 		diag::log_tagged("aob", "worker_queue_rejected clearing_generating_flag");
-		anti_tamper::webhook::write_log("aob", "worker queue rejected");
+		diag::log_tagged("aob", "worker queue rejected");
 		state->generating.store(false);
 		{
 			std::lock_guard<std::mutex> lk(state->mutex);

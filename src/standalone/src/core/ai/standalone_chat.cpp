@@ -36,7 +36,6 @@
 #include "mcp_client.hpp"
 #include "mcp_marketplace.hpp"
 #include "standalone_ai_client.hpp"
-#include "standalone_license.hpp"
 #include "standalone_settings.hpp"
 #include "standalone_driver.hpp"
 #include "agent_registry.hpp"
@@ -68,10 +67,6 @@
 #include "standalone_context.hpp"
 #include "skills.hpp"
 #include "../analysis/stealth_engine.hpp"
-#include "../anti-tamper/mcp_posture.hpp"
-#include "../anti-tamper/init_guard.hpp"
-#include "../anti-tamper/state.hpp"
-#include "../testlab/test_all_features.hpp"
 #include "../ui/components.hpp"
 #include "../ui/design_system.hpp"
 #include "../ui/fonts.hpp"
@@ -388,77 +383,6 @@ void note_tool_execution_for_approval_limits()
     s_approval_counters.auto_approved_requests++;
 }
 
-void queue_mcp_services_shutdown(const char* reason, bool stop_server, bool disconnect_clients)
-{
-    if (!stop_server && !disconnect_clients)
-        return;
-
-    const bool already = s_mcp_shutdown_in_flight.exchange(true, std::memory_order_acq_rel);
-    if (already) {
-        diag::log_tagged_fmt("init_chat",
-            "authorized_mcp_services_shutdown_already_in_flight reason=%s stop_server=%d disconnect_clients=%d",
-            reason ? reason : "<null>",
-            stop_server ? 1 : 0,
-            disconnect_clients ? 1 : 0);
-        return;
-    }
-
-    std::string reason_copy = reason ? reason : "unknown";
-    auto task = [reason_copy, stop_server, disconnect_clients]() {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        diag::log_tagged_fmt("init_chat",
-            "authorized_mcp_services_shutdown_worker_enter reason=%s stop_server=%d disconnect_clients=%d tid=%lu",
-            reason_copy.c_str(),
-            stop_server ? 1 : 0,
-            disconnect_clients ? 1 : 0,
-            GetCurrentThreadId());
-        try {
-            if (stop_server) {
-                diag::log_tagged("init_chat", "authorized_mcp_server_stop_worker_start");
-                s_mcp_server.stop();
-                diag::log_tagged("init_chat", "authorized_mcp_server_stop_worker_done");
-            }
-        } catch (const std::exception& e) {
-            diag::log_tagged_fmt("init_chat", "authorized_mcp_server_stop_worker_exception what=%s", e.what());
-        } catch (...) {
-            diag::log_tagged("init_chat", "authorized_mcp_server_stop_worker_exception what=<unknown>");
-        }
-
-        try {
-            if (disconnect_clients) {
-                diag::log_tagged("init_chat", "authorized_mcp_client_disconnect_worker_start");
-                s_mcp_client_mgr.disconnect_all();
-                diag::log_tagged("init_chat", "authorized_mcp_client_disconnect_worker_done");
-            }
-        } catch (const std::exception& e) {
-            diag::log_tagged_fmt("init_chat", "authorized_mcp_client_disconnect_worker_exception what=%s", e.what());
-        } catch (...) {
-            diag::log_tagged("init_chat", "authorized_mcp_client_disconnect_worker_exception what=<unknown>");
-        }
-
-        s_mcp_shutdown_in_flight.store(false, std::memory_order_release);
-        diag::log_tagged_fmt("init_chat",
-            "authorized_mcp_services_shutdown_worker_exit reason=%s elapsed_ms=%llu",
-            reason_copy.c_str(),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-    };
-
-    bool posted = submit_chat_task(
-        "authorized_mcp_services_shutdown",
-        aida::infra::executor::domain_t::security_liveness,
-        "lifecycle_gate",
-        5,
-        std::move(task));
-    if (!posted) {
-        s_mcp_shutdown_in_flight.store(false, std::memory_order_release);
-        diag::log_tagged_fmt("init_chat",
-            "authorized_mcp_services_shutdown_post_failed reason=%s stop_server=%d disconnect_clients=%d",
-            reason_copy.c_str(),
-            stop_server ? 1 : 0,
-            disconnect_clients ? 1 : 0);
-    }
-}
-
 struct mcp_start_in_flight_guard_t
 {
     ~mcp_start_in_flight_guard_t()
@@ -477,31 +401,13 @@ void start_authorized_mcp_services_worker()
         return;
     }
 
-    if (!anti_tamper::mcp_posture::is_current_posture_trusted())
-    {
-        mcp_standalone::set_ide_lifecycle_ready(false);
-        diag::log_tagged_fmt("init_chat",
-            "authorized_mcp_services_blocked_mcp_posture summary_hash=0x%016llX",
-            static_cast<unsigned long long>(anti_tamper::mcp_posture::cached_summary_hash()));
-        return;
-    }
-
-    std::string missing_exports;
     const bool ide_ready = s_ide_ready_for_mcp_services.load(std::memory_order_acquire);
-    const bool valid = license::validated && standalone_license::is_valid();
-    const bool arc_loaded = standalone_license::is_arc_loaded();
-    const bool exports_ok = valid && arc_loaded && standalone_license::validate_arc_required_exports(missing_exports);
-    if (!ide_ready || !valid || !arc_loaded || !exports_ok)
+    if (!ide_ready)
     {
         mcp_standalone::set_ide_lifecycle_ready(false);
         diag::log_tagged_fmt("init_chat",
-            "authorized_mcp_services_blocked ide=%d validated=%d valid=%d arc=%d exports=%d missing='%.160s'",
-            ide_ready ? 1 : 0,
-            license::validated ? 1 : 0,
-            standalone_license::is_valid() ? 1 : 0,
-            standalone_license::is_arc_loaded() ? 1 : 0,
-            exports_ok ? 1 : 0,
-            missing_exports.c_str());
+            "authorized_mcp_services_blocked ide=%d",
+            ide_ready ? 1 : 0);
         return;
     }
 
@@ -541,13 +447,9 @@ void start_authorized_mcp_services_worker()
         }
         s_last_start_attempt = now;
         diag::log_tagged_fmt("init_chat",
-            "authorized_mcp_server_start port=%d ide=%d validated=%d valid=%d arc=%d exports=%d tid=%lu",
+            "authorized_mcp_server_start port=%d ide=%d tid=%lu",
             g_sa_settings.mcp_port,
             ide_ready ? 1 : 0,
-            license::validated ? 1 : 0,
-            standalone_license::is_valid() ? 1 : 0,
-            standalone_license::is_arc_loaded() ? 1 : 0,
-            exports_ok ? 1 : 0,
             GetCurrentThreadId());
         bool server_start_result = false;
         try {
@@ -1123,18 +1025,6 @@ std::string execute_tool(const std::string& raw_name, const json& arguments)
 {
     std::string name = canonical_tool_name_for_dispatch(raw_name);
 
-    (void)standalone_license::verify_entitlement_state();
-    {
-        std::string lifecycle_reason;
-        if (!mcp_standalone::lifecycle_authorized(&lifecycle_reason)) {
-            diag::log_tagged_fmt("mcp_standalone",
-                "local_tool_dispatch_blocked tool='%s' reason='%.160s'",
-                name.c_str(),
-                lifecycle_reason.c_str());
-            return "Error: AiDA MCP is not authorized. Open AiDAStandalone.exe, authenticate, and wait for the protected runtime to finish loading.";
-        }
-    }
-
     output_log::push(bottom_tab_t::mcp_log, "[tool] Executing: " + name);
 
 
@@ -1417,25 +1307,6 @@ size_t tool_fanout_worker_limit(size_t group_size)
     return (std::min)(limit, group_size);
 }
 
-bool tool_runtime_preflight(const std::string& tool_name, std::string& error_text)
-{
-    uint64_t gate = standalone_license::inline_gate_check(
-        standalone_license::gate_chat_tool_exec);
-    if (!standalone_license::verify_tool_runtime(
-            standalone_license::gate_chat_tool_exec, gate, tool_name)) {
-        error_text = "Service unavailable.";
-        return false;
-    }
-
-    if (!standalone_license::inline_proof_check_d()) {
-        error_text = "Error: Tool execution timed out.";
-        return false;
-    }
-
-    error_text.clear();
-    return true;
-}
-
 void apply_tool_repetition_guard(
     const std::string& tool_name,
     const json& arguments,
@@ -1653,23 +1524,6 @@ bool run_ordered_tool_calls(
             return false;
         }
 
-        std::string security_error;
-        if (!tool_runtime_preflight(req.name, security_error)) {
-            if (!flush_group())
-                return false;
-            tool_execution_result_t result;
-            result.ready = true;
-            result.is_error = true;
-            result.text = security_error;
-            ordered_results[req.index] = std::move(result);
-            diag::log_tagged_fmt("chat",
-                "agent_tool_fanout_security_block original=%zu tool=%.96s reason=%.160s",
-                req.index,
-                req.name.c_str(),
-                security_error.c_str());
-            continue;
-        }
-
         std::string deny_reason;
         const auto approval = probe_tool_approval_without_prompt(
             req.name, req.arguments, projected_counters, deny_reason);
@@ -1685,20 +1539,6 @@ bool run_ordered_tool_calls(
 
             if (!flush_group())
                 return false;
-
-            if (!tool_runtime_preflight(req.name, security_error)) {
-                tool_execution_result_t result;
-                result.ready = true;
-                result.is_error = true;
-                result.text = security_error;
-                ordered_results[req.index] = std::move(result);
-                diag::log_tagged_fmt("chat",
-                    "agent_tool_fanout_serial_security_block original=%zu tool=%.96s reason=%.160s",
-                    req.index,
-                    req.name.c_str(),
-                    security_error.c_str());
-                continue;
-            }
 
             post_update(ai_update_t::THINKING, "Calling " + req.name + "...");
 
@@ -1733,20 +1573,6 @@ bool run_ordered_tool_calls(
         }
 
         post_update(ai_update_t::THINKING, "Calling " + req.name + "...");
-
-        if (!tool_runtime_preflight(req.name, security_error)) {
-            tool_execution_result_t result;
-            result.ready = true;
-            result.is_error = true;
-            result.text = security_error;
-            ordered_results[req.index] = std::move(result);
-            diag::log_tagged_fmt("chat",
-                "agent_tool_fanout_prompt_security_block original=%zu tool=%.96s reason=%.160s",
-                req.index,
-                req.name.c_str(),
-                security_error.c_str());
-            continue;
-        }
 
         if (!request_tool_approval(req.name, req.arguments)) {
             const std::string& deny_text_ref = tool_approval_last_deny_reason();
@@ -1797,28 +1623,6 @@ void run_agentic(std::string user_message,
         user_message.size(),
         history.size());
 
-    {
-        uint64_t gate = standalone_license::inline_gate_check(
-            standalone_license::gate_chat_pre_agentic);
-        const double v = standalone_license::verify_gate_token(
-            standalone_license::gate_chat_pre_agentic, gate);
-        if (v < 0.5) {
-            diag::log_tagged_fmt("chat",
-                "run_agentic_pre_agentic_gate_blocked gt=0x%016llX v=%.3f",
-                static_cast<unsigned long long>(gate), v);
-            post_update(ai_update_t::ERR,
-                standalone_license::decode_status_string(
-                    standalone_license::str_session_revoked));
-            return;
-        }
-    }
-
-    if (!standalone_license::is_valid()) {
-        diag::log_tagged("chat", "run_agentic_license_invalid");
-        post_update(ai_update_t::ERR, "Session expired. Please restart.");
-        return;
-    }
-
     post_update(ai_update_t::THINKING);
     output_log::push(bottom_tab_t::output, "[ai] New request: " + user_message.substr(0, 120) + (user_message.size() > 120 ? "..." : ""));
 
@@ -1849,11 +1653,6 @@ void run_agentic(std::string user_message,
             }
 
 
-            if (standalone_license::inline_proof_check_a() < 0.5) {
-                post_update(ai_update_t::ERR, "Service degraded. Please restart the application.");
-                return;
-            }
-
             if (turn > 0)
                 post_update(ai_update_t::THINKING, "Processing tool results...");
 
@@ -1883,18 +1682,6 @@ void run_agentic(std::string user_message,
                 return;
             }
 
-
-            {
-                uint64_t gate = standalone_license::inline_gate_check(
-                    standalone_license::gate_chat_post_response);
-                if (standalone_license::verify_gate_token(
-                        standalone_license::gate_chat_post_response, gate) < 0.5) {
-                    post_update(ai_update_t::ERR,
-                        standalone_license::decode_status_string(
-                            standalone_license::str_session_revoked));
-                    return;
-                }
-            }
 
             std::string thinking_content;
             std::string clean_response = response;
@@ -2096,11 +1883,6 @@ void run_agentic(std::string user_message,
     for (int turn = 0; turn < max_turns; ++turn) {
         if (s_cancel.load()) { post_update(ai_update_t::COMPLETE); return; }
 
-        if (standalone_license::inline_proof_check_a() < 0.5) {
-            post_update(ai_update_t::ERR, "Service degraded. Please restart the application.");
-            return;
-        }
-
 
         {
             std::string active_model = settings_snapshot.get_active_model();
@@ -2259,18 +2041,6 @@ void run_agentic(std::string user_message,
             }
         }
 
-
-        {
-            uint64_t gate = standalone_license::inline_gate_check(
-                standalone_license::gate_chat_post_response);
-            if (standalone_license::verify_gate_token(
-                    standalone_license::gate_chat_post_response, gate) < 0.5) {
-                post_update(ai_update_t::ERR,
-                    standalone_license::decode_status_string(
-                        standalone_license::str_session_revoked));
-                return;
-            }
-        }
 
         if (!gen.thinking.empty() && !gen.thinking_streamed)
             post_update(ai_update_t::THINKING, gen.thinking);
@@ -2438,20 +2208,10 @@ void register_standalone_protection() {
             return;
     }
 
-    if (!standalone_license::is_valid()) {
-        diag::log_tagged_fmt("init_chat",
-            "register_standalone_protection_deferred auth_ok=0 arc_loaded=%d",
-            standalone_license::is_arc_loaded() ? 1 : 0);
-        return;
-    }
-
     auto dyn = driver_bridge::dynamic_ioctl_state();
     if (!dyn.ready) {
-        const std::string run_id = standalone_license::run_correlation_id();
         diag::log_tagged_fmt("init_chat",
-            "preauth_skipped_dynamic_ioctl_not_ready phase=register_standalone_protection op=heartbeat run_id=%s runtime_authorized=%d loaded=%d kernel=%d connected=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
-            run_id.c_str(),
-            standalone_license::is_valid() ? 1 : 0,
+            "preauth_skipped_dynamic_ioctl_not_ready phase=register_standalone_protection op=heartbeat loaded=%d kernel=%d connected=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
             dyn.loaded ? 1 : 0,
             dyn.kernel ? 1 : 0,
             dyn.connected ? 1 : 0,
@@ -2514,18 +2274,6 @@ __declspec(noinline) static DWORD seh_settings_load(settings_sa_t& s, bool& out_
     return 0;
 }
 
-__declspec(noinline) static DWORD seh_standalone_license_initialize(settings_sa_t& s, bool& out_ok)
-{
-    out_ok = false;
-    __try {
-        out_ok = standalone_license::initialize(s);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        anti_tamper::init_guard::mark_seh_abort(GetExceptionCode(), "seh_standalone_license_initialize");
-        return GetExceptionCode();
-    }
-    return 0;
-}
-
 __declspec(noinline) static DWORD seh_register_standalone_protection_call()
 {
     __try {
@@ -2550,12 +2298,10 @@ void init_standalone_chat()
 {
     if (s_initialized.load(std::memory_order_acquire)) return;
 
-    const std::string run_id = standalone_license::run_correlation_id();
-    diag::log_tagged_fmt("init_chat", "startup_context run_id=%s pid=%lu tid=%lu",
-        run_id.c_str(),
+    diag::log_tagged_fmt("init_chat", "startup_context pid=%lu tid=%lu",
         GetCurrentProcessId(),
         GetCurrentThreadId());
-    diag::log_tagged_fmt("init_chat", "settings_load_start run_id=%s", run_id.c_str());
+    diag::log_tagged("init_chat", "settings_load_start");
     bool settings_loaded = false;
     DWORD seh_load = seh_settings_load(g_sa_settings, settings_loaded);
     if (seh_load != 0)
@@ -2629,38 +2375,6 @@ void init_standalone_chat()
 
     themes::changed = true;
 
-
-    const ULONGLONG license_init_start_ms = GetTickCount64();
-    diag::log_tagged_fmt("init_chat", "license_initialize_start run_id=%s key_len=%zu session_len=%zu arc_ok=%d tick=%llu",
-        run_id.c_str(),
-        g_sa_settings.license_key.size(),
-        g_sa_settings.license_session_token.size(),
-        g_sa_settings.license_arc_load_ok ? 1 : 0,
-        static_cast<unsigned long long>(license_init_start_ms));
-    bool license_ok = false;
-    DWORD seh_lic = seh_standalone_license_initialize(g_sa_settings, license_ok);
-    if (seh_lic != 0)
-        diag::log_tagged_fmt("init_chat", "license_initialize_seh code=0x%08lX last_err=%lu elapsed_ms=%llu",
-            seh_lic,
-            GetLastError(),
-            static_cast<unsigned long long>(GetTickCount64() - license_init_start_ms));
-    license::validated = license_ok;
-    license::saved_key = g_sa_settings.license_key;
-    strncpy_s(license::key_buf, sizeof(license::key_buf),
-              g_sa_settings.license_key.c_str(), _TRUNCATE);
-    if (!license::validated && !standalone_license::last_error().empty())
-        license::error_msg = standalone_license::last_error();
-    license::check_failed = !license::validated && !license::error_msg.empty();
-    {
-        const std::string runtime_snapshot = standalone_license::runtime_state_snapshot();
-        diag::log_tagged_fmt("init_chat", "license_initialize_done run_id=%s elapsed_ms=%llu validated=%d canonical_valid=%d arc=%d state={%.512s}",
-            run_id.c_str(),
-            static_cast<unsigned long long>(GetTickCount64() - license_init_start_ms),
-            license::validated ? 1 : 0,
-            standalone_license::is_valid() ? 1 : 0,
-            standalone_license::is_arc_loaded() ? 1 : 0,
-            runtime_snapshot.c_str());
-    }
 
     diag::log_tagged("init_chat", "ai_client_create_start");
     g_sa_ai_client = std::make_unique<standalone_ai_client_t>(g_sa_settings);
@@ -2789,7 +2503,6 @@ void init_standalone_chat()
     diag::log_tagged("init_chat", "restore_workspace_state_done");
 
     output_log::push(bottom_tab_t::output, "[init] AiDA Standalone initialized");
-    output_log::push(bottom_tab_t::output, "[init] License: " + std::string(license::validated ? "valid" : "not validated"));
     if (s_server_started.load(std::memory_order_acquire))
         output_log::push(bottom_tab_t::mcp_log, "[mcp-server] Started on port " + std::to_string(g_sa_settings.mcp_port));
     output_log::push(bottom_tab_t::driver_log, "[driver] Bridge initialized");
@@ -2814,28 +2527,8 @@ void start_authorized_mcp_services()
         return;
     }
 
-    if (!anti_tamper::mcp_posture::is_current_posture_trusted())
-    {
-        mcp_standalone::set_ide_lifecycle_ready(false);
-        static auto s_last_posture_block_log = std::chrono::steady_clock::time_point{};
-        auto now = std::chrono::steady_clock::now();
-        if (s_last_posture_block_log == std::chrono::steady_clock::time_point{} ||
-            std::chrono::duration_cast<std::chrono::seconds>(now - s_last_posture_block_log).count() >= 2)
-        {
-            diag::log_tagged_fmt("init_chat",
-                "authorized_mcp_services_blocked_mcp_posture summary_hash=0x%016llX",
-                static_cast<unsigned long long>(anti_tamper::mcp_posture::cached_summary_hash()));
-            s_last_posture_block_log = now;
-        }
-        return;
-    }
-
-    std::string missing_exports;
     const bool ide_ready = s_ide_ready_for_mcp_services.load(std::memory_order_acquire);
-    const bool valid = license::validated && standalone_license::is_valid();
-    const bool arc_loaded = standalone_license::is_arc_loaded();
-    const bool exports_ok = valid && arc_loaded && standalone_license::validate_arc_required_exports(missing_exports);
-    if (!ide_ready || !valid || !arc_loaded || !exports_ok)
+    if (!ide_ready)
     {
         mcp_standalone::set_ide_lifecycle_ready(false);
         static auto s_last_block_log = std::chrono::steady_clock::time_point{};
@@ -2844,13 +2537,8 @@ void start_authorized_mcp_services()
             std::chrono::duration_cast<std::chrono::seconds>(now - s_last_block_log).count() >= 2)
         {
             diag::log_tagged_fmt("init_chat",
-                "authorized_mcp_services_blocked ide=%d validated=%d valid=%d arc=%d exports=%d missing='%.160s'",
-                ide_ready ? 1 : 0,
-                license::validated ? 1 : 0,
-                standalone_license::is_valid() ? 1 : 0,
-                standalone_license::is_arc_loaded() ? 1 : 0,
-                exports_ok ? 1 : 0,
-                missing_exports.c_str());
+                "authorized_mcp_services_blocked ide=%d",
+                ide_ready ? 1 : 0);
             s_last_block_log = now;
         }
         return;
@@ -2951,10 +2639,6 @@ void shutdown_standalone_chat()
     (void)aida::session::shutdown();
     shutdown_phase_done("session_shutdown", session_start);
 
-    ULONGLONG license_bg_start = shutdown_phase_begin("license_background_stop");
-    standalone_license::stop_background_workers("chat.shutdown_pre_queues", 5000);
-    shutdown_phase_done("license_background_stop", license_bg_start);
-
     ULONGLONG queue_start = shutdown_phase_begin("queue_drain");
     log_shutdown_queue_snapshot("queue_drain_before");
     aida::infra::executor::shutdown();
@@ -2982,10 +2666,6 @@ void shutdown_standalone_chat()
     } else {
         diag::log_tagged_critical("chat", "driver_event_shutdown_deferred reason=queue_drain_incomplete");
     }
-
-    ULONGLONG arc_start = shutdown_phase_begin("license_arc_unload_late");
-    standalone_license::shutdown_after_worker_quiesce("chat.shutdown_after_queues");
-    shutdown_phase_done("license_arc_unload_late", arc_start);
 
     ULONGLONG persist_start = shutdown_phase_begin("persist_state");
     persist_workspace_state();
@@ -3226,57 +2906,6 @@ void tick_ai_chat()
 void poll_ai_chat()
 {
     if (!s_initialized.load(std::memory_order_acquire)) return;
-
-    if (license::validated && !standalone_license::is_valid()) {
-        const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
-        if (license::preserve_valid_state(runtime_locked, test_all_features::is_running())) {
-            license::checking = false;
-            license::activation_worker_active.store(false, std::memory_order_release);
-            license::check_failed = false;
-            license::error_msg.clear();
-            diag::log_tagged_fmt("license",
-                "DIAG_DIALOG_TRIGGER_SUPPRESSED source=poll_ai_chat tid=%lu full_test=1 arc=%d",
-                GetCurrentThreadId(),
-                standalone_license::is_arc_loaded() ? 1 : 0);
-        } else {
-            license::validated = false;
-            license::check_failed = true;
-            license::error_msg = runtime_locked
-                ? std::string("Runtime integrity check failed. Restart AiDAStandalone.exe.")
-                : standalone_license::last_error();
-            diag::log_tagged_fmt("license",
-                "DIAG_DIALOG_TRIGGER source=poll_ai_chat tid=%lu runtime_locked=%d err=%.200s",
-                GetCurrentThreadId(), runtime_locked ? 1 : 0, license::error_msg.c_str());
-            mcp_standalone::set_ide_lifecycle_ready(false);
-            s_ide_ready_for_mcp_services.store(false, std::memory_order_release);
-            const bool stop_server = s_server_started.exchange(false, std::memory_order_acq_rel);
-            const bool disconnect_clients = s_mcp_clients_connected.exchange(false, std::memory_order_acq_rel);
-            if (stop_server) {
-                diag::log_tagged("init_chat", "authorized_mcp_server_stop_auth_lost");
-            }
-            if (disconnect_clients) {
-                diag::log_tagged("init_chat", "authorized_mcp_client_disconnect_auth_lost");
-            }
-            queue_mcp_services_shutdown("auth_lost", stop_server, disconnect_clients);
-        }
-    }
-
-    {
-        std::string lifecycle_reason;
-        if ((s_server_started.load(std::memory_order_acquire) || s_mcp_clients_connected.load(std::memory_order_acquire)) &&
-            !mcp_standalone::lifecycle_authorized(&lifecycle_reason))
-        {
-            diag::log_tagged_fmt("init_chat",
-                "authorized_mcp_services_stop_unauthorized reason='%.160s'",
-                lifecycle_reason.c_str());
-            mcp_standalone::set_ide_lifecycle_ready(false);
-            s_ide_ready_for_mcp_services.store(false, std::memory_order_release);
-            const bool stop_server = s_server_started.exchange(false, std::memory_order_acq_rel);
-            const bool disconnect_clients = s_mcp_clients_connected.exchange(false, std::memory_order_acq_rel);
-            queue_mcp_services_shutdown(lifecycle_reason.c_str(), stop_server, disconnect_clients);
-        }
-    }
-
 
     {
         static auto s_last_poll = std::chrono::steady_clock::now();

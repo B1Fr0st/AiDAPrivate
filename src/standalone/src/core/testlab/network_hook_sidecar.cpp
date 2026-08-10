@@ -131,7 +131,7 @@ void print_usage() {
     std::printf("  --no-wait                   Do not wait for Go event\n");
     std::printf("  --iterations <n>            Network and buffer mutation count\n");
     std::printf("  --interval-ms <n>           Delay between iterations\n");
-    std::printf("  --mode plain|protected      Requested harness mode label\n");
+    std::printf("  --mode plain                Requested harness mode label\n");
     std::printf("  --verbose                   Emit per-iteration diagnostics\n");
     std::fflush(stdout);
 }
@@ -545,11 +545,7 @@ bool emit_send_payloads(SOCKET s, int iteration) {
 }
 
 const char* build_mode() {
-#ifdef AIDA_SIDECAR_PROTECTED_BUILD
-    return "protected";
-#else
     return "plain";
-#endif
 }
 
 int run_sidecar(const config_t& cfg) {

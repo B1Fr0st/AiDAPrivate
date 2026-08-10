@@ -356,9 +356,7 @@ static void to_json(nlohmann::json& j, const settings_t& s)
         {OBFSTR_C("embedding_api_key"), obfuscate_key(s.embedding_api_key)},
         {OBFSTR_C("embedding_model_name"), s.embedding_model_name},
         {OBFSTR_C("embedding_dimensions"), s.embedding_dimensions},
-        {OBFSTR_C("embedding_batch_size"), s.embedding_batch_size},
-        {OBFSTR_C("firebase_api_key"), obfuscate_key(s.firebase_api_key)},
-        {OBFSTR_C("eula_accepted"), s.eula_accepted}
+        {OBFSTR_C("embedding_batch_size"), s.embedding_batch_size}
     };
 }
 
@@ -411,10 +409,6 @@ static void from_json(const nlohmann::json& j, settings_t& s)
     s.embedding_model_name = j.value(OBFSTR_C("embedding_model_name"), d.embedding_model_name);
     s.embedding_dimensions = j.value(OBFSTR_C("embedding_dimensions"), d.embedding_dimensions);
     s.embedding_batch_size = j.value(OBFSTR_C("embedding_batch_size"), d.embedding_batch_size);
-
-    s.firebase_api_key = get_trimmed_key_string(j, OBFSTR_C("firebase_api_key"), d.firebase_api_key);
-
-    s.eula_accepted = j.value(OBFSTR_C("eula_accepted"), d.eula_accepted);
 
     if (j.contains(OBFSTR_C("custom_prompts")))
         j.at(OBFSTR_C("custom_prompts")).get_to(s.custom_prompts);
@@ -471,10 +465,6 @@ static bool save_settings_to_file(const settings_t& settings, const qstring& pat
         nlohmann::json settings_json = settings;
         for (auto it = settings_json.begin(); it != settings_json.end(); ++it)
             merged[it.key()] = it.value();
-
-        merged.erase(OBFSTR_C("license_key"));
-        merged.erase(OBFSTR_C("license_validated_at"));
-        merged.erase(OBFSTR_C("license_hwid"));
 
         std::string json_str = merged.dump(4);
 
@@ -579,8 +569,6 @@ static bool load_settings_from_file(settings_t& settings, const qstring& path)
         req(OBFSTR_C("check_for_updates"));
         req(OBFSTR_C("mcp_enabled"));
         req(OBFSTR_C("mcp_port"));
-        req(OBFSTR_C("firebase_api_key"));
-        req(OBFSTR_C("eula_accepted"));
 
         settings = j.get<settings_t>();
 
@@ -641,12 +629,7 @@ settings_t::settings_t() :
     embedding_api_key(""),
     embedding_model_name(OBFSTR("text-embedding-3-small")),
     embedding_dimensions(1536),
-    embedding_batch_size(32),
-    eula_accepted(false),
-    license_key(""),
-    license_validated_at(0),
-    license_hwid(""),
-    firebase_api_key("")
+    embedding_batch_size(32)
 {
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("ida_settings_ctor_enter mcp_enabled=%d mcp_port=%d",

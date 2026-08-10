@@ -21,8 +21,6 @@
 #include <utility>
 
 #include "../../helpers/diag_log.hpp"
-#include "../runtime/loader_header_invariant.hpp"
-#include "../runtime/manual_map_tls.hpp"
 
 namespace aida::infra::win_thread {
 
@@ -109,9 +107,7 @@ namespace detail {
 
 inline DWORD WINAPI entry(void* arg)
 {
-    const bool tls_ready = aida::manual_map_tls::ensure_current_thread();
-    diag::log_tagged_fmt("win_thread", "thread_entry tls_ready=%d tid=%lu state=%p",
-        tls_ready ? 1 : 0,
+    diag::log_tagged_fmt("win_thread", "thread_entry tid=%lu state=%p",
         static_cast<unsigned long>(GetCurrentThreadId()),
         arg);
     if (!arg) {
@@ -386,18 +382,15 @@ bool start_raw(Fn&& fn, unsigned stack_reserve, HANDLE& out_handle, unsigned& ou
         return false;
     }
 
-    aida::runtime::loader_header_invariant::scoped_restore_t loader_window(name ? name : "thread_start", "win_thread");
-
     char entry_desc[256];
     describe_address(reinterpret_cast<const void*>(&entry), entry_desc, sizeof(entry_desc));
     diag::log_tagged_fmt("win_thread",
-        "thread_start begin name=%s requested_stack_reserve=%u caller_pid=%lu caller_tid=%lu state=%p loader_window=%d entry_region={%s}",
+        "thread_start begin name=%s requested_stack_reserve=%u caller_pid=%lu caller_tid=%lu state=%p entry_region={%s}",
         name ? name : "<unnamed>",
         stack_reserve,
         static_cast<unsigned long>(GetCurrentProcessId()),
         static_cast<unsigned long>(GetCurrentThreadId()),
         state,
-        loader_window.active() ? 1 : 0,
         entry_desc);
 
     std::string errors;

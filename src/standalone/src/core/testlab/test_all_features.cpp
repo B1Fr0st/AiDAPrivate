@@ -19,10 +19,8 @@
 #include "../network/burp/camoufox_bridge.hpp"
 #include "../runtime/run_target.hpp"
 #include "../runtime/standalone_driver.hpp"
-#include "../runtime/standalone_license.hpp"
 #include "../mcp/mcp_standalone.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
-#include "../anti-tamper/state.hpp"
 #include "../scanner/memory_scanner.hpp"
 #include "../scanner/aob_generator.hpp"
 #include "../disasm/cfg_view.hpp"
@@ -154,6 +152,7 @@ namespace test_all_features {
 		std::atomic<bool> g_cancel_requested{ false };
 		std::atomic<bool> g_interactive_cancel_cleanup_inflight{ false };
 		std::atomic<bool> g_target_unavailable{ false };
+		std::atomic<bool> g_full_test_guard_active{ false };
 
 		std::atomic<int>  g_total{ 0 };
 		std::atomic<int>  g_current{ 0 };
@@ -222,10 +221,7 @@ namespace test_all_features {
 		constexpr destructive_skip_key_t kExpectedDestructiveSkipKeys[] = {
 			{ "thread", "TSR" },
 			{ "remote-call", "RC" },
-			{ "anti-debug", "DBGA" },
-			{ "module", "PINJ" },
-			{ "tamper", "ABRT" },
-			{ "evidence", "RECU" }
+			{ "module", "PINJ" }
 		};
 		constexpr int kExpectedDestructiveSkipCount =
 			static_cast<int>(sizeof(kExpectedDestructiveSkipKeys) / sizeof(kExpectedDestructiveSkipKeys[0]));
@@ -302,7 +298,6 @@ namespace test_all_features {
 		constexpr int kDisasmFeatureTests = 111;
 		constexpr int kMcpFeatureTests = 514;
 		constexpr int kUiFeatureTests = 10;
-		constexpr std::uint64_t kPostFullTestSuppressionMs = 180000;
 
 
 		void format_timestamp(char* out, std::size_t cap) {
@@ -963,34 +958,25 @@ namespace test_all_features {
 		}
 
 		void begin_test_guard_impl(const char* source, HANDLE hf = INVALID_HANDLE_VALUE) {
-			anti_tamper::state::get().full_test_running.store(true, std::memory_order_release);
-			log_msg(hf, "env", "full_test_guard_enter source=%s pid=%lu tid=%lu post_suppression_configured_ms=%llu tick64=%llu user_default_skip_load=%d",
+			g_full_test_guard_active.store(true, std::memory_order_release);
+			log_msg(hf, "env", "full_test_guard_enter source=%s pid=%lu tid=%lu tick64=%llu user_default_skip_load=%d",
 				source ? source : "unspecified",
 				static_cast<unsigned long>(GetCurrentProcessId()),
 				static_cast<unsigned long>(GetCurrentThreadId()),
-				static_cast<unsigned long long>(kPostFullTestSuppressionMs),
 				static_cast<unsigned long long>(GetTickCount64()),
 				pdb_default_skip::get() ? 1 : 0);
 			set_full_test_env(hf, true, source ? source : "full_test_guard_enter");
 		}
 
-		void end_test_guard_impl(const char* source, bool arm_post_suppression, HANDLE hf = INVALID_HANDLE_VALUE) {
-			uint64_t remaining = 0;
-			if (arm_post_suppression) {
-				anti_tamper::state::arm_full_test_suppression(kPostFullTestSuppressionMs);
-				anti_tamper::state::full_test_suppression_active(&remaining);
-			}
-			log_msg(hf, "env", "full_test_guard_exit source=%s arm_post=%d configured_ms=%llu remaining_ms=%llu pid=%lu tid=%lu tick64=%llu user_default_skip_load=%d",
+		void end_test_guard_impl(const char* source, HANDLE hf = INVALID_HANDLE_VALUE) {
+			log_msg(hf, "env", "full_test_guard_exit source=%s pid=%lu tid=%lu tick64=%llu user_default_skip_load=%d",
 				source ? source : "unspecified",
-				arm_post_suppression ? 1 : 0,
-				static_cast<unsigned long long>(arm_post_suppression ? kPostFullTestSuppressionMs : 0),
-				static_cast<unsigned long long>(remaining),
 				static_cast<unsigned long>(GetCurrentProcessId()),
 				static_cast<unsigned long>(GetCurrentThreadId()),
 				static_cast<unsigned long long>(GetTickCount64()),
 				pdb_default_skip::get() ? 1 : 0);
 			set_full_test_env(hf, false, source ? source : "full_test_guard_exit");
-			anti_tamper::state::get().full_test_running.store(false, std::memory_order_release);
+			g_full_test_guard_active.store(false, std::memory_order_release);
 		}
 
 		void set_step(const char* label) {
@@ -1087,18 +1073,7 @@ namespace test_all_features {
 		}
 
 		bool cancelled() {
-			if (g_cancel_requested.load(std::memory_order_acquire))
-				return true;
-			auto& rt = anti_tamper::state::get();
-			if (rt.full_test_running.load(std::memory_order_acquire) &&
-				rt.violation_latched.load(std::memory_order_acquire)) {
-				bool expected = false;
-				if (g_cancel_requested.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-					diag::log_tagged("test_all", "full_test_cancelled_due_to_integrity_latch");
-				}
-				return true;
-			}
-			return false;
+			return g_cancel_requested.load(std::memory_order_acquire);
 		}
 
 		int running_done() {
@@ -1416,8 +1391,6 @@ namespace test_all_features {
 					static_cast<unsigned long long>(cq_stats.rejected),
 					static_cast<unsigned long long>(cq_stats.oldest_active_ms));
 				pkt_ctx.critical_queue_snapshot = cq_buf;
-				pkt_ctx.license_liveness_ms = standalone_license::last_heartbeat_time();
-				pkt_ctx.arc_liveness_ms = standalone_license::activation_completed_at();
 				pkt_ctx.driver_watchdog_ms = driver_bridge::watchdog_last_ok_tick();
 				std::string first_failure_snap;
 				std::string last_success_snap;
@@ -1741,19 +1714,6 @@ namespace test_all_features {
 			return value != nullptr && parsed_truthy(*value);
 		}
 
-		bool parsed_label_falsey(const test_lab::result_t& r, const char* label) {
-			const std::string* value = parsed_value(r, label);
-			if (value == nullptr)
-				return false;
-			std::string v = *value;
-			while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
-				v.erase(v.begin());
-			while (!v.empty() && (v.back() == ' ' || v.back() == '\t' || v.back() == '\r' || v.back() == '\n'))
-				v.pop_back();
-			std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-			return v == "0" || v == "false" || v == "no" || v == "off";
-		}
-
 		bool feature_evidence_failure_reason(const char* category, const char* name, const test_lab::result_t& r, std::string& reason) {
 			reason.clear();
 			const char* cat = category ? category : "";
@@ -1777,16 +1737,6 @@ namespace test_all_features {
 					return true;
 				}
 				reason = degraded_key + "=1";
-				return true;
-			}
-			if (parsed_value_contains(r, "kernel_probe_set", "safe_mode_skipped") ||
-				parsed_value_contains(r, "kernel_probe_set", "skipped_by_testlab_safe_flag")) {
-				if (parsed_label_truthy(r, "safe_contract_proven") &&
-					parsed_label_truthy(r, "safe_mode_expected_skip") &&
-					parsed_label_truthy(r, "full_kernel_probe_not_run")) {
-					return false;
-				}
-				reason = "kernel_probe_set=skipped_without_safe_contract";
 				return true;
 			}
 			if (std::strcmp(cat, "module") == 0 && name_starts_with(feature, "PMOD") && !parsed_nonzero(r, "rule_count")) {
@@ -1853,85 +1803,6 @@ namespace test_all_features {
 			if (std::strcmp(cat, "network-action") == 0 && name_starts_with(feature, "BWMN")) {
 				if (!parsed_nonzero(r, "Bytes/sec out") && !parsed_nonzero(r, "Bytes/sec in")) {
 					reason = "BWMN throughput_rate_zero_or_missing";
-					return true;
-				}
-			}
-			if (std::strcmp(cat, "dll") == 0 && name_starts_with(feature, "DPRT")) {
-				if (!parsed_label_truthy(r, "expected_hash_supplied") ||
-					!parsed_value_contains(r, "expected_hash_source", "provided_verified") ||
-					!parsed_label_truthy(r, "dprt_functional_pass_eligible") ||
-					!parsed_value_contains(r, "dprt_functional_proof", "provided_hash_register_query_unregister")) {
-					reason = "DPRT functional proof requires provided_verified expected_hash";
-					return true;
-				}
-			}
-			if (std::strcmp(cat, "dma-canary") == 0 && name_starts_with(feature, "CANQ")) {
-				std::uint64_t baseline = 0;
-				std::uint64_t after = 0;
-				if (!parsed_label_truthy(r, "baseline_query_ok") ||
-					!parsed_label_truthy(r, "controlled_register_ok") ||
-					!parsed_label_truthy(r, "after_query_ok") ||
-					!parsed_u64(r, "baseline_count", baseline) ||
-					!parsed_u64(r, "after_count", after) ||
-					after < baseline ||
-					!parsed_nonzero(r, "raw_struct_size") ||
-					!parsed_nonzero(r, "target_pid")) {
-					reason = "CANQ controlled pre/post canary evidence missing";
-					return true;
-				}
-			}
-			if (std::strcmp(cat, "target-latch") == 0 && name_starts_with(feature, "TIRA")) {
-				if (parsed_label_truthy(r, "positive_detection_coverage") && !parsed_label_truthy(r, "present")) {
-					reason = "TIRA positive detection coverage cannot pass with present=false";
-					return true;
-				}
-				if (!parsed_value_contains(r, "coverage_kind", "health_absence") ||
-					!parsed_label_truthy(r, "health_check_pass") ||
-					!parsed_label_falsey(r, "positive_detection_coverage")) {
-					reason = "TIRA health/positive coverage labels missing";
-					return true;
-				}
-			}
-			if (std::strcmp(cat, "tamper") == 0 && name_starts_with(feature, "SRVT")) {
-				if (!parsed_value_contains(r, "result", "accepted") ||
-					!parsed_nonzero(r, "server_nonce") ||
-					!parsed_nonzero(r, "token_bytes_consumed")) {
-					reason = "SRVT accepted_token_evidence_missing";
-					return true;
-				}
-			}
-			if (std::strcmp(cat, "tamper") == 0 && name_starts_with(feature, "SRV2")) {
-				if (!parsed_value_contains(r, "result", "accepted") ||
-					!parsed_nonzero(r, "server_nonce") ||
-					!parsed_nonzero(r, "epoch") ||
-					!parsed_nonzero(r, "driver_proof")) {
-					reason = "SRV2 accepted_driver_proof_missing";
-					return true;
-				}
-			}
-			if (std::strcmp(cat, "tamper") == 0 && name_starts_with(feature, "RELA")) {
-				if (!parsed_value_contains(r, "result", "latched") && !parsed_value_contains(r, "result", "accepted")) {
-					reason = "RELA latch_result_missing";
-					return true;
-				}
-			}
-			if (std::strcmp(cat, "sentinel") == 0 && name_starts_with(feature, "Sentinel Evidence Ring")) {
-				const char* labels[] = { "foreground_drain_proven", "background_observer_proven" };
-				if (!any_parsed_nonzero(r, labels, sizeof(labels) / sizeof(labels[0]))) {
-					reason = "sentinel_evidence_no_foreground_or_background_proof";
-					return true;
-				}
-			}
-			if (std::strcmp(cat, "sentinel") == 0 && name_starts_with(feature, "Sentinel Tier-A")) {
-				if (parsed_label_truthy(r, "positive_detection_coverage") && !parsed_label_truthy(r, "present_flag")) {
-					reason = "sentinel_tier_a_positive_detection_cannot_pass_with_present_flag=0";
-					return true;
-				}
-				if (!parsed_value_contains(r, "coverage_kind", "health_absence") ||
-					!parsed_label_truthy(r, "health_check_pass") ||
-					!parsed_label_falsey(r, "positive_detection_coverage") ||
-					(!parsed_nonzero(r, "hostile_driver_absent") && !parsed_nonzero(r, "absence_expected_healthy"))) {
-					reason = "sentinel_tier_a_health_absence_labels_missing";
 					return true;
 				}
 			}
@@ -2911,22 +2782,6 @@ namespace test_all_features {
 					char tmp[MAX_PATH];
 					GetTempPathA(MAX_PATH, tmp);
 					s.text_a = std::string(tmp) + "aida_test_capture.pcap";
-				} else if (name_starts_with(name, "ADMP")) {
-					s.u32_a = 4;
-					s.pid = 0;
-				} else if (name_starts_with(name, "SRVT")) {
-					s.text_a = "00112233445566778899AABBCCDDEEFF";
-				} else if (name_starts_with(name, "SRV2")) {
-					s.text_a = "00112233445566778899AABBCCDDEEFF";
-					s.u32_a = 1;
-				} else if (name_starts_with(name, "DPRT")) {
-					s.text_b.clear();
-					s.u32_b = 30000;
-				} else if (name_starts_with(name, "CANR")) {
-					static std::uint8_t canary_scratch[0x1000];
-					s.addr = reinterpret_cast<std::uint64_t>(&canary_scratch[0]);
-					s.size = sizeof(canary_scratch);
-					s.u32_a = 0;
 				} else if (name_starts_with(name, "FM")) {
 					std::uint64_t alloc = driver_bridge::allocate_memory(0x1000);
 					if (alloc != 0) {
@@ -4028,7 +3883,7 @@ namespace test_all_features {
 			bool owns_entry = false;
 
 			explicit full_test_env_guard_t(HANDLE* handle) : hf(handle), active(true) {
-				owns_entry = !anti_tamper::state::get().full_test_running.load(std::memory_order_acquire);
+				owns_entry = !g_full_test_guard_active.load(std::memory_order_acquire);
 				if (owns_entry)
 					begin_test_guard_impl("run_all begin", hf ? *hf : INVALID_HANDLE_VALUE);
 				else
@@ -4039,7 +3894,7 @@ namespace test_all_features {
 
 			void clear(const char* reason) {
 				if (!active) return;
-				end_test_guard_impl(reason ? reason : "run_all end", true, hf ? *hf : INVALID_HANDLE_VALUE);
+				end_test_guard_impl(reason ? reason : "run_all end", hf ? *hf : INVALID_HANDLE_VALUE);
 				active = false;
 			}
 
@@ -4417,7 +4272,7 @@ namespace test_all_features {
 				static_cast<unsigned long>(code),
 				message ? message : "",
 				snap);
-			end_test_guard_impl("worker exception escape", true, hf);
+			end_test_guard_impl("worker exception escape", hf);
 			try {
 				cleanup_memory_scanner_runtime(hf, "worker exception escape", 5000);
 			} catch (...) {
@@ -4681,7 +4536,7 @@ namespace test_all_features {
 					g_failed.fetch_add(1);
 					g_running.store(false, std::memory_order_release);
 					set_full_test_env(hf, false, "taskflow graph submit failed");
-					anti_tamper::state::get().full_test_running.store(false, std::memory_order_release);
+					g_full_test_guard_active.store(false, std::memory_order_release);
 					set_phase("Idle");
 					set_step("taskflow graph submit failed");
 					if (hf != INVALID_HANDLE_VALUE) {
@@ -4698,7 +4553,7 @@ namespace test_all_features {
 				g_failed.fetch_add(1);
 				g_running.store(false, std::memory_order_release);
 				set_full_test_env(hf, false, "worker start exception");
-				anti_tamper::state::get().full_test_running.store(false, std::memory_order_release);
+				g_full_test_guard_active.store(false, std::memory_order_release);
 				set_phase("Idle");
 				set_step("worker start exception");
 				if (hf != INVALID_HANDLE_VALUE) {
@@ -4715,7 +4570,7 @@ namespace test_all_features {
 				g_failed.fetch_add(1);
 				g_running.store(false, std::memory_order_release);
 				set_full_test_env(hf, false, "worker start unknown exception");
-				anti_tamper::state::get().full_test_running.store(false, std::memory_order_release);
+				g_full_test_guard_active.store(false, std::memory_order_release);
 				set_phase("Idle");
 				set_step("worker start unknown exception");
 				if (hf != INVALID_HANDLE_VALUE) {
@@ -5004,9 +4859,9 @@ namespace test_all_features {
 		}
 	}
 
-	void end_test_guard(const char* source, bool arm_post_suppression) {
+	void end_test_guard(const char* source) {
 		HANDLE hf = open_log_file();
-		end_test_guard_impl(source ? source : "external end_test_guard", arm_post_suppression, hf);
+		end_test_guard_impl(source ? source : "external end_test_guard", hf);
 		if (hf != INVALID_HANDLE_VALUE) {
 			flush_full_test_log(hf);
 			CloseHandle(hf);
@@ -5023,7 +4878,7 @@ namespace test_all_features {
 
 	bool is_unattended_full_test_active() {
 		return is_running() ||
-			anti_tamper::state::get().full_test_running.load(std::memory_order_acquire) ||
+			g_full_test_guard_active.load(std::memory_order_acquire) ||
 			full_test_env_active();
 	}
 

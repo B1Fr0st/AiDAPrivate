@@ -56,7 +56,6 @@ void copy_text(char* destination, size_t capacity, const char* value) {
 namespace driver_bridge {
 
 bool using_kernel_driver() { return true; }
-bool refresh_heartbeat() { return true; }
 uint32_t attached_pid() { return 6420; }
 
 std::vector<net_connection_info_t> enumerate_connections(uint32_t filter_pid, uint32_t filter_protocol) {
@@ -148,10 +147,6 @@ std::vector<bw_process_info_t> get_bw_per_process(uint32_t filter_pid) {
     return entries;
 }
 
-}
-
-namespace standalone_license {
-bool is_valid() { return true; }
 }
 
 namespace protocol_parser {

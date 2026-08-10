@@ -231,4 +231,84 @@ namespace whoswho_kernel_layout {
     __forceinline SIZE_T kthread_apc_state_size() {
         return 0x30;
     }
+
+    inline ULONG get_executable_sections(PVOID moduleBase, PVOID* bases, SIZE_T* sizes, ULONG maxSections) {
+        if (!moduleBase || !bases || !sizes || maxSections == 0)
+            return 0;
+
+        auto dos = static_cast<PIMAGE_DOS_HEADER>(moduleBase);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+
+        auto nt = reinterpret_cast<PIMAGE_NT_HEADERS64>((UCHAR*)moduleBase + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+        ULONG count = 0;
+        auto sec = IMAGE_FIRST_SECTION(nt);
+        for (USHORT i = 0; i < nt->FileHeader.NumberOfSections && count < maxSections; i++) {
+            if ((sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) && sec[i].Misc.VirtualSize > 0) {
+                bases[count] = (PVOID)((UCHAR*)moduleBase + sec[i].VirtualAddress);
+                sizes[count] = sec[i].Misc.VirtualSize;
+                count++;
+            }
+        }
+        return count;
+    }
+
+    inline PVOID find_pattern_safe(PVOID base, SIZE_T size, const UCHAR* pattern, const char* mask) {
+        SIZE_T maskLen = 0;
+        while (mask[maskLen]) maskLen++;
+
+        if (!base || !pattern || size < maskLen)
+            return nullptr;
+
+        const UCHAR* data = static_cast<const UCHAR*>(base);
+        SIZE_T pageSize = 0x1000;
+
+        for (SIZE_T i = 0; i <= size - maskLen; ) {
+            SIZE_T currentPage = (reinterpret_cast<ULONG_PTR>(data + i)) & ~(pageSize - 1);
+            if (!_MmIsAddressValid(reinterpret_cast<PVOID>(currentPage))) {
+                SIZE_T nextPage = currentPage + pageSize;
+                SIZE_T skip = nextPage - reinterpret_cast<ULONG_PTR>(data + i);
+                i += skip;
+                continue;
+            }
+
+            SIZE_T pageEnd = currentPage + pageSize - reinterpret_cast<ULONG_PTR>(data);
+            if (pageEnd > size) pageEnd = size;
+
+            if (pageEnd < maskLen) {
+                i = pageEnd;
+                continue;
+            }
+
+            for (; i <= pageEnd - maskLen && i <= size - maskLen; ++i) {
+                bool hit = true;
+                for (SIZE_T j = 0; j < maskLen; ++j) {
+                    if (mask[j] == 'x' && data[i + j] != pattern[j]) {
+                        hit = false;
+                        break;
+                    }
+                }
+                if (hit)
+                    return const_cast<UCHAR*>(&data[i]);
+            }
+
+            if (pageEnd < size && i < pageEnd)
+                i = pageEnd;
+        }
+        return nullptr;
+    }
+
+    inline PVOID find_pattern_in_all_sections(PVOID moduleBase, const UCHAR* pattern, const char* mask) {
+        PVOID bases[16];
+        SIZE_T sizes[16];
+        ULONG count = get_executable_sections(moduleBase, bases, sizes, 16);
+        if (count == 0) return nullptr;
+
+        for (ULONG s = 0; s < count; s++) {
+            PVOID result = find_pattern_safe(bases[s], sizes[s], pattern, mask);
+            if (result) return result;
+        }
+        return nullptr;
+    }
 }

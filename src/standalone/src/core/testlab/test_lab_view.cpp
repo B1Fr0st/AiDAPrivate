@@ -43,7 +43,6 @@ namespace test_lab_view {
 		const char* driver_label(test_lab::driver_e d) {
 			switch (d) {
 				case test_lab::driver_e::whoswho:  return "WHO";
-				case test_lab::driver_e::sentinel: return "SEN";
 				case test_lab::driver_e::driverless: return "SAFE";
 			}
 			return "?";
@@ -53,7 +52,6 @@ namespace test_lab_view {
 			const auto& t = aida::ui::resolved();
 			switch (d) {
 				case test_lab::driver_e::whoswho:  return aida::ui::with_alpha(t.accent_u32, alpha);
-				case test_lab::driver_e::sentinel: return aida::ui::with_alpha(t.warning, alpha);
 				case test_lab::driver_e::driverless: return aida::ui::with_alpha(t.success, alpha);
 			}
 			return aida::ui::with_alpha(t.text_dim, alpha);
@@ -525,7 +523,7 @@ namespace test_lab_view {
 
 			~full_test_scope_t() {
 				if (active)
-					test_all_features::end_test_guard(source, true);
+					test_all_features::end_test_guard(source);
 			}
 
 			full_test_scope_t(const full_test_scope_t&) = delete;
@@ -581,7 +579,6 @@ namespace test_lab_view {
 		const char* driver_name(test_lab::driver_e d) {
 			switch (d) {
 				case test_lab::driver_e::whoswho:  return "whoswho";
-				case test_lab::driver_e::sentinel: return "sentinel";
 				case test_lab::driver_e::driverless: return "driverless";
 			}
 			return "unknown";
@@ -831,31 +828,6 @@ namespace test_lab_view {
 				s.text_a = "test.example.com";
 				s.text_b = "127.0.0.1";
 				s.u32_a = 0;
-				return;
-			}
-			if (name_starts_with(name, "DPRT")) {
-				s.u32_a = 1u;
-				return;
-			}
-			if (name_starts_with(name, "CANR")) {
-				static std::uint8_t canary_scratch[0x1000];
-				s.addr = reinterpret_cast<std::uint64_t>(&canary_scratch[0]);
-				s.size = sizeof(canary_scratch);
-				s.u32_a = 0;
-				return;
-			}
-			if (name_starts_with(name, "ADMP")) {
-				s.u32_a = 4u;
-				s.pid = 0;
-				return;
-			}
-			if (name_starts_with(name, "SRVT")) {
-				s.text_a = "00112233445566778899AABBCCDDEEFF";
-				return;
-			}
-			if (name_starts_with(name, "SRV2")) {
-				s.text_a = "00112233445566778899AABBCCDDEEFF";
-				s.u32_a = 1u;
 				return;
 			}
 			if (name_starts_with(name, "PCEX")) {

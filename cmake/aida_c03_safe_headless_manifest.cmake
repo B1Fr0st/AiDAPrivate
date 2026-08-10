@@ -97,7 +97,6 @@ set(AIDA_C03_MCP_PRODUCTION_CLOSURE_SOURCES
     "${STANDALONE_ROOT}/core/re/vmt.cpp"
     "${STANDALONE_ROOT}/core/scanner/memory_scanner.cpp"
     "${STANDALONE_ROOT}/core/scanner/scanner_tools_standalone.cpp"
-    "${STANDALONE_ROOT}/core/session/session_health.cpp"
     "${STANDALONE_ROOT}/core/session/session_store.cpp"
     "${STANDALONE_ROOT}/core/tools/coding_tools_standalone.cpp"
     "${STANDALONE_ROOT}/core/tools/driver_tools_standalone.cpp"
@@ -113,21 +112,6 @@ set(AIDA_C03_MCP_PRODUCTION_CLOSURE_SOURCES
     "${CMAKE_SOURCE_DIR}/src/emulation_engine.cpp"
     "${CMAKE_SOURCE_DIR}/src/net_security.cpp")
 
-set(AIDA_C03_LICENSE_ARC_PRODUCTION_CLOSURE_SOURCES
-    "${STANDALONE_ROOT}/core/arc/plaintext_window.cpp"
-    "${STANDALONE_ROOT}/core/crypto/keys_a.cpp"
-    "${STANDALONE_ROOT}/core/crypto/keys_b.cpp"
-    "${STANDALONE_ROOT}/core/crypto/keys_c.cpp"
-    "${STANDALONE_ROOT}/core/crypto/keys_d.cpp"
-    "${STANDALONE_ROOT}/core/crypto/wb_ed25519.cpp"
-    "${STANDALONE_ROOT}/core/network/tls_exporter.cpp"
-    "${STANDALONE_ROOT}/core/runtime/arc_loader.cpp"
-    "${STANDALONE_ROOT}/core/runtime/customer_capsule.cpp"
-    "${STANDALONE_ROOT}/core/runtime/gate_tokens.cpp"
-    "${STANDALONE_ROOT}/core/runtime/license_state.cpp"
-    "${STANDALONE_ROOT}/core/runtime/standalone_license_transport.cpp"
-    "${STANDALONE_ROOT}/core/settings/settings_persistence_service.cpp")
-
 set(AIDA_C03_CAMOUFOX_AUDIT_PRODUCTION_CLOSURE_SOURCES
     "${STANDALONE_ROOT}/core/infra/event_bus.cpp"
     "${STANDALONE_ROOT}/core/network/burp/audit_trail.cpp"
@@ -138,7 +122,8 @@ set(AIDA_C03_CAMOUFOX_AUDIT_PRODUCTION_CLOSURE_SOURCES
 
 set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     ${AIDA_C03_MCP_PRODUCTION_CLOSURE_SOURCES}
-    ${AIDA_C03_LICENSE_ARC_PRODUCTION_CLOSURE_SOURCES}
+    "${STANDALONE_ROOT}/core/network/tls_exporter.cpp"
+    "${STANDALONE_ROOT}/core/settings/settings_persistence_service.cpp"
     ${AIDA_C03_CAMOUFOX_AUDIT_PRODUCTION_CLOSURE_SOURCES}
     "${STANDALONE_ROOT}/core/ai/agent_manager_service.cpp"
     "${STANDALONE_ROOT}/core/ai/agent_task.cpp"
@@ -267,7 +252,6 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/debugger/source_debug_service.cpp"
     "${STANDALONE_ROOT}/core/debugger/debugger_interaction_context.cpp"
     "${STANDALONE_ROOT}/core/network/burp/camoufox_bridge.cpp"
-    "${STANDALONE_ROOT}/core/runtime/standalone_license.cpp"
     "${STANDALONE_ROOT}/core/runtime/vm_guest_bridge.cpp"
     "${STANDALONE_ROOT}/core/session/analysis_session.cpp"
     "${STANDALONE_ROOT}/core/session/compaction.cpp"
@@ -294,8 +278,6 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/workbench/workbench_persistence.cpp"
     "${STANDALONE_ROOT}/core/workbench/workbench_shell_integration.cpp"
     "${STANDALONE_ROOT}/core/testlab/test_lab_features_c03_safe_headless.cpp"
-    "${CMAKE_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
-    "${CMAKE_SOURCE_DIR}/src/shared/telemetry/telemetry_client.cpp"
     "${STANDALONE_ROOT}/core/analysis/flirt/flirt_engine.cpp"
     "${STANDALONE_ROOT}/core/analysis/flirt/flirt_signature_db.cpp"
     "${STANDALONE_ROOT}/core/analysis/flirt/static_recognition_service.cpp"
@@ -550,7 +532,8 @@ set(AIDA_C03_COMPILER_MATRIX_CM_14
     "${CMAKE_SOURCE_DIR}/driver/syscall.asm"
     "${STANDALONE_ROOT}/resources/aida_embedded.rc.in")
 set(AIDA_C03_COMPILER_MATRIX_CM_15
-    ${AIDA_C03_LICENSE_ARC_PRODUCTION_CLOSURE_SOURCES}
+    "${STANDALONE_ROOT}/core/network/tls_exporter.cpp"
+    "${STANDALONE_ROOT}/core/settings/settings_persistence_service.cpp"
     ${AIDA_C03_CAMOUFOX_AUDIT_PRODUCTION_CLOSURE_SOURCES}
     "${STANDALONE_ROOT}/core/auth/auth_store.cpp"
     "${STANDALONE_ROOT}/core/auth/auth_http.cpp"
@@ -561,15 +544,10 @@ set(AIDA_C03_COMPILER_MATRIX_CM_15
     "${STANDALONE_ROOT}/core/analysis/surface_reconciliation.cpp"
     "${AIDA_C03_TEST_ROOT}/managed_decompiler_consumers/managed_decompiler_consumers_harness.cpp"
     "${AIDA_C03_TEST_ROOT}/managed_publication_persistence/managed_publication_persistence_harness.cpp"
-    "${AIDA_C03_TEST_ROOT}/security/mcp_client_auth/mcp_client_auth_harness.cpp"
-    "${AIDA_C03_TEST_ROOT}/security/anti_tamper_integrity/anti_tamper_integrity_harness.cpp"
     "${AIDA_C03_TEST_ROOT}/auth_browser_dispatch/auth_browser_dispatch_harness.cpp"
     "${AIDA_C03_TEST_ROOT}/surface_reconciliation_harness.cpp"
     "${CMAKE_SOURCE_DIR}/src/emulation_engine.cpp"
     "${STANDALONE_ROOT}/core/network/burp/camoufox_bridge.cpp"
-    "${STANDALONE_ROOT}/core/runtime/standalone_license.cpp"
-    "${CMAKE_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
-    "${CMAKE_SOURCE_DIR}/src/shared/telemetry/telemetry_client.cpp"
     "${STANDALONE_ROOT}/core/network/burp/offensive/auth_attack_engine.cpp"
     "${STANDALONE_ROOT}/core/network/burp/offensive/business_logic_engine.cpp"
     "${STANDALONE_ROOT}/core/network/burp/offensive/js_analysis_engine.cpp"
@@ -589,9 +567,7 @@ set(AIDA_C03_COMPILER_MATRIX_CM_15
     "${CMAKE_SOURCE_DIR}/cmake/aida_c03_dependencies.cmake"
     "${AIDA_C03_SAFE_HEADLESS_CMAKE_MODULE}"
     "${AIDA_C03_PATH_POLICY_MODULE}"
-    "${AIDA_C03_PATH_IDENTITY_POLICY}"
-    "${CMAKE_SOURCE_DIR}/deploy_to_server.ps1"
-    "${CMAKE_SOURCE_DIR}/tools/protector/main.cpp")
+    "${AIDA_C03_PATH_IDENTITY_POLICY}")
 set(AIDA_C03_COMPILER_MATRIX_UNION)
 foreach(_aida_matrix_suffix IN ITEMS 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15)
     list(APPEND AIDA_C03_COMPILER_MATRIX_UNION ${AIDA_C03_COMPILER_MATRIX_CM_${_aida_matrix_suffix}})
@@ -689,7 +665,6 @@ function(aida_c03_configure_native_target target)
         "${STANDALONE_ROOT}/core/ui"
         "${STANDALONE_ROOT}/core/workbench"
         "${AIDA_C03_TEST_ROOT}"
-        "${AIDA_C03_TEST_ROOT}/security/mcp_client_auth"
         "${AIDA_C03_MCP_TEST_ROOT}"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/cpp-httplib"
@@ -1297,7 +1272,6 @@ function(aida_c03_register_safe_headless_targets application_target)
         "${CMAKE_SOURCE_DIR}/src"
         "${STANDALONE_ROOT}/core/emulation"
         "${CMAKE_SOURCE_DIR}/driver"
-        "${STANDALONE_ROOT}/core/arc"
         "${STANDALONE_ROOT}/core/ai"
         "${STANDALONE_ROOT}/core/auth"
         "${STANDALONE_ROOT}/core/debugger"
@@ -1524,14 +1498,6 @@ function(aida_c03_register_safe_headless_targets application_target)
         AIDA_C03_PACKAGES "C08;C09;C10;C11;C12;C13;C14;C15;C16;C17;C18;C19"
         LABELS "c03;c03_safe_headless;safe-headless;C08;C09;C10;C11;C12;C13;C14;C15;C16;C17;C18;C19")
     aida_c03_register_manifest_entry(
-        TARGET aida_c03_security_mcp_client_auth_harness PACKAGE SECURITY
-        ENTRY_DEFINITION AIDA_C03_ENTRY_MCP_CLIENT_AUTH
-        SOURCES
-            "${_aida_entries}"
-            "${AIDA_C03_TEST_ROOT}/security/mcp_client_auth/mcp_client_auth_harness.cpp"
-        INCLUDE_DIRECTORIES "${AIDA_C03_TEST_ROOT}/security/mcp_client_auth")
-
-    aida_c03_register_manifest_entry(
         TARGET aida_c03_c20_c22_workbench_documents_harness PACKAGE C20
         SOURCES "${AIDA_C03_TEST_ROOT}/workbench_documents_harness.cpp")
     set_target_properties(aida_c03_c20_c22_workbench_documents_harness PROPERTIES
@@ -1604,26 +1570,6 @@ function(aida_c03_register_safe_headless_targets application_target)
         TARGET aida_c03_surface_reconciliation_harness PACKAGE D08
         SOURCES "${AIDA_C03_TEST_ROOT}/surface_reconciliation_harness.cpp")
 
-    set(_aida_anti_tamper_runtime
-        "src/standalone/src/core/anti-tamper/anti_hook.hpp"
-        "src/standalone/src/core/anti-tamper/re_detection_engine.hpp"
-        "src/standalone/src/core/anti-tamper/orchestrator.hpp"
-        "src/standalone/src/core/anti-tamper/anti_dump.hpp")
-    foreach(_aida_relative IN LISTS _aida_anti_tamper_runtime)
-        aida_c03_stage_runtime_file("${CMAKE_SOURCE_DIR}/${_aida_relative}" "${_aida_relative}")
-    endforeach()
-    aida_c03_register_manifest_entry(
-        TARGET aida_c03_anti_tamper_integrity_harness PACKAGE SECURITY ARGS_ENTRY
-        SOURCES
-            "${AIDA_C03_TEST_ROOT}/security/anti_tamper_integrity/anti_tamper_integrity_harness.cpp"
-            "${AIDA_C03_TEST_ROOT}/security/anti_tamper_integrity/self_guard_policy_cases.cpp"
-            "${AIDA_C03_TEST_ROOT}/security/anti_tamper_integrity/prologue_policy_cases.cpp"
-            "${AIDA_C03_TEST_ROOT}/security/anti_tamper_integrity/dma_policy_cases.cpp"
-            "${AIDA_C03_TEST_ROOT}/security/anti_tamper_integrity/passive_probe_policy_cases.cpp"
-        ARGUMENTS "."
-        INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/src"
-        RUNTIME_FILES ${_aida_anti_tamper_runtime})
-
     aida_c03_register_manifest_entry(
         TARGET aida_c03_srec_api_prototype_lookup_harness PACKAGE SREC
         SOURCES "${AIDA_C03_TEST_ROOT}/api_prototype_lookup_harness.cpp")
@@ -1651,14 +1597,14 @@ function(aida_c03_register_safe_headless_targets application_target)
     get_property(_aida_manifest_records GLOBAL PROPERTY AIDA_C03_MANIFEST_TARGET_RECORDS)
     list(LENGTH _aida_manifest_targets _aida_manifest_target_count)
     list(LENGTH _aida_manifest_records _aida_manifest_record_count)
-    if(NOT _aida_manifest_target_count EQUAL 58 OR NOT _aida_manifest_record_count EQUAL 58)
+    if(NOT _aida_manifest_target_count EQUAL 56 OR NOT _aida_manifest_record_count EQUAL 56)
         message(WARNING "AiDA C03 canonical manifest cardinality is invalid: targets=${_aida_manifest_target_count}, records=${_aida_manifest_record_count}")
     endif()
     file(READ "${AIDA_C03_SAFE_HEADLESS_INVENTORY}" _aida_inventory_json)
     string(JSON _aida_inventory_schema GET "${_aida_inventory_json}" schema)
     string(JSON _aida_inventory_count LENGTH "${_aida_inventory_json}" entries)
     if(NOT _aida_inventory_schema STREQUAL "aida.c03.safe-headless.inventory.v1" OR
-       NOT _aida_inventory_count EQUAL 58)
+       NOT _aida_inventory_count EQUAL 56)
         message(WARNING "AiDA C03 safe-headless inventory identity or cardinality is invalid")
     endif()
     math(EXPR _aida_inventory_last "${_aida_inventory_count} - 1")
@@ -1684,13 +1630,13 @@ function(aida_c03_register_safe_headless_targets application_target)
     string(JSON _aida_assertion_entries_length LENGTH "${_aida_assertion_inventory_json}" entries)
     if(NOT _aida_assertion_inventory_schema STREQUAL "aida.c03.safe-headless.assertion-sites.v1" OR
        NOT _aida_assertion_inventory_version EQUAL 1 OR
-       NOT _aida_assertion_entry_count EQUAL 58 OR
-       NOT _aida_assertion_entries_length EQUAL 58 OR
+       NOT _aida_assertion_entry_count EQUAL 56 OR
+       NOT _aida_assertion_entries_length EQUAL 56 OR
        NOT _aida_assertion_pending_count EQUAL 0)
         message(WARNING "AiDA C03 assertion telemetry inventory identity, cardinality, or handoff state is invalid")
     endif()
     set(_aida_assertion_targets)
-    foreach(_aida_index RANGE 0 57)
+    foreach(_aida_index RANGE 0 55)
         string(JSON _aida_assertion_target GET "${_aida_assertion_inventory_json}" entries ${_aida_index} target)
         if(_aida_assertion_target IN_LIST _aida_assertion_targets OR
            NOT _aida_assertion_target IN_LIST _aida_manifest_targets)

@@ -116,7 +116,7 @@ std::string last_error()
 #include <mutex>
 #include <unordered_map>
 
-#include "anti-tamper/webhook.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #pragma comment(lib, "Crypt32.lib")
 #pragma comment(lib, "Shell32.lib")
@@ -159,7 +159,7 @@ namespace store {
 			last_error_ref() = text;
 			if (!text.empty()) {
 				const std::string line = std::string("[aida.auth.store] ") + text;
-				anti_tamper::webhook::write_log("auth.store", line.c_str());
+				diag::log_tagged("auth.store", line.c_str());
 			}
 		}
 

@@ -55,13 +55,6 @@ public:
     int         embedding_dimensions;
     int         embedding_batch_size;
 
-    bool        eula_accepted;
-
-    std::string license_key;
-    int64_t     license_validated_at;
-    std::string license_hwid;
-    std::string firebase_api_key;
-
 public:
     std::map<std::string, std::string> custom_prompts;
     std::string active_prompt_name;

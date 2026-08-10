@@ -3,7 +3,6 @@
 #include <ntimage.h>
 #include <cstdint>
 
-#include <Crypter.h>
 #include <imports/Strings.h>
 
 namespace func_obfuscate {
@@ -101,28 +100,28 @@ inline bool SetupFunctions() {
         return false;
     }
 
-    *(PVOID*)&_RtlInitUnicodeString = GetProcAddress(kernelBase, (PCHAR)skCrypt("RtlInitUnicodeString"));
-    *(PVOID*)&_IoCreateDriver = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoCreateDriver"));
-    *(PVOID*)&_IoCreateDevice = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoCreateDevice"));
-    *(PVOID*)&_IoCreateSymbolicLink = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoCreateSymbolicLink"));
-    *(PVOID*)&_IoGetCurrentIrpStackLocation = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoGetCurrentIrpStackLocation"));
-    *(PVOID*)&_IofCompleteRequest = GetProcAddress(kernelBase, (PCHAR)skCrypt("IofCompleteRequest"));
-    *(PVOID*)&_MmCopyVirtualMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmCopyVirtualMemory"));
-    *(PVOID*)&_MmCopyMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmCopyMemory"));
-    *(PVOID*)&_MmMapIoSpaceEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmMapIoSpaceEx"));
-    *(PVOID*)&_MmUnmapIoSpace = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmUnmapIoSpace"));
-    *(PVOID*)&_PsLookupProcessByProcessId = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsLookupProcessByProcessId"));
-    *(PVOID*)&_PsGetProcessSectionBaseAddress = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetProcessSectionBaseAddress"));
-    *(PVOID*)&_ObfDereferenceObject = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObfDereferenceObject"));
-    *(PVOID*)&_ObReferenceObjectByName = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObReferenceObjectByName"));
-    *(PVOID*)&_MmGetPhysicalMemoryRanges = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmGetPhysicalMemoryRanges"));
-    *(PVOID*)&_MmGetVirtualForPhysical = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmGetVirtualForPhysical"));
-    *(PVOID*)&_RtlGetVersion = GetProcAddress(kernelBase, (PCHAR)skCrypt("RtlGetVersion"));
-    *(PVOID*)&_KfRaiseIrql = GetProcAddress(kernelBase, (PCHAR)skCrypt("KfRaiseIrql"));
-    *(PVOID*)&_KeLowerIrql = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeLowerIrql"));
-    *(PVOID*)&_MmIsAddressValid = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmIsAddressValid"));
-    *(PVOID*)&_ZwOpenProcess = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwOpenProcess"));
-    *(PVOID*)&_ZwClose = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwClose"));
+    *(PVOID*)&_RtlInitUnicodeString = GetProcAddress(kernelBase, (PCHAR)"RtlInitUnicodeString");
+    *(PVOID*)&_IoCreateDriver = GetProcAddress(kernelBase, (PCHAR)"IoCreateDriver");
+    *(PVOID*)&_IoCreateDevice = GetProcAddress(kernelBase, (PCHAR)"IoCreateDevice");
+    *(PVOID*)&_IoCreateSymbolicLink = GetProcAddress(kernelBase, (PCHAR)"IoCreateSymbolicLink");
+    *(PVOID*)&_IoGetCurrentIrpStackLocation = GetProcAddress(kernelBase, (PCHAR)"IoGetCurrentIrpStackLocation");
+    *(PVOID*)&_IofCompleteRequest = GetProcAddress(kernelBase, (PCHAR)"IofCompleteRequest");
+    *(PVOID*)&_MmCopyVirtualMemory = GetProcAddress(kernelBase, (PCHAR)"MmCopyVirtualMemory");
+    *(PVOID*)&_MmCopyMemory = GetProcAddress(kernelBase, (PCHAR)"MmCopyMemory");
+    *(PVOID*)&_MmMapIoSpaceEx = GetProcAddress(kernelBase, (PCHAR)"MmMapIoSpaceEx");
+    *(PVOID*)&_MmUnmapIoSpace = GetProcAddress(kernelBase, (PCHAR)"MmUnmapIoSpace");
+    *(PVOID*)&_PsLookupProcessByProcessId = GetProcAddress(kernelBase, (PCHAR)"PsLookupProcessByProcessId");
+    *(PVOID*)&_PsGetProcessSectionBaseAddress = GetProcAddress(kernelBase, (PCHAR)"PsGetProcessSectionBaseAddress");
+    *(PVOID*)&_ObfDereferenceObject = GetProcAddress(kernelBase, (PCHAR)"ObfDereferenceObject");
+    *(PVOID*)&_ObReferenceObjectByName = GetProcAddress(kernelBase, (PCHAR)"ObReferenceObjectByName");
+    *(PVOID*)&_MmGetPhysicalMemoryRanges = GetProcAddress(kernelBase, (PCHAR)"MmGetPhysicalMemoryRanges");
+    *(PVOID*)&_MmGetVirtualForPhysical = GetProcAddress(kernelBase, (PCHAR)"MmGetVirtualForPhysical");
+    *(PVOID*)&_RtlGetVersion = GetProcAddress(kernelBase, (PCHAR)"RtlGetVersion");
+    *(PVOID*)&_KfRaiseIrql = GetProcAddress(kernelBase, (PCHAR)"KfRaiseIrql");
+    *(PVOID*)&_KeLowerIrql = GetProcAddress(kernelBase, (PCHAR)"KeLowerIrql");
+    *(PVOID*)&_MmIsAddressValid = GetProcAddress(kernelBase, (PCHAR)"MmIsAddressValid");
+    *(PVOID*)&_ZwOpenProcess = GetProcAddress(kernelBase, (PCHAR)"ZwOpenProcess");
+    *(PVOID*)&_ZwClose = GetProcAddress(kernelBase, (PCHAR)"ZwClose");
 
     if (!_RtlInitUnicodeString || !_IoCreateDriver || !_IoCreateDevice ||
         !_IoCreateSymbolicLink || !_IofCompleteRequest || !_MmCopyMemory ||

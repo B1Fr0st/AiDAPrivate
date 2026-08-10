@@ -43,7 +43,6 @@
 #endif
 
 #include "../diagnostics/metadata_ring.hpp"
-#include "../runtime/manual_map_tls.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "allocator.hpp"
 #include "host_topology.hpp"
@@ -844,7 +843,6 @@ inline std::size_t resolve_worker_index(tf::Executor* executor) {
 
 inline void worker_interface_t::scheduler_prologue(tf::Worker& worker) {
     pool_t* p = pool_;
-    const bool tls_ready = aida::manual_map_tls::ensure_current_thread();
     if (!p)
         return;
     if (below_normal_priority_pool(*p)) {
@@ -852,13 +850,6 @@ inline void worker_interface_t::scheduler_prologue(tf::Worker& worker) {
         SetThreadPriority(GetCurrentThread(),
             elevated ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
         pool_priority_tls_generation() = p->priority_generation.load(std::memory_order_acquire);
-    }
-    if (!tls_ready) {
-        diag::log_tagged_fmt(safe_log_tag(*p),
-            "taskflow_worker_tls_unavailable phase=worker_start pool=%s worker_id=%zu tid=%lu",
-            safe_pool_name(*p),
-            worker.id(),
-            static_cast<unsigned long>(GetCurrentThreadId()));
     }
 }
 
@@ -1062,16 +1053,7 @@ inline void start_record(const std::shared_ptr<job_record_t>& record, std::uint6
             p->fairness_wait_ns_ring_next.fetch_add(1u, std::memory_order_acq_rel);
         p->fairness_wait_ns_ring[ring_slot & 1023u].store(fairness_wait_ns, std::memory_order_release);
     }
-    const bool task_tls_ready = aida::manual_map_tls::ensure_current_thread();
     const DWORD tid = GetCurrentThreadId();
-    if (!task_tls_ready) {
-        diag::log_tagged_fmt(safe_log_tag(*p),
-            "taskflow_task_tls_unavailable phase=task_start pool=%s job_id=%llu label=%s tid=%lu",
-            safe_pool_name(*p),
-            static_cast<unsigned long long>(record->id),
-            active_label.empty() ? "<unnamed>" : active_label.c_str(),
-            static_cast<unsigned long>(tid));
-    }
     const std::size_t worker_index = resolve_worker_index(p->executor.get());
     {
         std::lock_guard<std::mutex> lk(p->mtx);

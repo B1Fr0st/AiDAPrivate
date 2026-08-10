@@ -1,16 +1,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include "standalone_driver.hpp"
 #include "standalone_driver_identity.hpp"
-#include "standalone_license.hpp"
-#include "standalone_driver_antitamper_api.hpp"
-#include "anti-tamper/state.hpp"
-#include "anti-tamper/webhook.hpp"
-#include "anti-tamper/kernel_adbg_classifier.hpp"
 #include "driver_loader.hpp"
 #include "toast_notification.hpp"
-#include "arc/arc.h"
 #include "comm.h"
-#include "event_bus.hpp"
 #include "win_thread.hpp"
 #include "../infra/executor.hpp"
 #include "../mcp/mcp_standalone.hpp"
@@ -59,125 +52,8 @@ namespace
     std::vector<driver_bridge::pre_detach_fn_t> g_pre_detach_hooks;
     std::mutex                  g_callback_mtx;
 
-    std::atomic<driver_bridge::kernel_demote_kick_callback_t> g_kernel_demote_kick_cb{nullptr};
-    std::atomic<uint64_t> g_kernel_demote_last_notify_ms{0};
-
-    void kernel_demote_detected_bridge_thunk(const char* reason) noexcept {
-        driver_bridge::notify_kernel_demote_detected(reason);
-    }
-
     std::mutex      g_state_mtx;
     HANDLE          g_process = nullptr;
-    std::mutex      g_last_invalidate_mtx;
-    std::string     g_last_invalidate_reason;
-    std::atomic<uint64_t> g_last_invalidate_tick{0};
-
-    using arc_set_process_id_fn = void (*)(uint32_t);
-    using arc_solve_dtb_fn = uint64_t (*)();
-    using arc_get_dtb_fn = uint64_t (*)();
-    using arc_find_image_fn = uint64_t (*)();
-    using arc_set_base_address_fn = void (*)(uint64_t);
-
-    struct arc_vtable_slots_t
-    {
-        arc_set_process_id_fn set_process_id = nullptr;
-        arc_solve_dtb_fn solve_dtb = nullptr;
-        arc_get_dtb_fn get_dtb = nullptr;
-        arc_find_image_fn find_image = nullptr;
-        arc_set_base_address_fn set_base_address = nullptr;
-        DWORD exception_code = 0;
-    };
-
-    __declspec(noinline) arc_vtable_slots_t read_arc_vtable_slots_guarded(const arc_comm_vtable_t* table)
-    {
-        arc_vtable_slots_t slots{};
-        if (!table)
-            return slots;
-        __try {
-            slots.set_process_id = table->set_process_id;
-            slots.solve_dtb = table->solve_dtb;
-            slots.get_dtb = table->get_dtb;
-            slots.find_image = table->find_image;
-            slots.set_base_address = table->set_base_address;
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            slots = {};
-            slots.exception_code = GetExceptionCode();
-        }
-        return slots;
-    }
-
-    __declspec(noinline) DWORD call_arc_set_process_id_guarded(arc_set_process_id_fn fn, uint32_t pid)
-    {
-        DWORD seh_code = 0;
-        __try {
-            fn(pid);
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            seh_code = GetExceptionCode();
-        }
-        return seh_code;
-    }
-
-    __declspec(noinline) uint64_t call_arc_u64_guarded(arc_solve_dtb_fn fn, DWORD* out_seh_code)
-    {
-        if (out_seh_code)
-            *out_seh_code = 0;
-        uint64_t result = 0;
-        __try {
-            result = fn();
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            if (out_seh_code)
-                *out_seh_code = GetExceptionCode();
-            result = 0;
-        }
-        return result;
-    }
-
-    __declspec(noinline) uint64_t call_arc_get_dtb_guarded(arc_get_dtb_fn fn, DWORD* out_seh_code)
-    {
-        if (out_seh_code)
-            *out_seh_code = 0;
-        uint64_t result = 0;
-        __try {
-            result = fn();
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            if (out_seh_code)
-                *out_seh_code = GetExceptionCode();
-            result = 0;
-        }
-        return result;
-    }
-
-    __declspec(noinline) uint64_t call_arc_find_image_guarded(arc_find_image_fn fn, DWORD* out_seh_code)
-    {
-        if (out_seh_code)
-            *out_seh_code = 0;
-        uint64_t result = 0;
-        __try {
-            result = fn();
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            if (out_seh_code)
-                *out_seh_code = GetExceptionCode();
-            result = 0;
-        }
-        return result;
-    }
-
-    __declspec(noinline) DWORD call_arc_set_base_address_guarded(arc_set_base_address_fn fn, uint64_t base)
-    {
-        DWORD seh_code = 0;
-        __try {
-            fn(base);
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            seh_code = GetExceptionCode();
-        }
-        return seh_code;
-    }
-
-    template <typename Fn>
-    unsigned long long fn_bits(Fn fn)
-    {
-        return static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(fn));
-    }
 
     struct bridge_region_snapshot_t
     {
@@ -247,380 +123,6 @@ namespace
         return true;
     }
 
-    struct arc_attach_resolution_t
-    {
-        uint32_t pid = 0;
-        ULONGLONG started_ms = 0;
-        uint64_t dtb = 0;
-        uint64_t image_base = 0;
-        bool solved = false;
-    };
-
-    bool arc_bridge_attach_resolution(arc_attach_resolution_t& ctx)
-    {
-        return standalone_license::with_arc_comm_bridge(
-            [](const arc_comm_vtable_t* table, void* user) -> bool {
-                auto* c = static_cast<arc_attach_resolution_t*>(user);
-                diag::log_tagged_critical_fmt("driver",
-                    "attach_post_get_arc_vtable vtable=%p exc=0x%08lX elapsed_ms=%llu",
-                    table,
-                    0ul,
-                    static_cast<unsigned long long>(GetTickCount64() - c->started_ms));
-                const arc_vtable_slots_t arc_slots = read_arc_vtable_slots_guarded(table);
-                diag::log_tagged_critical_fmt("driver",
-                    "attach_arc_vtable_slots exc=0x%08lX set=0x%llX solve=0x%llX get=0x%llX image=0x%llX base=0x%llX",
-                    static_cast<unsigned long>(arc_slots.exception_code),
-                    fn_bits(arc_slots.set_process_id),
-                    fn_bits(arc_slots.solve_dtb),
-                    fn_bits(arc_slots.get_dtb),
-                    fn_bits(arc_slots.find_image),
-                    fn_bits(arc_slots.set_base_address));
-                if (!arc_slots.set_process_id || !arc_slots.solve_dtb || !arc_slots.get_dtb ||
-                    !arc_slots.find_image || !arc_slots.set_base_address || arc_slots.exception_code != 0)
-                    return false;
-
-                diag::log_tagged_critical("driver", "attach_arc_vtable_pre_set_process_id");
-                const DWORD set_pid_exc = call_arc_set_process_id_guarded(arc_slots.set_process_id, c->pid);
-                diag::log_tagged_critical_fmt("driver",
-                    "attach_arc_vtable_post_set_process_id exc=0x%08lX",
-                    static_cast<unsigned long>(set_pid_exc));
-                diag::log_tagged_critical("driver", "attach_arc_vtable_pre_solve_dtb");
-                DWORD solve_exc = 0;
-                uint64_t dtb = (set_pid_exc == 0)
-                    ? call_arc_u64_guarded(arc_slots.solve_dtb, &solve_exc)
-                    : 0;
-                diag::log_tagged_critical_fmt("driver",
-                    "attach_arc_vtable_post_solve_dtb dtb=0x%llX exc=0x%08lX",
-                    static_cast<unsigned long long>(dtb),
-                    static_cast<unsigned long>(solve_exc));
-                if (dtb == 0 && set_pid_exc == 0 && solve_exc == 0) {
-                    DWORD get_exc = 0;
-                    diag::log_tagged_critical("driver", "attach_arc_vtable_pre_get_dtb");
-                    dtb = call_arc_get_dtb_guarded(arc_slots.get_dtb, &get_exc);
-                    diag::log_tagged_critical_fmt("driver",
-                        "attach_arc_vtable_post_get_dtb dtb=0x%llX exc=0x%08lX",
-                        static_cast<unsigned long long>(dtb),
-                        static_cast<unsigned long>(get_exc));
-                }
-                if (dtb == 0 || set_pid_exc != 0 || solve_exc != 0)
-                    return false;
-
-                c->dtb = dtb;
-                c->solved = true;
-                diag::log_tagged_critical("driver", "attach_arc_vtable_pre_find_image");
-                DWORD find_exc = 0;
-                const uint64_t image_base = call_arc_find_image_guarded(arc_slots.find_image, &find_exc);
-                diag::log_tagged_critical_fmt("driver",
-                    "attach_arc_vtable_post_find_image base=0x%llX exc=0x%08lX",
-                    static_cast<unsigned long long>(image_base),
-                    static_cast<unsigned long>(find_exc));
-                if (image_base != 0 && find_exc == 0) {
-                    c->image_base = image_base;
-                    const DWORD base_exc = call_arc_set_base_address_guarded(arc_slots.set_base_address, image_base);
-                    diag::log_tagged_critical_fmt("driver",
-                        "attach_arc_vtable_post_set_base_address base=0x%llX exc=0x%08lX",
-                        static_cast<unsigned long long>(image_base),
-                        static_cast<unsigned long>(base_exc));
-                }
-                return true;
-            },
-            &ctx);
-    }
-
-    bool arc_bridge_set_process_id(uint32_t pid)
-    {
-        struct ctx_t { uint32_t pid; } ctx{pid};
-        return standalone_license::with_arc_comm_bridge(
-            [](const arc_comm_vtable_t* table, void* user) -> bool {
-                auto* c = static_cast<ctx_t*>(user);
-                if (!table->set_process_id)
-                    return false;
-                table->set_process_id(c->pid);
-                return true;
-            },
-            &ctx);
-    }
-
-    uint64_t arc_bridge_solve_dtb(bool require_get_dtb)
-    {
-        struct ctx_t { bool require_get_dtb; uint64_t value; } ctx{require_get_dtb, 0};
-        standalone_license::with_arc_comm_bridge(
-            [](const arc_comm_vtable_t* table, void* user) -> bool {
-                auto* c = static_cast<ctx_t*>(user);
-                if (!table->solve_dtb || (c->require_get_dtb && !table->get_dtb))
-                    return false;
-                c->value = table->solve_dtb();
-                return true;
-            },
-            &ctx);
-        return ctx.value;
-    }
-
-    uint64_t arc_bridge_find_image()
-    {
-        struct ctx_t { uint64_t value; } ctx{};
-        standalone_license::with_arc_comm_bridge(
-            [](const arc_comm_vtable_t* table, void* user) -> bool {
-                auto* c = static_cast<ctx_t*>(user);
-                if (!table->find_image)
-                    return false;
-                c->value = table->find_image();
-                return true;
-            },
-            &ctx);
-        return ctx.value;
-    }
-
-    bool arc_bridge_set_base_address(uint64_t base)
-    {
-        struct ctx_t { uint64_t base; } ctx{base};
-        return standalone_license::with_arc_comm_bridge(
-            [](const arc_comm_vtable_t* table, void* user) -> bool {
-                auto* c = static_cast<ctx_t*>(user);
-                if (!table->set_base_address)
-                    return false;
-                table->set_base_address(c->base);
-                return true;
-            },
-            &ctx);
-    }
-
-    uint32_t arc_bridge_find_process(const char* name)
-    {
-        if (!name || !*name)
-            return 0;
-        struct ctx_t { const char* name; uint32_t pid; } ctx{name, 0};
-        standalone_license::with_arc_comm_bridge(
-            [](const arc_comm_vtable_t* table, void* user) -> bool {
-                auto* c = static_cast<ctx_t*>(user);
-                if (!table->find_process)
-                    return false;
-                c->pid = table->find_process(c->name);
-                return true;
-            },
-            &ctx);
-        return ctx.pid;
-    }
-
-    bool arc_bridge_clear_process_context()
-    {
-        return standalone_license::with_arc_comm_bridge(
-            [](const arc_comm_vtable_t* table, void*) -> bool {
-                if (!table->clear_process_context)
-                    return false;
-                table->clear_process_context();
-                return true;
-            },
-            nullptr);
-    }
-
-    size_t arc_bridge_read_raw(uint64_t address, void* buffer, size_t size, bool* invoked = nullptr)
-    {
-        if (invoked)
-            *invoked = false;
-        if (!buffer || size == 0)
-            return 0;
-        static std::atomic<uint64_t> s_arc_read_seq{0};
-        const uint64_t seq = s_arc_read_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
-        const bool log_this = seq <= 256 || size <= 4096 || (seq % 128) == 0;
-        const uint32_t active_pid = driver_bridge::attached_pid();
-        const bool arc_loaded = standalone_license::is_arc_loaded();
-        const bool bridge_available = arc_loaded && driver_bridge::can_read_memory();
-        const DWORD tid = GetCurrentThreadId();
-        const ULONGLONG started = GetTickCount64();
-        if (log_this) {
-            diag::log_tagged_critical_fmt("driver",
-                "arc_read_raw_pre seq=%llu target_pid=%u active_pid=%u addr=0x%llX size=%llu tid=%lu arc_loaded=%d bridge_available=%d",
-                static_cast<unsigned long long>(seq),
-                active_pid,
-                active_pid,
-                static_cast<unsigned long long>(address),
-                static_cast<unsigned long long>(size),
-                static_cast<unsigned long>(tid),
-                arc_loaded ? 1 : 0,
-                bridge_available ? 1 : 0);
-        }
-        struct ctx_t { uint64_t address; void* buffer; size_t size; size_t bytes; bool invoked; } ctx{address, buffer, size, 0, false};
-        SetLastError(ERROR_SUCCESS);
-        const bool bridge_ok = standalone_license::with_arc_comm_bridge(
-            [](const arc_comm_vtable_t* table, void* user) -> bool {
-                auto* c = static_cast<ctx_t*>(user);
-                if (!table->read_raw)
-                    return false;
-                c->invoked = true;
-                c->bytes = table->read_raw(c->address, c->buffer, c->size);
-                return true;
-            },
-            &ctx);
-        const DWORD gle = GetLastError();
-        const ULONGLONG elapsed = GetTickCount64() - started;
-        if (log_this || !bridge_ok || !ctx.invoked || ctx.bytes == 0 || ctx.bytes != size || elapsed > 250) {
-            diag::log_tagged_critical_fmt("driver",
-                "arc_read_raw_post seq=%llu target_pid=%u active_pid=%u addr=0x%llX size=%llu tid=%lu arc_loaded=%d bridge_available=%d bridge_ok=%d invoked=%d bytes=%llu gle=%lu elapsed_ms=%llu",
-                static_cast<unsigned long long>(seq),
-                active_pid,
-                driver_bridge::attached_pid(),
-                static_cast<unsigned long long>(address),
-                static_cast<unsigned long long>(size),
-                static_cast<unsigned long>(tid),
-                arc_loaded ? 1 : 0,
-                bridge_available ? 1 : 0,
-                bridge_ok ? 1 : 0,
-                ctx.invoked ? 1 : 0,
-                static_cast<unsigned long long>(ctx.bytes),
-                static_cast<unsigned long>(gle),
-                static_cast<unsigned long long>(elapsed));
-        }
-        if (invoked)
-            *invoked = ctx.invoked;
-        return ctx.bytes;
-    }
-
-    size_t arc_bridge_write_raw(uint64_t address, const void* buffer, size_t size)
-    {
-        if (!buffer || size == 0)
-            return 0;
-        struct ctx_t { uint64_t address; const void* buffer; size_t size; size_t bytes; } ctx{address, buffer, size, 0};
-        standalone_license::with_arc_comm_bridge(
-            [](const arc_comm_vtable_t* table, void* user) -> bool {
-                auto* c = static_cast<ctx_t*>(user);
-                if (!table->write_raw)
-                    return false;
-                c->bytes = table->write_raw(c->address, c->buffer, c->size);
-                return true;
-            },
-            &ctx);
-        return ctx.bytes;
-    }
-
-    bool arc_bridge_enumerate_threads(void (*callback)(const arc_comm_vtable_t::thread_info_t*, void*),
-                                      void* callback_ctx,
-                                      uint32_t* out_count)
-    {
-        if (out_count)
-            *out_count = 0;
-        if (!callback)
-            return false;
-        struct ctx_t {
-            void (*callback)(const arc_comm_vtable_t::thread_info_t*, void*);
-            void* callback_ctx;
-            uint32_t count;
-        } ctx{callback, callback_ctx, 0};
-        bool ok = standalone_license::with_arc_comm_bridge(
-            [](const arc_comm_vtable_t* table, void* user) -> bool {
-                auto* c = static_cast<ctx_t*>(user);
-                if (!table->enumerate_threads)
-                    return false;
-                c->count = table->enumerate_threads(c->callback, c->callback_ctx);
-                return true;
-            },
-            &ctx);
-        if (out_count)
-            *out_count = ctx.count;
-        return ok;
-    }
-
-    bool arc_bridge_enumerate_memory_regions(void (*callback)(const arc_comm_vtable_t::memory_region_info_t*, void*),
-                                             void* callback_ctx,
-                                             uint32_t* out_count)
-    {
-        if (out_count)
-            *out_count = 0;
-        if (!callback)
-            return false;
-        struct ctx_t {
-            void (*callback)(const arc_comm_vtable_t::memory_region_info_t*, void*);
-            void* callback_ctx;
-            uint32_t count;
-        } ctx{callback, callback_ctx, 0};
-        bool ok = standalone_license::with_arc_comm_bridge(
-            [](const arc_comm_vtable_t* table, void* user) -> bool {
-                auto* c = static_cast<ctx_t*>(user);
-                if (!table->enumerate_memory_regions)
-                    return false;
-                c->count = table->enumerate_memory_regions(c->callback, c->callback_ctx);
-                return true;
-            },
-            &ctx);
-        if (out_count)
-            *out_count = ctx.count;
-        return ok;
-    }
-
-    bool arc_bridge_query_memory(uint64_t address, arc_comm_vtable_t::memory_region_info_t* out)
-    {
-        if (!out)
-            return false;
-        struct ctx_t { uint64_t address; arc_comm_vtable_t::memory_region_info_t* out; bool result; } ctx{address, out, false};
-        bool ok = standalone_license::with_arc_comm_bridge(
-            [](const arc_comm_vtable_t* table, void* user) -> bool {
-                auto* c = static_cast<ctx_t*>(user);
-                if (!table->query_memory)
-                    return false;
-                c->result = table->query_memory(c->address, c->out);
-                return true;
-            },
-            &ctx);
-        return ok && ctx.result;
-    }
-
-    bool arc_bridge_remote_call(uint64_t function_address,
-                                uint64_t arg1,
-                                uint64_t arg2,
-                                uint64_t arg3,
-                                uint64_t arg4,
-                                uint64_t& result,
-                                bool allow_zero_result,
-                                bool& zero_result_rejected)
-    {
-        struct ctx_t {
-            uint64_t function_address;
-            uint64_t arg1;
-            uint64_t arg2;
-            uint64_t arg3;
-            uint64_t arg4;
-            uint64_t result;
-            DWORD gle;
-            bool invoked;
-            bool allow_zero_result;
-            bool zero_result_rejected;
-        } ctx{function_address, arg1, arg2, arg3, arg4, 0, ERROR_SUCCESS, false, allow_zero_result, false};
-        zero_result_rejected = false;
-        SetLastError(ERROR_SUCCESS);
-        bool ok = standalone_license::with_arc_comm_bridge(
-            [](const arc_comm_vtable_t* table, void* user) -> bool {
-                auto* c = static_cast<ctx_t*>(user);
-                if (!table->remote_call) {
-                    c->gle = ERROR_PROC_NOT_FOUND;
-                    return false;
-                }
-                SetLastError(ERROR_SUCCESS);
-                c->invoked = true;
-                c->result = table->remote_call(c->function_address, c->arg1, c->arg2, c->arg3, c->arg4);
-                c->gle = GetLastError();
-                if (c->result != 0)
-                    return true;
-                if (c->allow_zero_result && c->gle == ERROR_SUCCESS)
-                    return true;
-                c->zero_result_rejected = true;
-                if (c->gle == ERROR_SUCCESS)
-                    c->gle = ERROR_GEN_FAILURE;
-                return false;
-            },
-            &ctx);
-        zero_result_rejected = ctx.zero_result_rejected;
-        if (ok) {
-            result = ctx.result;
-            SetLastError(ERROR_SUCCESS);
-        } else {
-            DWORD gle = ctx.gle != ERROR_SUCCESS ? ctx.gle : GetLastError();
-            if (gle == ERROR_SUCCESS)
-                gle = ctx.invoked ? ERROR_GEN_FAILURE : ERROR_NOT_READY;
-            SetLastError(gle);
-        }
-        return ok;
-    }
-
     uint32_t        g_pid = 0;
     std::atomic<uint32_t> g_pid_snapshot{0};
     uint32_t        g_primary_pid = 0;
@@ -632,8 +134,6 @@ namespace
     bool            g_kernel_mode = false;
     bool            g_has_vm_read = false;
     bool            g_kernel_attached = false;
-    std::atomic_bool g_adbg_clear_process_dr_supported{ true };
-    std::atomic_bool g_adbg_hide_all_threads_supported{ true };
     std::atomic<std::uint64_t> g_active_pid_generation{1};
     std::atomic<std::uint64_t> g_remote_call_sequence{1};
     std::atomic<std::uint32_t> g_remote_call_lower_inflight{0};
@@ -655,34 +155,9 @@ namespace
         return value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
     }
 
-    bool destructive_driver_action_suppressed()
-    {
-        if (anti_tamper::state::get().full_test_running.load(std::memory_order_acquire))
-            return true;
-        if (anti_tamper::state::full_test_suppression_active())
-            return true;
-        return env_flag_enabled("AIDA_FULL_TEST_RUNNING") ||
-               env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT");
-    }
-
     bool driver_error_toast_suppressed()
     {
-        if (anti_tamper::state::get().full_test_running.load(std::memory_order_acquire))
-            return true;
-        if (anti_tamper::state::full_test_suppression_active())
-            return true;
         return env_flag_enabled("AIDA_FULL_TEST_RUNNING");
-    }
-
-    bool stale_session_error_toast_suppressed()
-    {
-        if (driver_error_toast_suppressed())
-            return true;
-        if (anti_tamper::state::get().violation_latched.load(std::memory_order_acquire))
-            return true;
-        if (anti_tamper::state::get().license_pending_activation.load(std::memory_order_acquire))
-            return true;
-        return !standalone_license::is_arc_loaded();
     }
 
     struct process_ctx_t {
@@ -3681,22 +3156,7 @@ namespace
         va_start(ap, fmt);
         _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
         va_end(ap);
-        auto starts_with = [](const char* text, const char* prefix) -> bool {
-            return text && prefix && std::strncmp(text, prefix, std::strlen(prefix)) == 0;
-        };
-        const bool routine_kernel_probe =
-            starts_with(buf, "kernel_anti_debug_query_pre ") ||
-            starts_with(buf, "kernel_anti_debug_clear_dr_pre ") ||
-            starts_with(buf, "kernel_anti_debug_clear_process_dr_pre ") ||
-            starts_with(buf, "kernel_anti_debug_scan_debuggers_pre ") ||
-            starts_with(buf, "kernel_anti_debug_query_post ok=1 ") ||
-            starts_with(buf, "kernel_anti_debug_clear_dr_post ok=1 ") ||
-            starts_with(buf, "kernel_anti_debug_clear_process_dr_post ok=1 ") ||
-            starts_with(buf, "kernel_anti_debug_scan_debuggers_post ok=1 ");
-        if (routine_kernel_probe)
-            anti_tamper::webhook::write_log("driver", buf);
-        else
-            anti_tamper::webhook::write_log_critical("driver", buf);
+        diag::log_tagged_critical("driver", buf);
     }
 
     std::vector<driver_bridge::thread_info_t> enumerate_threads_usermode_snapshot(uint32_t pid)
@@ -3772,10 +3232,9 @@ namespace
                 }
                 logf("AiDA Standalone: %s\n", text.c_str());
                 if (!allow_toast || driver_error_toast_suppressed()) {
-                    diag::log_tagged_critical_fmt("driver", "driver_error_toast_suppressed text_len=%zu allow_toast=%d full_test_latch=%d env_full_test=%d suppressed_dupes=%llu",
+                    diag::log_tagged_critical_fmt("driver", "driver_error_toast_suppressed text_len=%zu allow_toast=%d env_full_test=%d suppressed_dupes=%llu",
                         text.size(),
                         allow_toast ? 1 : 0,
-                        anti_tamper::state::get().full_test_running.load(std::memory_order_acquire) ? 1 : 0,
                         env_flag_enabled("AIDA_FULL_TEST_RUNNING") ? 1 : 0,
                         static_cast<unsigned long long>(suppressed_now));
                 } else {
@@ -3808,9 +3267,8 @@ namespace
     {
         logf("AiDA Standalone: %s requires kernel driver.\n", func_name);
         if (driver_error_toast_suppressed()) {
-            diag::log_tagged_critical_fmt("driver", "driver_kernel_required_toast_suppressed func=%s full_test_latch=%d env_full_test=%d",
+            diag::log_tagged_critical_fmt("driver", "driver_kernel_required_toast_suppressed func=%s env_full_test=%d",
                 func_name ? func_name : "<null>",
-                anti_tamper::state::get().full_test_running.load(std::memory_order_acquire) ? 1 : 0,
                 env_flag_enabled("AIDA_FULL_TEST_RUNNING") ? 1 : 0);
         } else {
             toast_notification::push(std::string(func_name) + " requires kernel driver",
@@ -3824,177 +3282,47 @@ namespace
     std::atomic<int>  g_driver_consecutive_fail{0};
     std::atomic<uint64_t> g_driver_watchdog_last_ok_tick{0};
 
-    std::atomic<unsigned> g_consecutive_invalid_function{0};
-    constexpr unsigned kInvalidFunctionInvalidateThreshold = 16;
-
     constexpr int    kDriverWatchdogPeriodMs       = 4000;
-    constexpr int    kDriverWatchdogFailThreshold  = 8;
-    constexpr uint64_t kDriverWatchdogStaleSessionMinAgeMs = 45000;
-    constexpr int    kDriverWatchdogRecoveryProbeCount = 2;
-    constexpr DWORD  kDriverWatchdogRecoveryProbeDelayMs = 250;
-    constexpr DWORD  kDriverFastFailCode           = 0xBEA7DEADu;
-
-    [[noreturn]] void driver_fast_fail(const char* phase, DWORD err)
-    {
-        char buf[768];
-        DWORD hb_err     = device ? device->get_last_heartbeat_error() : 0u;
-        DWORD hb_bytes   = device ? device->get_last_heartbeat_bytes_returned() : 0u;
-        std::uint64_t hb_resp = device ? device->get_last_heartbeat_response() : 0ull;
-        std::uint32_t hb_ioctl = device ? device->get_last_heartbeat_ioctl_code() : 0u;
-        std::uint32_t hb_magic = device ? device->get_last_heartbeat_magic() : 0u;
-        std::uint32_t hb_base = device ? device->get_last_heartbeat_base() : 0u;
-        std::uint32_t hb_key_hash = device ? device->get_last_heartbeat_key_hash() : 0u;
-        std::uint32_t hb_ioctl_seed_hash = device ? device->get_last_heartbeat_ioctl_seed_hash() : 0u;
-        std::uint32_t hb_inst_server_seed = device ? device->get_last_heartbeat_server_seed_present() : 0u;
-        std::uint32_t hb_inst_ioctl_seed = device ? device->get_last_heartbeat_ioctl_seed_present() : 0u;
-        std::uint32_t hb_global_server_seed = device ? device->get_last_heartbeat_global_server_seed_present() : 0u;
-        std::uint32_t hb_global_ioctl_seed = device ? device->get_last_heartbeat_global_ioctl_seed_present() : 0u;
-        std::uint32_t hb_offset = device ? device->get_last_heartbeat_offset() : 0u;
-        BOOL hb_dioctl   = device ? device->get_last_heartbeat_dioctl_result() : FALSE;
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "DRIVER_REQUIRED phase=%s err=0x%08X "
-            "hb_err=%lu hb_bytes=%lu hb_resp=0x%016llX "
-            "hb_ioctl=0x%08X hb_magic=0x%08X hb_dioctl=%d "
-            "hb_base=0x%04X hb_offset=%u key_hash=0x%08X ioctl_seed_hash=0x%08X "
-            "inst_seed=%u/%u global_seed=%u/%u last_ok_ms=%llu",
-            phase ? phase : "?", err,
-            (unsigned long)hb_err, (unsigned long)hb_bytes,
-            (unsigned long long)hb_resp,
-            hb_ioctl, hb_magic, hb_dioctl ? 1 : 0,
-            hb_base, hb_offset, hb_key_hash, hb_ioctl_seed_hash,
-            hb_inst_server_seed, hb_inst_ioctl_seed,
-            hb_global_server_seed, hb_global_ioctl_seed,
-            static_cast<unsigned long long>(g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire)));
-        const std::string loader_error = driver_loader::last_error();
-        diag::log_tagged_critical("driver", buf);
-        diag::log_tagged_critical_fmt("driver", "loader_last_error=\"%s\"",
-            loader_error.empty() ? "<empty>" : loader_error.c_str());
-
-        char crash[2048];
-        _snprintf_s(crash, sizeof(crash), _TRUNCATE,
-            "FASTFAIL: code=0x%08X phase=%s err=0x%08X tid=%lu\r\n"
-            "Reason=Kernel driver is required, but the loader did not produce a connectable device.\r\n"
-            "DriverLoaderLastError=%s\r\n"
-            "HeartbeatError=%lu HeartbeatBytes=%lu HeartbeatResponse=0x%016llX\r\n"
-            "HeartbeatIoctl=0x%08X HeartbeatMagic=0x%08X HeartbeatDeviceIoctl=%d\r\n"
-            "HeartbeatBase=0x%04X HeartbeatOffset=%u HeartbeatKeyHash=0x%08X HeartbeatIoctlSeedHash=0x%08X\r\n"
-            "HeartbeatInstanceSeeds=%u/%u HeartbeatGlobalSeeds=%u/%u WatchdogLastOkMs=%llu\r\n"
-            "KernelDriverLogExpected=%s\r\n",
-            kDriverFastFailCode,
-            phase ? phase : "?",
-            err,
-            GetCurrentThreadId(),
-            loader_error.empty() ? "<empty>" : loader_error.c_str(),
-            (unsigned long)hb_err,
-            (unsigned long)hb_bytes,
-            (unsigned long long)hb_resp,
-            hb_ioctl,
-            hb_magic,
-            hb_dioctl ? 1 : 0,
-            hb_base,
-            hb_offset,
-            hb_key_hash,
-            hb_ioctl_seed_hash,
-            hb_inst_server_seed,
-            hb_inst_ioctl_seed,
-            hb_global_server_seed,
-            hb_global_ioctl_seed,
-            static_cast<unsigned long long>(g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire)),
-            (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) ? "no, DriverEntry likely did not run" : "unknown");
-        diag::write_crash_log(crash, false);
-        diag::log_tagged_critical("driver", "ABOUT_TO_FASTFAIL_0xBEA7DEAD");
-        OutputDebugStringA(buf);
-        anti_tamper::webhook::send_debug_log("driver", buf, true);
-        Sleep(50);
-        __fastfail(kDriverFastFailCode);
-    }
 
     bool driver_startup_fail_closed(const char* phase, DWORD err)
     {
-        char buf[1024];
-        DWORD hb_err     = device ? device->get_last_heartbeat_error() : 0u;
-        DWORD hb_bytes   = device ? device->get_last_heartbeat_bytes_returned() : 0u;
-        std::uint64_t hb_resp = device ? device->get_last_heartbeat_response() : 0ull;
-        std::uint32_t hb_ioctl = device ? device->get_last_heartbeat_ioctl_code() : 0u;
-        std::uint32_t hb_magic = device ? device->get_last_heartbeat_magic() : 0u;
-        std::uint32_t hb_base = device ? device->get_last_heartbeat_base() : 0u;
-        std::uint32_t hb_key_hash = device ? device->get_last_heartbeat_key_hash() : 0u;
-        std::uint32_t hb_ioctl_seed_hash = device ? device->get_last_heartbeat_ioctl_seed_hash() : 0u;
-        std::uint32_t hb_inst_server_seed = device ? device->get_last_heartbeat_server_seed_present() : 0u;
-        std::uint32_t hb_inst_ioctl_seed = device ? device->get_last_heartbeat_ioctl_seed_present() : 0u;
-        std::uint32_t hb_global_server_seed = device ? device->get_last_heartbeat_global_server_seed_present() : 0u;
-        std::uint32_t hb_global_ioctl_seed = device ? device->get_last_heartbeat_global_ioctl_seed_present() : 0u;
-        std::uint32_t hb_offset = device ? device->get_last_heartbeat_offset() : 0u;
-        BOOL hb_dioctl = device ? device->get_last_heartbeat_dioctl_result() : FALSE;
         const std::string loader_error = driver_loader::last_error();
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "DRIVER_REQUIRED_FAIL_CLOSED phase=%s err=0x%08X "
-            "hb_err=%lu hb_bytes=%lu hb_resp=0x%016llX "
-            "hb_ioctl=0x%08X hb_magic=0x%08X hb_dioctl=%d "
-            "hb_base=0x%04X hb_offset=%u key_hash=0x%08X ioctl_seed_hash=0x%08X "
-            "inst_seed=%u/%u global_seed=%u/%u loader=\"%s\"",
+        diag::log_tagged_critical_fmt("driver",
+            "driver_startup_failed phase=%s err=0x%08X loader=\"%s\"",
             phase ? phase : "?",
-            err,
-            (unsigned long)hb_err,
-            (unsigned long)hb_bytes,
-            (unsigned long long)hb_resp,
-            hb_ioctl,
-            hb_magic,
-            hb_dioctl ? 1 : 0,
-            hb_base,
-            hb_offset,
-            hb_key_hash,
-            hb_ioctl_seed_hash,
-            hb_inst_server_seed,
-            hb_inst_ioctl_seed,
-            hb_global_server_seed,
-            hb_global_ioctl_seed,
+            static_cast<unsigned long>(err),
             loader_error.empty() ? "<empty>" : loader_error.c_str());
 
-        diag::log_tagged_critical("driver", buf);
-        anti_tamper::webhook::send_debug_log("driver", buf, true);
-
-        char crash[2048];
+        char crash[1024];
         _snprintf_s(crash, sizeof(crash), _TRUNCATE,
-            "FAIL_CLOSED: phase=%s err=0x%08X tid=%lu\r\n"
-            "Reason=Kernel driver is required, but the loader did not produce a connectable device. AiDA remains locked without crashing.\r\n"
-            "DriverLoaderLastError=%s\r\n"
-            "HeartbeatError=%lu HeartbeatBytes=%lu HeartbeatResponse=0x%016llX\r\n"
-            "HeartbeatIoctl=0x%08X HeartbeatMagic=0x%08X HeartbeatDeviceIoctl=%d\r\n"
-            "HeartbeatBase=0x%04X HeartbeatOffset=%u HeartbeatKeyHash=0x%08X HeartbeatIoctlSeedHash=0x%08X\r\n"
-            "HeartbeatInstanceSeeds=%u/%u HeartbeatGlobalSeeds=%u/%u WatchdogLastOkMs=%llu\r\n",
+            "DRIVER_STARTUP_FAILED: phase=%s err=0x%08X tid=%lu\r\n"
+            "Reason=Kernel driver did not produce a connectable device; kernel-backed features are unavailable.\r\n"
+            "DriverLoaderLastError=%s\r\n",
             phase ? phase : "?",
             err,
             GetCurrentThreadId(),
-            loader_error.empty() ? "<empty>" : loader_error.c_str(),
-            (unsigned long)hb_err,
-            (unsigned long)hb_bytes,
-            (unsigned long long)hb_resp,
-            hb_ioctl,
-            hb_magic,
-            hb_dioctl ? 1 : 0,
-            hb_base,
-            hb_offset,
-            hb_key_hash,
-            hb_ioctl_seed_hash,
-            hb_inst_server_seed,
-            hb_inst_ioctl_seed,
-            hb_global_server_seed,
-            hb_global_ioctl_seed,
-            static_cast<unsigned long long>(g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire)));
+            loader_error.empty() ? "<empty>" : loader_error.c_str());
         diag::write_crash_log(crash, false);
 
-        std::string ui_error = "Kernel driver is required and could not be started.";
+        std::string ui_error = "Kernel driver could not be started.";
         if (!loader_error.empty())
             ui_error += " " + loader_error;
         set_last_error_locked(ui_error);
         return false;
     }
 
+    bool driver_liveness_probe() noexcept
+    {
+        if (!device || !device->is_connected())
+            return false;
+        voyager::device_t::ssdt_info info{};
+        return device->query_ssdt(info);
+    }
+
     void driver_watchdog_thread(uint64_t epoch)
     {
         diag::log_tagged_critical("driver", "watchdog_thread_entry");
-        uint64_t hb_iter = 0;
+        uint64_t probe_iter = 0;
         while (!g_driver_watchdog_stop.load(std::memory_order_acquire) &&
                g_driver_watchdog_epoch.load(std::memory_order_acquire) == epoch) {
             Sleep(kDriverWatchdogPeriodMs);
@@ -4002,125 +3330,33 @@ namespace
                 g_driver_watchdog_epoch.load(std::memory_order_acquire) != epoch) {
                 break;
             }
-            ++hb_iter;
-            bool connected = (device && device->is_connected());
-            bool ok = false;
-            if (connected) {
-                ok = device->send_heartbeat();
-            }
-            diag::log_tagged_critical_fmt("driver",
-                "heartbeat iter=%llu connected=%d ok=%d hb_err=%lu hb_bytes=%lu hb_resp=0x%016llX hb_ioctl=0x%08X hb_magic=0x%08X hb_dioctl=%d hb_base=0x%04X hb_offset=%u key_hash=0x%08X ioctl_seed_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u last_ok_ms=%llu",
-                (unsigned long long)hb_iter,
+            ++probe_iter;
+            const bool connected = (device && device->is_connected());
+            const bool ok = connected && driver_liveness_probe();
+            diag::log_tagged_fmt("driver",
+                "watchdog_liveness iter=%llu connected=%d ok=%d last_ok_ms=%llu",
+                static_cast<unsigned long long>(probe_iter),
                 connected ? 1 : 0,
                 ok ? 1 : 0,
-                device ? (unsigned long)device->get_last_heartbeat_error() : 0ul,
-                device ? (unsigned long)device->get_last_heartbeat_bytes_returned() : 0ul,
-                device ? (unsigned long long)device->get_last_heartbeat_response() : 0ull,
-                device ? (unsigned int)device->get_last_heartbeat_ioctl_code() : 0u,
-                device ? (unsigned int)device->get_last_heartbeat_magic() : 0u,
-                (device && device->get_last_heartbeat_dioctl_result()) ? 1 : 0,
-                device ? (unsigned int)device->get_last_heartbeat_base() : 0u,
-                device ? (unsigned int)device->get_last_heartbeat_offset() : 0u,
-                device ? (unsigned int)device->get_last_heartbeat_key_hash() : 0u,
-                device ? (unsigned int)device->get_last_heartbeat_ioctl_seed_hash() : 0u,
-                device ? (unsigned int)device->get_last_heartbeat_server_seed_present() : 0u,
-                device ? (unsigned int)device->get_last_heartbeat_ioctl_seed_present() : 0u,
-                device ? (unsigned int)device->get_last_heartbeat_global_server_seed_present() : 0u,
-                device ? (unsigned int)device->get_last_heartbeat_global_ioctl_seed_present() : 0u,
                 static_cast<unsigned long long>(g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire)));
             aida::diagnostics::breadcrumb_options_t wd_opts{};
-            wd_opts.category = aida::diagnostics::breadcrumb_category_t::license_arc_watchdog;
-            wd_opts.label = "driver_watchdog_heartbeat";
-            wd_opts.reason = ok ? "ok" : (connected ? "heartbeat_failed" : "not_connected");
+            wd_opts.category = aida::diagnostics::breadcrumb_category_t::driver_debugger;
+            wd_opts.label = "driver_watchdog_liveness";
+            wd_opts.reason = ok ? "ok" : (connected ? "probe_failed" : "not_connected");
             wd_opts.owner_subsystem = "driver_bridge";
-            wd_opts.status_code = ok ? 0 : static_cast<std::uint16_t>(device ? device->get_last_heartbeat_error() : 0);
+            wd_opts.status_code = ok ? 0 : static_cast<std::uint16_t>(GetLastError() & 0xFFFFu);
             aida::diagnostics::emit(std::move(wd_opts));
             if (ok) {
                 g_driver_watchdog_last_ok_tick.store(GetTickCount64(), std::memory_order_release);
                 g_driver_consecutive_fail.store(0, std::memory_order_release);
                 continue;
             }
-            int n = g_driver_consecutive_fail.fetch_add(1, std::memory_order_acq_rel) + 1;
-            char dbg[256];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "watchdog_heartbeat_fail consecutive=%d hb_err=%lu hb_bytes=%lu",
+            const int n = g_driver_consecutive_fail.fetch_add(1, std::memory_order_acq_rel) + 1;
+            diag::log_tagged_fmt("driver",
+                "watchdog_liveness_fail consecutive=%d connected=%d gle=%lu",
                 n,
-                device ? (unsigned long)device->get_last_heartbeat_error() : 0ul,
-                device ? (unsigned long)device->get_last_heartbeat_bytes_returned() : 0ul);
-            diag::log_tagged_critical("driver", dbg);
-            if (n >= kDriverWatchdogFailThreshold) {
-                const uint64_t last_ok = g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire);
-                if (connected && last_ok != 0) {
-                    const uint64_t now_tick = static_cast<uint64_t>(GetTickCount64());
-                    const uint64_t last_ok_age = now_tick >= last_ok ? now_tick - last_ok : 0;
-                    if (last_ok_age < kDriverWatchdogStaleSessionMinAgeMs) {
-                        diag::log_tagged_critical_fmt("driver",
-                            "watchdog_stale_session_defer consecutive=%d last_ok_age_ms=%llu min_age_ms=%llu hb_err=%lu hb_ioctl=0x%08X hb_base=0x%04X key_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u",
-                            n,
-                            static_cast<unsigned long long>(last_ok_age),
-                            static_cast<unsigned long long>(kDriverWatchdogStaleSessionMinAgeMs),
-                            device ? (unsigned long)device->get_last_heartbeat_error() : 0ul,
-                            device ? (unsigned int)device->get_last_heartbeat_ioctl_code() : 0u,
-                            device ? (unsigned int)device->get_last_heartbeat_base() : 0u,
-                            device ? (unsigned int)device->get_last_heartbeat_key_hash() : 0u,
-                            device ? (unsigned int)device->get_last_heartbeat_server_seed_present() : 0u,
-                            device ? (unsigned int)device->get_last_heartbeat_ioctl_seed_present() : 0u,
-                            device ? (unsigned int)device->get_last_heartbeat_global_server_seed_present() : 0u,
-                            device ? (unsigned int)device->get_last_heartbeat_global_ioctl_seed_present() : 0u);
-                        g_driver_consecutive_fail.store(kDriverWatchdogFailThreshold - 1, std::memory_order_release);
-                        continue;
-                    }
-                    bool recovered = false;
-                    for (int probe = 1; probe <= kDriverWatchdogRecoveryProbeCount; ++probe) {
-                        if (g_driver_watchdog_stop.load(std::memory_order_acquire) ||
-                            g_driver_watchdog_epoch.load(std::memory_order_acquire) != epoch)
-                            break;
-                        Sleep(kDriverWatchdogRecoveryProbeDelayMs);
-                        const bool probe_connected = (device && device->is_connected());
-                        const bool probe_ok = probe_connected && device->send_heartbeat();
-                        diag::log_tagged_critical_fmt("driver",
-                            "watchdog_recovery_probe probe=%d max=%d connected=%d ok=%d last_ok_age_ms=%llu hb_err=%lu hb_bytes=%lu hb_ioctl=0x%08X hb_base=0x%04X key_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u",
-                            probe,
-                            kDriverWatchdogRecoveryProbeCount,
-                            probe_connected ? 1 : 0,
-                            probe_ok ? 1 : 0,
-                            static_cast<unsigned long long>(last_ok_age),
-                            device ? (unsigned long)device->get_last_heartbeat_error() : 0ul,
-                            device ? (unsigned long)device->get_last_heartbeat_bytes_returned() : 0ul,
-                            device ? (unsigned int)device->get_last_heartbeat_ioctl_code() : 0u,
-                            device ? (unsigned int)device->get_last_heartbeat_base() : 0u,
-                            device ? (unsigned int)device->get_last_heartbeat_key_hash() : 0u,
-                            device ? (unsigned int)device->get_last_heartbeat_server_seed_present() : 0u,
-                            device ? (unsigned int)device->get_last_heartbeat_ioctl_seed_present() : 0u,
-                            device ? (unsigned int)device->get_last_heartbeat_global_server_seed_present() : 0u,
-                            device ? (unsigned int)device->get_last_heartbeat_global_ioctl_seed_present() : 0u);
-                        if (probe_ok) {
-                            g_driver_watchdog_last_ok_tick.store(GetTickCount64(), std::memory_order_release);
-                            g_driver_consecutive_fail.store(0, std::memory_order_release);
-                            recovered = true;
-                            break;
-                        }
-                    }
-                    if (recovered)
-                        continue;
-                    diag::log_tagged_critical_fmt("driver",
-                        "watchdog_stale_session_invalidate consecutive=%d last_ok_age_ms=%llu hb_err=%lu hb_ioctl=0x%08X hb_base=0x%04X key_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u",
-                        n,
-                        static_cast<unsigned long long>(GetTickCount64() - last_ok),
-                        device ? (unsigned long)device->get_last_heartbeat_error() : 0ul,
-                        device ? (unsigned int)device->get_last_heartbeat_ioctl_code() : 0u,
-                        device ? (unsigned int)device->get_last_heartbeat_base() : 0u,
-                        device ? (unsigned int)device->get_last_heartbeat_key_hash() : 0u,
-                        device ? (unsigned int)device->get_last_heartbeat_server_seed_present() : 0u,
-                        device ? (unsigned int)device->get_last_heartbeat_ioctl_seed_present() : 0u,
-                        device ? (unsigned int)device->get_last_heartbeat_global_server_seed_present() : 0u,
-                        device ? (unsigned int)device->get_last_heartbeat_global_ioctl_seed_present() : 0u);
-                    g_driver_consecutive_fail.store(kDriverWatchdogFailThreshold, std::memory_order_release);
-                    driver_bridge::invalidate_kernel_session("watchdog_heartbeat_fail");
-                    break;
-                }
-                driver_fast_fail("watchdog", 0xBEA70000u | (device ? device->get_last_heartbeat_error() & 0xFFFFu : 0u));
-            }
+                connected ? 1 : 0,
+                static_cast<unsigned long>(GetLastError()));
         }
         if (g_driver_watchdog_epoch.load(std::memory_order_acquire) == epoch)
             g_driver_watchdog_started.store(false, std::memory_order_release);
@@ -4173,272 +3409,9 @@ namespace
     std::atomic<bool> g_event_poller_started{false};
     std::atomic<bool> g_event_poller_stop{false};
     std::atomic<uint64_t> g_event_poller_epoch{0};
-    std::atomic<bool> g_kernel_reconnect_queued{false};
-    std::atomic<bool> g_post_demote_dtb_resolve_queued{false};
     std::atomic<uint64_t> g_tctx_kernel_bypass_until_ms{0};
     std::atomic<uint32_t> g_tctx_kernel_failures{0};
-    constexpr DWORD kKernelReconnectInitialDelayMs = 750;
-    constexpr DWORD kKernelReconnectRetryDelayMs = 2000;
-    constexpr int kKernelReconnectMaxAttempts = 3;
 
-    struct runtime_auth_snapshot_t
-    {
-        bool valid = false;
-        bool arc_loaded = false;
-        bool arc_loading = false;
-        bool arc_transfer = false;
-        bool arc_exports = false;
-        bool pending_activation = true;
-        bool violation_latched = false;
-        bool activation_hardening = false;
-        bool driver_hardening = false;
-        std::string missing_exports;
-        std::string violation_reason;
-        std::string latch_source;
-    };
-
-    struct kernel_session_snapshot_t
-    {
-        bool initialized = false;
-        bool kernel_mode = false;
-        bool connected = false;
-        bool has_vm_read = false;
-        bool kernel_attached = false;
-        bool watchdog_started = false;
-        bool watchdog_stop = false;
-        uint32_t active_pid = 0;
-        size_t attached_count = 0;
-        uint64_t watchdog_last_ok = 0;
-        int consecutive_fail = 0;
-        DWORD hb_err = 0;
-        DWORD hb_bytes = 0;
-        uint32_t hb_ioctl = 0;
-        uint32_t hb_base = 0;
-        uint32_t hb_key_hash = 0;
-    };
-
-    runtime_auth_snapshot_t capture_runtime_auth_snapshot()
-    {
-        runtime_auth_snapshot_t snap{};
-        auto& rt = anti_tamper::state::get();
-        snap.pending_activation = rt.license_pending_activation.load(std::memory_order_acquire);
-        snap.violation_latched = rt.violation_latched.load(std::memory_order_acquire);
-        snap.activation_hardening = rt.activation_hardening_done.load(std::memory_order_acquire);
-        snap.driver_hardening = rt.driver_hardening_done.load(std::memory_order_acquire);
-        {
-            std::lock_guard<std::mutex> lk(rt.mtx);
-            snap.violation_reason = rt.violation_reason;
-        }
-        snap.latch_source = anti_tamper::runtime_integrity_latch_source_snapshot();
-        snap.arc_loaded = standalone_license::is_arc_loaded();
-        snap.arc_loading = standalone_license::is_arc_download_in_progress();
-        snap.arc_transfer = standalone_license::is_arc_transfer_in_progress();
-        snap.valid = standalone_license::is_valid();
-        if (snap.arc_loaded)
-            snap.arc_exports = standalone_license::validate_arc_required_exports(snap.missing_exports);
-        else
-            snap.missing_exports = "arc_not_loaded";
-        return snap;
-    }
-
-    bool authenticated_runtime_preserved_for_kernel_transition(const runtime_auth_snapshot_t& snap)
-    {
-        return snap.valid &&
-               snap.arc_loaded &&
-               snap.arc_exports &&
-               snap.activation_hardening &&
-               !snap.pending_activation &&
-               !snap.violation_latched;
-    }
-
-    kernel_session_snapshot_t capture_kernel_session_snapshot_locked()
-    {
-        kernel_session_snapshot_t snap{};
-        snap.initialized = g_initialized;
-        snap.kernel_mode = g_kernel_mode;
-        snap.connected = device && device->is_connected();
-        snap.has_vm_read = g_has_vm_read;
-        snap.kernel_attached = g_kernel_attached;
-        snap.watchdog_started = g_driver_watchdog_started.load(std::memory_order_acquire);
-        snap.watchdog_stop = g_driver_watchdog_stop.load(std::memory_order_acquire);
-        snap.active_pid = g_pid;
-        snap.attached_count = g_processes.size();
-        snap.watchdog_last_ok = g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire);
-        snap.consecutive_fail = g_driver_consecutive_fail.load(std::memory_order_acquire);
-        snap.hb_err = device ? device->get_last_heartbeat_error() : 0u;
-        snap.hb_bytes = device ? device->get_last_heartbeat_bytes_returned() : 0u;
-        snap.hb_ioctl = device ? device->get_last_heartbeat_ioctl_code() : 0u;
-        snap.hb_base = device ? device->get_last_heartbeat_base() : 0u;
-        snap.hb_key_hash = device ? device->get_last_heartbeat_key_hash() : 0u;
-        return snap;
-    }
-
-    void log_auth_kernel_transition(const char* phase,
-                                    const char* reason,
-                                    bool preserve_activation,
-                                    const runtime_auth_snapshot_t& before_auth,
-                                    const runtime_auth_snapshot_t& after_auth,
-                                    const kernel_session_snapshot_t& before_kernel,
-                                    const kernel_session_snapshot_t& after_kernel)
-    {
-        driver_critical_fmt(
-            "auth_kernel_transition phase=%s reason=%s preserve_activation=%d "
-            "auth_valid=%d->%d arc=%d->%d loading=%d->%d transfer=%d->%d exports=%d->%d pending=%d->%d violation=%d->%d activation_hardening=%d->%d driver_hardening=%d->%d missing_before='%.160s' missing_after='%.160s' violation_reason_before='%.160s' violation_reason_after='%.160s' latch_source_before='%.512s' latch_source_after='%.512s' "
-            "kernel_initialized=%d->%d kernel_mode=%d->%d connected=%d->%d vm_read=%d->%d kernel_attached=%d->%d pid=%u->%u attached=%llu->%llu watchdog_started=%d->%d watchdog_stop=%d->%d watchdog_last_ok=%llu->%llu consecutive_fail=%d->%d hb_err=%lu->%lu hb_bytes=%lu->%lu hb_ioctl=0x%08X->0x%08X hb_base=0x%04X->0x%04X key_hash=0x%08X->0x%08X",
-            phase ? phase : "<null>",
-            reason ? reason : "<null>",
-            preserve_activation ? 1 : 0,
-            before_auth.valid ? 1 : 0,
-            after_auth.valid ? 1 : 0,
-            before_auth.arc_loaded ? 1 : 0,
-            after_auth.arc_loaded ? 1 : 0,
-            before_auth.arc_loading ? 1 : 0,
-            after_auth.arc_loading ? 1 : 0,
-            before_auth.arc_transfer ? 1 : 0,
-            after_auth.arc_transfer ? 1 : 0,
-            before_auth.arc_exports ? 1 : 0,
-            after_auth.arc_exports ? 1 : 0,
-            before_auth.pending_activation ? 1 : 0,
-            after_auth.pending_activation ? 1 : 0,
-            before_auth.violation_latched ? 1 : 0,
-            after_auth.violation_latched ? 1 : 0,
-            before_auth.activation_hardening ? 1 : 0,
-            after_auth.activation_hardening ? 1 : 0,
-            before_auth.driver_hardening ? 1 : 0,
-            after_auth.driver_hardening ? 1 : 0,
-            before_auth.missing_exports.c_str(),
-            after_auth.missing_exports.c_str(),
-            before_auth.violation_reason.c_str(),
-            after_auth.violation_reason.c_str(),
-            before_auth.latch_source.c_str(),
-            after_auth.latch_source.c_str(),
-            before_kernel.initialized ? 1 : 0,
-            after_kernel.initialized ? 1 : 0,
-            before_kernel.kernel_mode ? 1 : 0,
-            after_kernel.kernel_mode ? 1 : 0,
-            before_kernel.connected ? 1 : 0,
-            after_kernel.connected ? 1 : 0,
-            before_kernel.has_vm_read ? 1 : 0,
-            after_kernel.has_vm_read ? 1 : 0,
-            before_kernel.kernel_attached ? 1 : 0,
-            after_kernel.kernel_attached ? 1 : 0,
-            before_kernel.active_pid,
-            after_kernel.active_pid,
-            static_cast<unsigned long long>(before_kernel.attached_count),
-            static_cast<unsigned long long>(after_kernel.attached_count),
-            before_kernel.watchdog_started ? 1 : 0,
-            after_kernel.watchdog_started ? 1 : 0,
-            before_kernel.watchdog_stop ? 1 : 0,
-            after_kernel.watchdog_stop ? 1 : 0,
-            static_cast<unsigned long long>(before_kernel.watchdog_last_ok),
-            static_cast<unsigned long long>(after_kernel.watchdog_last_ok),
-            before_kernel.consecutive_fail,
-            after_kernel.consecutive_fail,
-            static_cast<unsigned long>(before_kernel.hb_err),
-            static_cast<unsigned long>(after_kernel.hb_err),
-            static_cast<unsigned long>(before_kernel.hb_bytes),
-            static_cast<unsigned long>(after_kernel.hb_bytes),
-            before_kernel.hb_ioctl,
-            after_kernel.hb_ioctl,
-            before_kernel.hb_base,
-            after_kernel.hb_base,
-            before_kernel.hb_key_hash,
-            after_kernel.hb_key_hash);
-    }
-
-    void reset_kernel_transition_hardening_locked(bool preserve_activation)
-    {
-        auto& rt = anti_tamper::state::get();
-        rt.driver_hardening_done.store(false, std::memory_order_release);
-        if (!preserve_activation)
-            rt.activation_hardening_done.store(false, std::memory_order_release);
-    }
-
-    void schedule_kernel_reconnect_after_stale(const char* reason, const runtime_auth_snapshot_t& stale_auth)
-    {
-        if (!authenticated_runtime_preserved_for_kernel_transition(stale_auth)) {
-            driver_critical_fmt("kernel_reconnect_skip reason=%s auth_valid=%d arc=%d exports=%d pending=%d violation=%d activation_hardening=%d",
-                reason ? reason : "<null>",
-                stale_auth.valid ? 1 : 0,
-                stale_auth.arc_loaded ? 1 : 0,
-                stale_auth.arc_exports ? 1 : 0,
-                stale_auth.pending_activation ? 1 : 0,
-                stale_auth.violation_latched ? 1 : 0,
-                stale_auth.activation_hardening ? 1 : 0);
-            return;
-        }
-
-        bool expected = false;
-        if (!g_kernel_reconnect_queued.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            driver_critical_fmt("kernel_reconnect_skip reason=%s already_queued=1", reason ? reason : "<null>");
-            return;
-        }
-
-        const std::string reason_text = (reason && *reason) ? reason : "kernel_stale";
-        aida::infra::executor::submission_t sub;
-        sub.owner_subsystem = "runtime_driver";
-        sub.label = "kernel_reconnect_after_stale";
-        sub.thread_class = "security_task";
-        sub.domain = aida::infra::executor::domain_t::security_liveness;
-        sub.priority = 0;
-        sub.body = [reason_text]() {
-            Sleep(kKernelReconnectInitialDelayMs);
-            for (int attempt = 1; attempt <= kKernelReconnectMaxAttempts; ++attempt) {
-                runtime_auth_snapshot_t auth = capture_runtime_auth_snapshot();
-                if (!authenticated_runtime_preserved_for_kernel_transition(auth)) {
-                    driver_critical_fmt("kernel_reconnect_abort reason=%s attempt=%d auth_valid=%d arc=%d exports=%d pending=%d violation=%d activation_hardening=%d missing='%.160s'",
-                        reason_text.c_str(),
-                        attempt,
-                        auth.valid ? 1 : 0,
-                        auth.arc_loaded ? 1 : 0,
-                        auth.arc_exports ? 1 : 0,
-                        auth.pending_activation ? 1 : 0,
-                        auth.violation_latched ? 1 : 0,
-                        auth.activation_hardening ? 1 : 0,
-                        auth.missing_exports.c_str());
-                    break;
-                }
-
-                driver_critical_fmt("kernel_reconnect_attempt reason=%s attempt=%d max=%d",
-                    reason_text.c_str(),
-                    attempt,
-                    kKernelReconnectMaxAttempts);
-                const bool loaded = driver_bridge::load_kernel_driver();
-                std::string unavailable_reason;
-                const bool available = loaded && driver_bridge::kernel_session_available(&unavailable_reason);
-                driver_critical_fmt("kernel_reconnect_result reason=%s attempt=%d loaded=%d available=%d unavailable='%.160s'",
-                    reason_text.c_str(),
-                    attempt,
-                    loaded ? 1 : 0,
-                    available ? 1 : 0,
-                    unavailable_reason.c_str());
-                if (loaded) {
-                    auto& rt = anti_tamper::state::get();
-                    if (rt.initialized.load(std::memory_order_acquire) &&
-                        !rt.driver_hardening_done.load(std::memory_order_acquire) &&
-                        !rt.violation_latched.load(std::memory_order_acquire))
-                    {
-                        const bool at_ok = anti_tamper::initialize();
-                        driver_critical_fmt("kernel_reconnect_antitamper_retry reason=%s attempt=%d ok=%d driver_hardening=%d violation=%d",
-                            reason_text.c_str(),
-                            attempt,
-                            at_ok ? 1 : 0,
-                            rt.driver_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
-                            rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0);
-                    }
-                    break;
-                }
-                if (attempt < kKernelReconnectMaxAttempts)
-                    Sleep(kKernelReconnectRetryDelayMs);
-            }
-            g_kernel_reconnect_queued.store(false, std::memory_order_release);
-        };
-        bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
-
-        driver_critical_fmt("kernel_reconnect_post reason=%s posted=%d", reason_text.c_str(), posted ? 1 : 0);
-        if (!posted)
-            g_kernel_reconnect_queued.store(false, std::memory_order_release);
-    }
     struct tctx_kernel_failure_key_t
     {
         uint32_t pid = 0;
@@ -4900,200 +3873,22 @@ namespace driver_bridge
         logf("%s", buf);
     }
 
-    void install_kernel_demote_kick_callback(kernel_demote_kick_callback_t cb)
-    {
-        g_kernel_demote_kick_cb.store(cb, std::memory_order_release);
-        diag::log_tagged_fmt("driver",
-            "install_kernel_demote_kick_callback cb=%p tid=%lu",
-            reinterpret_cast<void*>(cb),
-            static_cast<unsigned long>(GetCurrentThreadId()));
-    }
-
-    void notify_kernel_demote_detected(const char* reason)
-    {
-        const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
-        const uint64_t prior_ms = g_kernel_demote_last_notify_ms.exchange(now_ms, std::memory_order_acq_rel);
-        const uint64_t age_ms = prior_ms == 0 ? 0 : (now_ms - prior_ms);
-        auto cb = g_kernel_demote_kick_cb.load(std::memory_order_acquire);
-        diag::log_tagged_critical_fmt("driver",
-            "notify_kernel_demote_detected reason=%s last_notify_age_ms=%llu cb=%p tid=%lu",
-            reason ? reason : "unknown",
-            static_cast<unsigned long long>(age_ms),
-            reinterpret_cast<void*>(cb),
-            static_cast<unsigned long>(GetCurrentThreadId()));
-        if (cb) {
-            cb(reason ? reason : "send_request_invalid_function");
-        }
-
-        bool expected_queued = false;
-        if (g_post_demote_dtb_resolve_queued.compare_exchange_strong(expected_queued, true, std::memory_order_acq_rel)) {
-            const std::string reason_copy = reason ? std::string(reason) : std::string("send_request_invalid_function");
-            aida::infra::executor::submission_t sub;
-            sub.owner_subsystem = "runtime_driver";
-            sub.label = "driver_post_demote_dtb_resolve";
-            sub.thread_class = "security_task";
-            sub.domain = aida::infra::executor::domain_t::critical;
-            sub.priority = 0;
-            sub.body = [reason_copy]() {
-                Sleep(500);
-                const bool relay_ok = standalone_license::force_relay_now_blocking(2000);
-                diag::log_tagged_critical_fmt("driver",
-                    "post_demote_dtb_resolve_relay reason=%s relay_ok=%d",
-                    reason_copy.c_str(), relay_ok ? 1 : 0);
-                if (device && device->is_connected() && device->get_dtb() == 0) {
-                    device->solve_dtb();
-                    diag::log_tagged_fmt("driver",
-                        "post_demote_dtb_resolved pid=%u dtb=0x%llX ok=%d",
-                        device->get_process_id(),
-                        static_cast<unsigned long long>(device->get_dtb()),
-                        device->get_dtb() != 0 ? 1 : 0);
-                }
-                if (device && device->is_connected()) {
-                    const uint32_t hb_pid_before = device->get_process_id();
-                    const uint64_t hb_dtb_before = device->get_dtb();
-                    const bool hb_ok = device->send_heartbeat();
-                    const DWORD hb_err = device->get_last_heartbeat_error();
-                    const uint32_t hb_ioctl = device->get_last_heartbeat_ioctl_code();
-                    const uint64_t hb_resp = device->get_last_heartbeat_response();
-                    diag::log_tagged_critical_fmt("driver",
-                        "post_demote_reregister_heartbeat reason=%s hb_ok=%d hb_err=%lu hb_ioctl=0x%08X hb_resp=0x%llX pid=%u dtb=0x%llX dtb_after_hb=0x%llX",
-                        reason_copy.c_str(),
-                        hb_ok ? 1 : 0,
-                        static_cast<unsigned long>(hb_err),
-                        hb_ioctl,
-                        static_cast<unsigned long long>(hb_resp),
-                        hb_pid_before,
-                        static_cast<unsigned long long>(hb_dtb_before),
-                        static_cast<unsigned long long>(device->get_dtb()));
-                }
-                g_post_demote_dtb_resolve_queued.store(false, std::memory_order_release);
-            };
-            if (!aida::infra::executor::submit(std::move(sub)).submitted) {
-                g_post_demote_dtb_resolve_queued.store(false, std::memory_order_release);
-            }
-        }
-    }
-
-    void notify_send_request_success()
-    {
-        g_consecutive_invalid_function.store(0, std::memory_order_release);
-    }
-
-    void invalidate_kernel_session(const char* reason)
-    {
-        const unsigned consecutive_invalid_function_snapshot = g_consecutive_invalid_function.load(std::memory_order_acquire);
-        g_consecutive_invalid_function.store(0, std::memory_order_release);
-        {
-            std::lock_guard<std::mutex> lk(g_last_invalidate_mtx);
-            g_last_invalidate_reason = reason ? std::string(reason) : std::string("<null>");
-        }
-        g_last_invalidate_tick.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
-        const runtime_auth_snapshot_t before_auth = capture_runtime_auth_snapshot();
-        const bool preserve_activation = authenticated_runtime_preserved_for_kernel_transition(before_auth);
-        kernel_session_snapshot_t before_kernel{};
-        kernel_session_snapshot_t after_kernel{};
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            before_kernel = capture_kernel_session_snapshot_locked();
-            diag::log_tagged_critical_fmt("driver",
-                "invalidate_kernel_session_trigger reason=%s consecutive_invalid_function=%u g_kernel_attached=%d device_connected=%d device_dtb=0x%llX",
-                reason ? reason : "<null>",
-                consecutive_invalid_function_snapshot,
-                g_kernel_attached ? 1 : 0,
-                (device && device->is_connected()) ? 1 : 0,
-                static_cast<unsigned long long>(device ? device->get_dtb() : 0ULL));
-            diag::log_tagged_critical_fmt("driver",
-                "invalidate_kernel_session reason=%s initialized=%d kernel=%d connected=%d preserve_activation=%d auth_valid=%d arc=%d exports=%d pending=%d violation=%d activation_hardening=%d driver_hardening=%d",
-                reason ? reason : "<null>",
-                g_initialized ? 1 : 0,
-                g_kernel_mode ? 1 : 0,
-                (device && device->is_connected()) ? 1 : 0,
-                preserve_activation ? 1 : 0,
-                before_auth.valid ? 1 : 0,
-                before_auth.arc_loaded ? 1 : 0,
-                before_auth.arc_exports ? 1 : 0,
-                before_auth.pending_activation ? 1 : 0,
-                before_auth.violation_latched ? 1 : 0,
-                before_auth.activation_hardening ? 1 : 0,
-                before_auth.driver_hardening ? 1 : 0);
-            reset_kernel_transition_hardening_locked(preserve_activation);
-            g_kernel_mode = false;
-            g_initialized = false;
-            g_has_vm_read = false;
-            g_kernel_attached = false;
-            g_pid = 0;
-            g_primary_pid = 0;
-            g_pid_snapshot.store(0, std::memory_order_release);
-            const std::uint64_t generation = g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
-            g_process_name.clear();
-            g_driver_watchdog_stop.store(true, std::memory_order_release);
-            g_event_poller_stop.store(true, std::memory_order_release);
-            g_driver_watchdog_epoch.fetch_add(1, std::memory_order_acq_rel);
-            g_event_poller_epoch.fetch_add(1, std::memory_order_acq_rel);
-            g_driver_watchdog_started.store(false, std::memory_order_release);
-            g_event_poller_started.store(false, std::memory_order_release);
-            g_driver_consecutive_fail.store(0, std::memory_order_release);
-            g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
-            close_process_handle_locked();
-            for (auto& kv : g_processes)
-                release_ctx_handle(kv.second);
-            g_processes.clear();
-            if (device)
-                device->disconnect();
-            const bool suppress_toast = stale_session_error_toast_suppressed();
-            const bool allow_toast = !suppress_toast && !preserve_activation;
-            diag::log_tagged_critical_fmt("driver",
-                "stale_session_toast_policy reason=%s suppress=%d allow_toast=%d violation_latched=%d pending_activation=%d arc_loaded=%d preserve_activation=%d active_generation=%llu",
-                reason ? reason : "<null>",
-                suppress_toast ? 1 : 0,
-                allow_toast ? 1 : 0,
-                anti_tamper::state::get().violation_latched.load(std::memory_order_acquire) ? 1 : 0,
-                anti_tamper::state::get().license_pending_activation.load(std::memory_order_acquire) ? 1 : 0,
-                standalone_license::is_arc_loaded() ? 1 : 0,
-                preserve_activation ? 1 : 0,
-                static_cast<unsigned long long>(generation));
-            set_last_error_locked(
-                preserve_activation
-                    ? "Kernel driver session became stale; AiDA kept the authenticated IDE session active and degraded driver-backed capabilities while reconnecting."
-                    : "Kernel driver session became stale during activation; AiDA did not treat this as tampering.",
-                allow_toast);
-            after_kernel = capture_kernel_session_snapshot_locked();
-        }
-        const runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
-        log_auth_kernel_transition("invalidate_kernel_session",
-            reason,
-            preserve_activation,
-            before_auth,
-            after_auth,
-            before_kernel,
-            after_kernel);
-        schedule_kernel_reconnect_after_stale(reason, after_auth);
-    }
-
     void shutdown(const char* reason)
     {
         const char* reason_text = (reason && *reason) ? reason : "shutdown";
         const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        const runtime_auth_snapshot_t before_auth = capture_runtime_auth_snapshot();
-        kernel_session_snapshot_t before_kernel{};
-        kernel_session_snapshot_t after_kernel{};
-        bool kernel_mode = false;
-        bool connected = false;
         uint32_t active_pid = 0;
         size_t attached_count = 0;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
-            before_kernel = capture_kernel_session_snapshot_locked();
-            kernel_mode = g_kernel_mode;
-            connected = device && device->is_connected();
             active_pid = g_pid;
             attached_count = g_processes.size();
             driver_critical_fmt(
                 "shutdown_begin reason=%s initialized=%d kernel=%d connected=%d active_pid=%u attached=%llu watchdog_started=%d watchdog_stop=%d event_started=%d event_stop=%d tid=%lu",
                 reason_text,
                 g_initialized ? 1 : 0,
-                kernel_mode ? 1 : 0,
-                connected ? 1 : 0,
+                g_kernel_mode ? 1 : 0,
+                (device && device->is_connected()) ? 1 : 0,
                 active_pid,
                 static_cast<unsigned long long>(attached_count),
                 g_driver_watchdog_started.load(std::memory_order_acquire) ? 1 : 0,
@@ -5113,37 +3908,10 @@ namespace driver_bridge
 
         stop_lower_remote_call_executor(reason_text, 2500);
 
-        bool self_unregistered = false;
-        DWORD self_unregister_error = ERROR_SUCCESS;
-        if (kernel_mode && connected)
-        {
-            SetLastError(ERROR_SUCCESS);
-            self_unregistered = unregister_self_dll_protection();
-            self_unregister_error = self_unregistered ? ERROR_SUCCESS : GetLastError();
-            driver_critical_fmt(
-                "shutdown_unregister_self_dll_protection ok=%d err=%lu elapsed_ms=%llu",
-                self_unregistered ? 1 : 0,
-                static_cast<unsigned long>(self_unregister_error),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        }
-        else
-        {
-            driver_critical_fmt(
-                "shutdown_unregister_self_dll_protection skipped kernel=%d connected=%d elapsed_ms=%llu",
-                kernel_mode ? 1 : 0,
-                connected ? 1 : 0,
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        }
-
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
-            bool clear_context_ok = true;
             if (g_kernel_mode && device && device->is_connected())
-            {
-                clear_context_ok = arc_bridge_clear_process_context();
-                if (!clear_context_ok)
-                    device->clear_process_context();
-            }
+                device->clear_process_context();
             close_process_handle_locked();
             for (auto& kv : g_processes)
                 release_ctx_handle(kv.second);
@@ -5156,48 +3924,31 @@ namespace driver_bridge
             g_kernel_attached = false;
             g_kernel_mode = false;
             g_initialized = false;
-            anti_tamper::state::get().driver_hardening_done.store(false, std::memory_order_release);
-            anti_tamper::state::get().activation_hardening_done.store(false, std::memory_order_release);
             bool disconnect_attempted = device != nullptr;
             bool disconnect_connected_before = device && device->is_connected();
             if (device)
                 device->disconnect();
             bool disconnect_connected_after = device && device->is_connected();
             set_last_error_locked({});
-            after_kernel = capture_kernel_session_snapshot_locked();
             driver_critical_fmt(
-                "shutdown_done reason=%s self_unreg=%d self_unreg_err=%lu clear_context_ok=%d disconnect_attempted=%d connected_before=%d connected_after=%d elapsed_ms=%llu tid=%lu",
+                "shutdown_done reason=%s disconnect_attempted=%d connected_before=%d connected_after=%d elapsed_ms=%llu tid=%lu",
                 reason_text,
-                self_unregistered ? 1 : 0,
-                static_cast<unsigned long>(self_unregister_error),
-                clear_context_ok ? 1 : 0,
                 disconnect_attempted ? 1 : 0,
                 disconnect_connected_before ? 1 : 0,
                 disconnect_connected_after ? 1 : 0,
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
                 GetCurrentThreadId());
         }
-        const runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
-        log_auth_kernel_transition("shutdown",
-            reason_text,
-            false,
-            before_auth,
-            after_auth,
-            before_kernel,
-            after_kernel);
     }
 
     bool initialize()
     {
         const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        const runtime_auth_snapshot_t before_auth = capture_runtime_auth_snapshot();
-        const bool preserve_activation = authenticated_runtime_preserved_for_kernel_transition(before_auth);
         driver_critical_fmt("initialize_enter pid=%lu tid=%lu tick=%llu",
             GetCurrentProcessId(),
             GetCurrentThreadId(),
             static_cast<unsigned long long>(started));
         std::lock_guard<std::mutex> lk(g_state_mtx);
-        kernel_session_snapshot_t before_kernel = capture_kernel_session_snapshot_locked();
         driver_critical_fmt("initialize_state initialized=%d kernel=%d elapsed_ms=%llu",
             g_initialized ? 1 : 0,
             g_kernel_mode ? 1 : 0,
@@ -5212,37 +3963,15 @@ namespace driver_bridge
 
         g_remote_call_lower_executor_stop.store(false, std::memory_order_release);
         g_kernel_mode = false;
-        reset_kernel_transition_hardening_locked(preserve_activation);
-        g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
-        g_adbg_hide_all_threads_supported.store(true, std::memory_order_release);
         g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
         clear_last_error_locked_after_success("initialize_reset");
-
-        voyager::install_kernel_demote_detected_callback(&kernel_demote_detected_bridge_thunk);
-        voyager::install_send_request_success_callback(&driver_bridge::notify_send_request_success);
-        if (device) {
-            device->set_session_relay_cache_provider(&standalone_license::peek_cached_relay_inputs);
-            driver_critical_fmt("initialize_session_relay_cache_provider_wired tid=%lu",
-                static_cast<unsigned long>(GetCurrentThreadId()));
-        }
-        kernel_session_snapshot_t after_reset_kernel = capture_kernel_session_snapshot_locked();
-        runtime_auth_snapshot_t after_reset_auth = capture_runtime_auth_snapshot();
-        log_auth_kernel_transition("initialize_reset",
-            "initialize",
-            preserve_activation,
-            before_auth,
-            after_reset_auth,
-            before_kernel,
-            after_reset_kernel);
 
         driver_critical_fmt("initialize_connect_existing_pre device=%d elapsed_ms=%llu",
             device ? 1 : 0,
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
         if (device && device->connect()) {
-            driver_critical_fmt("initialize_connect_existing_post ok=1 elapsed_ms=%llu hb_err=%lu hb_bytes=%lu",
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
-                static_cast<unsigned long>(device->get_last_heartbeat_error()),
-                static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()));
+            driver_critical_fmt("initialize_connect_existing_post ok=1 elapsed_ms=%llu",
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             diag::log_tagged_fmt("driver", "connected to existing driver instance, skipping mapper");
             driver_loader::mark_already_loaded();
             g_kernel_mode = true;
@@ -5250,15 +3979,6 @@ namespace driver_bridge
             logf("AiDA Standalone: Connected to already-loaded driver (reuse, no remap).\n");
             start_driver_watchdog_locked();
             start_event_poller_locked();
-            kernel_session_snapshot_t after_kernel = capture_kernel_session_snapshot_locked();
-            runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
-            log_auth_kernel_transition("initialize_connect_existing",
-                "initialize",
-                preserve_activation,
-                before_auth,
-                after_auth,
-                before_kernel,
-                after_kernel);
             driver_critical_fmt("initialize_exit reason=existing_driver ok=1 kernel=1 elapsed_ms=%llu",
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             prestart_lower_remote_call_executor_state_known("initialize_existing_driver",
@@ -5269,38 +3989,24 @@ namespace driver_bridge
             return true;
         }
         DWORD existing_connect_err = device ? device->get_last_connect_error() : GetLastError();
-        BOOL existing_hb_ioctl = device ? device->get_last_heartbeat_dioctl_result() : FALSE;
-        DWORD existing_hb_bytes = device ? device->get_last_heartbeat_bytes_returned() : 0u;
-        DWORD existing_hb_err = device ? device->get_last_heartbeat_error() : 0u;
-        driver_critical_fmt("initialize_connect_existing_post ok=0 err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu elapsed_ms=%llu",
+        driver_critical_fmt("initialize_connect_existing_post ok=0 err=%lu elapsed_ms=%llu",
             static_cast<unsigned long>(existing_connect_err),
-            existing_hb_ioctl ? 1 : 0,
-            static_cast<unsigned long>(existing_hb_err),
-            static_cast<unsigned long>(existing_hb_bytes),
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
 
         const bool existing_driver_unreachable =
-            ((existing_connect_err & 0xFFFF0000u) == 0xBEA70000u) ||
-            existing_hb_ioctl ||
-            existing_hb_bytes != 0 ||
             existing_connect_err == 433u ||
             existing_connect_err == ERROR_ACCESS_DENIED;
         if (device && existing_driver_unreachable) {
             for (int attempt = 1; attempt <= 3; ++attempt) {
                 Sleep(300);
-                driver_critical_fmt("initialize_existing_driver_retry_pre attempt=%d err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu elapsed_ms=%llu",
+                driver_critical_fmt("initialize_existing_driver_retry_pre attempt=%d err=%lu elapsed_ms=%llu",
                     attempt,
                     static_cast<unsigned long>(device->get_last_connect_error()),
-                    device->get_last_heartbeat_dioctl_result() ? 1 : 0,
-                    static_cast<unsigned long>(device->get_last_heartbeat_error()),
-                    static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()),
                     static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
                 if (device->connect()) {
-                    driver_critical_fmt("initialize_existing_driver_retry_post attempt=%d ok=1 elapsed_ms=%llu hb_err=%lu hb_bytes=%lu",
+                    driver_critical_fmt("initialize_existing_driver_retry_post attempt=%d ok=1 elapsed_ms=%llu",
                         attempt,
-                        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
-                        static_cast<unsigned long>(device->get_last_heartbeat_error()),
-                        static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()));
+                        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
                     diag::log_tagged_fmt("driver", "connected to existing driver instance after guarded retry, skipping mapper");
                     driver_loader::mark_already_loaded();
                     g_kernel_mode = true;
@@ -5308,15 +4014,6 @@ namespace driver_bridge
                     logf("AiDA Standalone: Connected to already-loaded driver after guarded retry.\n");
                     start_driver_watchdog_locked();
                     start_event_poller_locked();
-                    kernel_session_snapshot_t after_kernel = capture_kernel_session_snapshot_locked();
-                    runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
-                    log_auth_kernel_transition("initialize_existing_driver_retry",
-                        "initialize",
-                        preserve_activation,
-                        before_auth,
-                        after_auth,
-                        before_kernel,
-                        after_kernel);
                     driver_critical_fmt("initialize_exit reason=existing_driver_retry ok=1 kernel=1 elapsed_ms=%llu",
                         static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
                     prestart_lower_remote_call_executor_state_known("initialize_existing_driver_retry",
@@ -5326,20 +4023,14 @@ namespace driver_bridge
                                                                     true);
                     return true;
                 }
-                driver_critical_fmt("initialize_existing_driver_retry_post attempt=%d ok=0 err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu elapsed_ms=%llu",
+                driver_critical_fmt("initialize_existing_driver_retry_post attempt=%d ok=0 err=%lu elapsed_ms=%llu",
                     attempt,
                     static_cast<unsigned long>(device->get_last_connect_error()),
-                    device->get_last_heartbeat_dioctl_result() ? 1 : 0,
-                    static_cast<unsigned long>(device->get_last_heartbeat_error()),
-                    static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()),
                     static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             }
             DWORD guarded_err = device->get_last_connect_error();
-            driver_critical_fmt("initialize_exit reason=existing_driver_unreachable_no_remap err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu elapsed_ms=%llu",
+            driver_critical_fmt("initialize_exit reason=existing_driver_unreachable_no_remap err=%lu elapsed_ms=%llu",
                 static_cast<unsigned long>(guarded_err),
-                device->get_last_heartbeat_dioctl_result() ? 1 : 0,
-                static_cast<unsigned long>(device->get_last_heartbeat_error()),
-                static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()),
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return driver_startup_fail_closed("initialize_existing_driver_unreachable_no_remap", guarded_err);
         }
@@ -5360,28 +4051,15 @@ namespace driver_bridge
             driver_critical_fmt("initialize_loader_failed_connect_retry_pre elapsed_ms=%llu",
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             if (device && device->connect()) {
-                driver_critical_fmt("initialize_loader_failed_connect_retry_post ok=1 elapsed_ms=%llu hb_err=%lu hb_bytes=%lu",
-                    static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
-                    static_cast<unsigned long>(device->get_last_heartbeat_error()),
-                    static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()));
+                driver_critical_fmt("initialize_loader_failed_connect_retry_post ok=1 elapsed_ms=%llu",
+                    static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
                 diag::log_tagged_fmt("driver", "loader_failed_but_driver_connect_ok");
                 driver_loader::mark_already_loaded();
                 g_kernel_mode = true;
                 g_initialized = true;
-                g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
-                g_adbg_hide_all_threads_supported.store(true, std::memory_order_release);
                 logf("AiDA Standalone: Mapper reported failure after load, but kernel driver backend is reachable.\n");
                 start_driver_watchdog_locked();
                 start_event_poller_locked();
-                kernel_session_snapshot_t after_kernel = capture_kernel_session_snapshot_locked();
-                runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
-                log_auth_kernel_transition("initialize_loader_failed_connect_retry",
-                    "initialize_loader",
-                    preserve_activation,
-                    before_auth,
-                    after_auth,
-                    before_kernel,
-                    after_kernel);
                 driver_critical_fmt("initialize_exit reason=loader_failed_but_connect_ok ok=1 kernel=1 elapsed_ms=%llu",
                     static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
                 prestart_lower_remote_call_executor_state_known("initialize_loader_failed_connect_retry",
@@ -5400,26 +4078,13 @@ namespace driver_bridge
         driver_critical_fmt("initialize_connect_after_loader_pre elapsed_ms=%llu",
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
         if (device && device->connect()) {
-            driver_critical_fmt("initialize_connect_after_loader_post ok=1 elapsed_ms=%llu hb_err=%lu hb_bytes=%lu",
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
-                static_cast<unsigned long>(device->get_last_heartbeat_error()),
-            static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()));
+            driver_critical_fmt("initialize_connect_after_loader_post ok=1 elapsed_ms=%llu",
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             g_kernel_mode = true;
             g_initialized = true;
-            g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
-            g_adbg_hide_all_threads_supported.store(true, std::memory_order_release);
             logf("AiDA Standalone: Live inspection bridge initialized with kernel driver backend.\n");
             start_driver_watchdog_locked();
             start_event_poller_locked();
-            kernel_session_snapshot_t after_kernel = capture_kernel_session_snapshot_locked();
-            runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
-            log_auth_kernel_transition("initialize_connect_after_loader",
-                "initialize",
-                preserve_activation,
-                before_auth,
-                after_auth,
-                before_kernel,
-                after_kernel);
             driver_critical_fmt("initialize_exit reason=loaded_connect_ok ok=1 kernel=1 elapsed_ms=%llu",
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             prestart_lower_remote_call_executor_state_known("initialize_connect_after_loader",
@@ -5446,90 +4111,49 @@ namespace driver_bridge
 
     bool load_kernel_driver()
     {
-        const runtime_auth_snapshot_t before_auth = capture_runtime_auth_snapshot();
-        const bool preserve_activation = authenticated_runtime_preserved_for_kernel_transition(before_auth);
         std::lock_guard<std::mutex> lk(g_state_mtx);
-        kernel_session_snapshot_t before_kernel = capture_kernel_session_snapshot_locked();
         if (g_kernel_mode && device && device->is_connected())
             return true;
 
         if (device && device->connect()) {
             driver_loader::mark_already_loaded();
-            reset_kernel_transition_hardening_locked(preserve_activation);
             g_kernel_mode = true;
             g_initialized = true;
-            g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
-            g_adbg_hide_all_threads_supported.store(true, std::memory_order_release);
             g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
             start_driver_watchdog_locked();
             start_event_poller_locked();
-            kernel_session_snapshot_t after_kernel = capture_kernel_session_snapshot_locked();
-            runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
-            log_auth_kernel_transition("load_kernel_driver_connect_existing",
-                "load_kernel_driver",
-                preserve_activation,
-                before_auth,
-                after_auth,
-                before_kernel,
-                after_kernel);
             return true;
         }
 
         if (device) {
             DWORD existing_connect_err = device->get_last_connect_error();
             const bool existing_driver_unreachable =
-                ((existing_connect_err & 0xFFFF0000u) == 0xBEA70000u) ||
-                device->get_last_heartbeat_dioctl_result() ||
-                device->get_last_heartbeat_bytes_returned() != 0 ||
                 existing_connect_err == 433u ||
                 existing_connect_err == ERROR_ACCESS_DENIED;
             if (existing_driver_unreachable) {
                 for (int attempt = 1; attempt <= 3; ++attempt) {
                     Sleep(300);
-                    driver_critical_fmt("load_kernel_driver_existing_retry_pre attempt=%d err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu",
+                    driver_critical_fmt("load_kernel_driver_existing_retry_pre attempt=%d err=%lu",
                         attempt,
-                        static_cast<unsigned long>(device->get_last_connect_error()),
-                        device->get_last_heartbeat_dioctl_result() ? 1 : 0,
-                        static_cast<unsigned long>(device->get_last_heartbeat_error()),
-                        static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()));
+                        static_cast<unsigned long>(device->get_last_connect_error()));
                     if (device->connect()) {
                         driver_loader::mark_already_loaded();
-                        reset_kernel_transition_hardening_locked(preserve_activation);
                         g_kernel_mode = true;
                         g_initialized = true;
-                        g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
-                        g_adbg_hide_all_threads_supported.store(true, std::memory_order_release);
                         g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
                         start_driver_watchdog_locked();
                         start_event_poller_locked();
-                        kernel_session_snapshot_t after_kernel = capture_kernel_session_snapshot_locked();
-                        runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
-                        log_auth_kernel_transition("load_kernel_driver_existing_retry",
-                            "load_kernel_driver",
-                            preserve_activation,
-                            before_auth,
-                            after_auth,
-                            before_kernel,
-                            after_kernel);
-                        driver_critical_fmt("load_kernel_driver_existing_retry_post attempt=%d ok=1 hb_err=%lu hb_bytes=%lu",
-                            attempt,
-                            static_cast<unsigned long>(device->get_last_heartbeat_error()),
-                            static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()));
+                        driver_critical_fmt("load_kernel_driver_existing_retry_post attempt=%d ok=1",
+                            attempt);
                         return true;
                     }
-                    driver_critical_fmt("load_kernel_driver_existing_retry_post attempt=%d ok=0 err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu",
+                    driver_critical_fmt("load_kernel_driver_existing_retry_post attempt=%d ok=0 err=%lu",
                         attempt,
-                        static_cast<unsigned long>(device->get_last_connect_error()),
-                        device->get_last_heartbeat_dioctl_result() ? 1 : 0,
-                        static_cast<unsigned long>(device->get_last_heartbeat_error()),
-                        static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()));
+                        static_cast<unsigned long>(device->get_last_connect_error()));
                 }
                 DWORD guarded_err = device->get_last_connect_error();
-                driver_critical_fmt("load_kernel_driver_no_remap_existing_unreachable err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu",
-                    static_cast<unsigned long>(guarded_err),
-                    device->get_last_heartbeat_dioctl_result() ? 1 : 0,
-                    static_cast<unsigned long>(device->get_last_heartbeat_error()),
-                    static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()));
+                driver_critical_fmt("load_kernel_driver_no_remap_existing_unreachable err=%lu",
+                    static_cast<unsigned long>(guarded_err));
                 return driver_startup_fail_closed("load_kernel_driver_existing_unreachable_no_remap", guarded_err);
             }
         }
@@ -5547,11 +4171,6 @@ namespace driver_bridge
             char buf[256];
             if (err == 0xFFFFFFFFu) {
                 snprintf(buf, sizeof(buf), "Failed to connect to the kernel driver (device object is null).");
-            } else if ((err & 0xFFFF0000u) == 0xBEA70000u) {
-                snprintf(buf, sizeof(buf),
-                    "Driver device opened but heartbeat failed (0x%08X). "
-                    "Stale session or IOCTL mismatch — try rebooting.",
-                    err);
             } else if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
                 snprintf(buf, sizeof(buf),
                     "Driver device not found (error %lu). "
@@ -5571,25 +4190,13 @@ namespace driver_bridge
             return false;
         }
 
-        reset_kernel_transition_hardening_locked(preserve_activation);
         g_kernel_mode = true;
         g_initialized = true;
-        g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
-        g_adbg_hide_all_threads_supported.store(true, std::memory_order_release);
         g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
         clear_last_error_locked_after_success("load_kernel_driver");
         logf("AiDA Standalone: Kernel driver backend is active.\n");
         start_driver_watchdog_locked();
         start_event_poller_locked();
-        kernel_session_snapshot_t after_kernel = capture_kernel_session_snapshot_locked();
-        runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
-        log_auth_kernel_transition("load_kernel_driver_connect_after_loader",
-            "load_kernel_driver",
-            preserve_activation,
-            before_auth,
-            after_auth,
-            before_kernel,
-            after_kernel);
         return true;
     }
 
@@ -5649,53 +4256,6 @@ namespace driver_bridge
             return false;
         }
 
-        if (device && device->session_invalidated()) {
-            set_reason("kernel_session_invalidated");
-            driver_critical_fmt("kernel_session_available ok=0 reason=kernel_session_invalidated initialized=%d kernel=%d connected=%d last_hb_err=%lu last_error='%.160s'",
-                initialized ? 1 : 0,
-                kernel_mode ? 1 : 0,
-                connected ? 1 : 0,
-                static_cast<unsigned long>(device->get_last_heartbeat_error()),
-                last_error_copy.c_str());
-            return false;
-        }
-
-        auto& rt = anti_tamper::state::get();
-        if (rt.violation_latched.load(std::memory_order_acquire)) {
-            set_reason("runtime_integrity_violation_latched");
-            std::string latch_source = anti_tamper::runtime_integrity_latch_source_snapshot();
-            std::string violation_reason;
-            {
-                std::lock_guard<std::mutex> lk(rt.mtx);
-                violation_reason = rt.violation_reason;
-            }
-            driver_critical_fmt("kernel_session_available ok=0 reason=runtime_integrity_violation_latched violation_reason='%.160s' latch_source='%.512s'",
-                violation_reason.c_str(),
-                latch_source.c_str());
-            return false;
-        }
-        if (rt.initialized.load(std::memory_order_acquire) &&
-            !rt.driver_hardening_done.load(std::memory_order_acquire))
-        {
-            set_reason("driver_hardening_not_finalized");
-            std::string last_reason;
-            {
-                std::lock_guard<std::mutex> lk(g_last_invalidate_mtx);
-                last_reason = g_last_invalidate_reason;
-            }
-            const uint64_t last_tick = g_last_invalidate_tick.load(std::memory_order_acquire);
-            const uint64_t now_tick = static_cast<uint64_t>(GetTickCount64());
-            const uint64_t elapsed_since_invalidate_ms = last_tick == 0 ? 0 : (now_tick - last_tick);
-            driver_critical_fmt("kernel_session_available ok=0 reason=driver_hardening_not_finalized initialized=%d kernel=%d connected=%d activation_hardening=%d last_invalidate_reason='%.160s' elapsed_since_invalidate_ms=%llu",
-                initialized ? 1 : 0,
-                kernel_mode ? 1 : 0,
-                connected ? 1 : 0,
-                rt.activation_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
-                last_reason.empty() ? "<never>" : last_reason.c_str(),
-                static_cast<unsigned long long>(elapsed_since_invalidate_ms));
-            return false;
-        }
-
         if (reason)
             reason->clear();
         return true;
@@ -5714,33 +4274,6 @@ namespace driver_bridge
         if (pid == static_cast<uint32_t>(GetCurrentProcessId())) {
             diag::log_tagged_critical("driver", "attach_REJECTED_self_pid");
             return false;
-        }
-
-        if (self_guard::is_self_or_child_pid(pid)) {
-            self_guard::self_guard_context_t sg_ctx;
-            sg_ctx.tool_name = "driver_attach";
-            sg_ctx.has_pid = true;
-            sg_ctx.target_pid = pid;
-            auto guard_result = self_guard::invoke_self_guard(sg_ctx);
-            if (guard_result != self_guard::self_guard_result_t::allow) {
-                self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
-            }
-            diag::log_tagged_critical_fmt("driver", "attach_REJECTED_self_or_child_pid pid=%u", pid);
-            return false;
-        }
-
-        {
-            diag::log_tagged_critical("driver", "attach_pre_inline_gate_check");
-            uint64_t gt = standalone_license::inline_gate_check(
-                standalone_license::gate_driver_attach);
-            diag::log_tagged_critical_fmt("driver", "attach_post_inline_gate_check token=0x%llX",
-                (unsigned long long)gt);
-            if (standalone_license::verify_gate_token(
-                    standalone_license::gate_driver_attach, gt) < 0.5) {
-                diag::log_tagged_critical("driver", "attach_REJECTED_gate_check_failed");
-                return false;
-            }
-            diag::log_tagged_critical("driver", "attach_post_verify_gate_token");
         }
 
         diag::log_tagged_critical("driver", "attach_pre_state_mtx_lock");
@@ -5792,66 +4325,22 @@ namespace driver_bridge
         device->set_process_id(pid);
         diag::log_tagged_critical("driver", "attach_post_set_process_id");
 
-        const ULONGLONG arc_bridge_t0 = GetTickCount64();
-        diag::log_tagged_critical("driver", "attach_pre_get_arc_vtable");
-        arc_attach_resolution_t arc_attach_ctx{};
-        arc_attach_ctx.pid = pid;
-        arc_attach_ctx.started_ms = arc_bridge_t0;
-        const bool arc_bridge_ok = arc_bridge_attach_resolution(arc_attach_ctx);
-        diag::log_tagged_critical_fmt("driver",
-            "attach_arc_vtable_wrapper_result ok=%d solved=%d dtb=0x%llX image=0x%llX elapsed_ms=%llu",
-            arc_bridge_ok ? 1 : 0,
-            arc_attach_ctx.solved ? 1 : 0,
-            static_cast<unsigned long long>(arc_attach_ctx.dtb),
-            static_cast<unsigned long long>(arc_attach_ctx.image_base),
-            static_cast<unsigned long long>(GetTickCount64() - arc_bridge_t0));
-        bool vtable_solved = arc_bridge_ok && arc_attach_ctx.solved;
-        if (vtable_solved) {
-            diag::log_tagged_critical("driver", "attach_pre_device_solve_dtb_after_vtable");
-            device->solve_dtb();
-            diag::log_tagged_critical("driver", "attach_post_device_solve_dtb_after_vtable");
-            if (arc_attach_ctx.image_base != 0)
-                device->set_base_address(arc_attach_ctx.image_base);
-        }
-
-        if (!vtable_solved) {
+        {
             diag::log_tagged_critical("driver", "attach_pre_device_solve_dtb_fallback");
             device->solve_dtb();
             diag::log_tagged_critical_fmt("driver", "attach_post_device_solve_dtb_fallback dtb=0x%llX",
                 (unsigned long long)device->get_dtb());
             if (device->get_dtb() == 0) {
-                const ULONGLONG attach_relay_start = GetTickCount64();
-                lk.unlock();
-                const bool attach_relay_ok = standalone_license::force_relay_now_blocking(2000);
-                lk.lock();
-                const uint64_t attach_relay_elapsed_ms = static_cast<uint64_t>(GetTickCount64() - attach_relay_start);
-                device->solve_dtb();
-                const bool attach_second_solve_ok = device->get_dtb() != 0;
                 diag::log_tagged_critical_fmt("driver",
-                    "attach_force_relay_attempt pid=%u relay_signal_set_ms=%llu wait_budget_ms=2000 relay_outcome_ok=%d second_solve_ok=%d second_dtb=0x%llX",
-                    pid,
-                    static_cast<unsigned long long>(attach_relay_elapsed_ms),
-                    attach_relay_ok ? 1 : 0,
-                    attach_second_solve_ok ? 1 : 0,
-                    static_cast<unsigned long long>(device->get_dtb()));
-            }
-            if (device->get_dtb() == 0) {
-                diag::log_tagged_critical_fmt("driver",
-                    "attach_device_solve_dtb_zero connected=%d hb_err=%lu hb_bytes=%lu hb_ioctl=0x%08X hb_magic=0x%08X hb_dioctl=%d",
-                    device->is_connected() ? 1 : 0,
-                    static_cast<unsigned long>(device->get_last_heartbeat_error()),
-                    static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()),
-                    device->get_last_heartbeat_ioctl_code(),
-                    device->get_last_heartbeat_magic(),
-                    device->get_last_heartbeat_dioctl_result() ? 1 : 0);
+                    "attach_device_solve_dtb_zero connected=%d",
+                    device->is_connected() ? 1 : 0);
                 close_process_handle_locked();
                 g_pid = 0;
                 g_pid_snapshot.store(0, std::memory_order_release);
                 g_process_name.clear();
                 g_has_vm_read = false;
                 g_kernel_attached = false;
-                if (!arc_bridge_clear_process_context())
-                    device->clear_process_context();
+                device->clear_process_context();
                 device->set_dtb(0);
                 device->set_kernel_dtb(0);
                 device->set_base_address(0);
@@ -5905,9 +4394,7 @@ namespace driver_bridge
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             if (g_kernel_mode && device && device->is_connected()) {
-                kernel_pid = arc_bridge_find_process(process_name.c_str());
-                if (kernel_pid == 0)
-                    kernel_pid = device->find_process(process_name.c_str());
+                kernel_pid = device->find_process(process_name.c_str());
             }
         }
         if (kernel_pid != 0)
@@ -5946,8 +4433,7 @@ namespace driver_bridge
         g_has_vm_read = false;
         g_kernel_attached = false;
         if (g_kernel_mode && device && device->is_connected()) {
-            if (!arc_bridge_clear_process_context())
-                device->clear_process_context();
+            device->clear_process_context();
         }
         if (prev_pid != 0) {
             auto it = g_processes.find(prev_pid);
@@ -5966,19 +4452,6 @@ namespace driver_bridge
             return false;
         if (pid == static_cast<uint32_t>(GetCurrentProcessId()))
             return false;
-
-        if (self_guard::is_self_or_child_pid(pid)) {
-            self_guard::self_guard_context_t sg_ctx;
-            sg_ctx.tool_name = "driver_attach_additional";
-            sg_ctx.has_pid = true;
-            sg_ctx.target_pid = pid;
-            auto guard_result = self_guard::invoke_self_guard(sg_ctx);
-            if (guard_result != self_guard::self_guard_result_t::allow) {
-                self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
-            }
-            diag::log_tagged_critical_fmt("driver", "attach_additional_REJECTED_self_or_child_pid pid=%u", pid);
-            return false;
-        }
 
         const DWORD caller_tid = GetCurrentThreadId();
         const ULONGLONG attach_additional_entry_tick = GetTickCount64();
@@ -6189,37 +4662,10 @@ namespace driver_bridge
                 if (pre_attempt > 0)
                     Sleep(25);
                 pre_validated_dtb = device->solve_dtb_for_pid(pid);
-                if (pre_validated_dtb == 0) {
-                    arc_bridge_set_process_id(pid);
-                    pre_validated_dtb = arc_bridge_solve_dtb(false);
-                    arc_bridge_set_process_id(device_pid_before);
-                }
             }
 
             const ULONGLONG pre_validate_elapsed = GetTickCount64() - pre_validate_start;
             const DWORD pre_validate_gle = GetLastError();
-
-            if (pre_validated_dtb == 0) {
-                const ULONGLONG force_relay_pre_start = GetTickCount64();
-                lk.unlock();
-                const bool pre_relay_ok = standalone_license::force_relay_now_blocking(2000);
-                lk.lock();
-                const uint64_t pre_relay_elapsed = GetTickCount64() - force_relay_pre_start;
-                diag::log_tagged_critical_fmt("driver",
-                    "refresh_kernel_context_pre_validate_force_relay op=%s pid=%u relay_ok=%d relay_elapsed_ms=%llu",
-                    op_label, pid, pre_relay_ok ? 1 : 0,
-                    static_cast<unsigned long long>(pre_relay_elapsed));
-                for (uint32_t post_relay_attempt = 0; post_relay_attempt < 5 && pre_validated_dtb == 0; ++post_relay_attempt) {
-                    if (post_relay_attempt > 0)
-                        Sleep(25);
-                    pre_validated_dtb = device->solve_dtb_for_pid(pid);
-                    if (pre_validated_dtb == 0) {
-                        arc_bridge_set_process_id(pid);
-                        pre_validated_dtb = arc_bridge_solve_dtb(false);
-                        arc_bridge_set_process_id(device_pid_before);
-                    }
-                }
-            }
 
             diag::log_tagged_critical_fmt("driver",
                 "refresh_kernel_context_pre_validate op=%s pid=%u pre_dtb=0x%llX pre_validate_elapsed_ms=%llu pre_validate_gle=%lu device_pid_before=%u device_pid_preserved=1",
@@ -6247,16 +4693,6 @@ namespace driver_bridge
             device->set_base_address(0);
         }
 
-        const bool arc_set_ok = arc_bridge_set_process_id(pid);
-        diag::log_tagged_fmt("driver",
-            "refresh_kernel_context_arc_set_pid op=%s pid=%u arc_set_ok=%d device_pid_before=%u shellcode_before=0x%llX shellcode_pid_before=%u shellcode_dtb_before=0x%llX",
-            op_label,
-            pid,
-            arc_set_ok ? 1 : 0,
-            device_pid_before,
-            static_cast<unsigned long long>(device->get_shellcode_address_diag()),
-            device->get_shellcode_pid_diag(),
-            static_cast<unsigned long long>(device->get_shellcode_dtb_at_alloc_diag()));
         device->set_process_id(pid);
         diag::log_tagged_fmt("driver",
             "refresh_kernel_context_device_set_pid op=%s pid=%u device_pid_after=%u shellcode_after=0x%llX shellcode_pid_after=%u shellcode_dtb_after=0x%llX",
@@ -6267,59 +4703,23 @@ namespace driver_bridge
             device->get_shellcode_pid_diag(),
             static_cast<unsigned long long>(device->get_shellcode_dtb_at_alloc_diag()));
 
-        const ULONGLONG arc_dtb_start = GetTickCount64();
-        uint64_t arc_dtb = arc_bridge_solve_dtb(false);
-        diag::log_tagged_critical_fmt("driver",
-            "refresh_kernel_context_step op=%s pid=%u step_name=arc_bridge_solve_dtb elapsed_ms=%llu inflight_at_step=%u caller_tid=%lu",
-            op_label,
-            pid,
-            static_cast<unsigned long long>(GetTickCount64() - arc_dtb_start),
-            g_remote_call_lower_inflight.load(std::memory_order_acquire),
-            static_cast<unsigned long>(caller_tid));
-
         const ULONGLONG solve_dtb_start = GetTickCount64();
         device->solve_dtb();
         uint32_t solve_dtb_retries = 0;
-        for (uint32_t solve_attempt = 0; solve_attempt < 10 && device->get_dtb() == 0 && arc_dtb == 0; ++solve_attempt) {
+        for (uint32_t solve_attempt = 0; solve_attempt < 10 && device->get_dtb() == 0; ++solve_attempt) {
             Sleep(25);
-            arc_dtb = arc_bridge_solve_dtb(false);
             device->solve_dtb();
             ++solve_dtb_retries;
         }
         diag::log_tagged_critical_fmt("driver",
-            "refresh_kernel_context_step op=%s pid=%u step_name=device_solve_dtb elapsed_ms=%llu inflight_at_step=%u retries=%u dtb_after=0x%llX arc_dtb_after=0x%llX caller_tid=%lu",
+            "refresh_kernel_context_step op=%s pid=%u step_name=device_solve_dtb elapsed_ms=%llu inflight_at_step=%u retries=%u dtb_after=0x%llX caller_tid=%lu",
             op_label,
             pid,
             static_cast<unsigned long long>(GetTickCount64() - solve_dtb_start),
             g_remote_call_lower_inflight.load(std::memory_order_acquire),
             solve_dtb_retries,
             static_cast<unsigned long long>(device->get_dtb()),
-            static_cast<unsigned long long>(arc_dtb),
             static_cast<unsigned long>(caller_tid));
-        if (device->get_dtb() == 0 && arc_dtb == 0) {
-            const ULONGLONG refresh_relay_start = GetTickCount64();
-            lk.unlock();
-            const bool refresh_relay_ok = standalone_license::force_relay_now_blocking(2000);
-            lk.lock();
-            const uint64_t refresh_relay_elapsed_ms = static_cast<uint64_t>(GetTickCount64() - refresh_relay_start);
-            const ULONGLONG second_solve_start = GetTickCount64();
-            device->solve_dtb();
-            const uint64_t second_solve_elapsed_ms = static_cast<uint64_t>(GetTickCount64() - second_solve_start);
-            const uint64_t second_dtb = device->get_dtb();
-            const bool second_solve_ok = second_dtb != 0;
-            diag::log_tagged_critical_fmt("driver",
-                "refresh_kernel_context_force_relay_attempt op=%s pid=%u relay_signal_set_ms=%llu wait_budget_ms=2000 relay_outcome_ok=%d second_solve_ok=%d second_solve_elapsed_ms=%llu second_dtb=0x%llX caller_tid=%lu",
-                op_label,
-                pid,
-                static_cast<unsigned long long>(refresh_relay_elapsed_ms),
-                refresh_relay_ok ? 1 : 0,
-                second_solve_ok ? 1 : 0,
-                static_cast<unsigned long long>(second_solve_elapsed_ms),
-                static_cast<unsigned long long>(second_dtb),
-                static_cast<unsigned long>(caller_tid));
-        }
-        if (device->get_dtb() == 0 && arc_dtb != 0)
-            device->set_dtb(arc_dtb);
         if (device->get_dtb() == 0 && ctx.cached_dtb != 0)
             device->set_dtb(ctx.cached_dtb);
         if (device->get_dtb() == 0) {
@@ -6329,7 +4729,6 @@ namespace driver_bridge
                     "refresh_kernel_context_rollback op=%s pid=%u device_pid_before=%u reason=post_switch_dtb_zero rolling_back_to_previous_pid",
                     op_label, pid, device_pid_before);
                 device->set_process_id(device_pid_before);
-                arc_bridge_set_process_id(device_pid_before);
                 auto prev_it = g_processes.find(device_pid_before);
                 if (prev_it != g_processes.end()) {
                     if (prev_it->second.cached_dtb != 0) {
@@ -6344,14 +4743,12 @@ namespace driver_bridge
                 }
             } else {
                 device->set_process_id(0);
-                arc_bridge_set_process_id(0);
             }
             diag::log_tagged_fmt("driver",
-                "refresh_kernel_context_post op=%s pid=%u dtb_before=0x%llX dtb_after=0x0 kernel_dtb_after=0x0 base_after=0x0 kernel_attached=0 arc_dtb=0x%llX cached_dtb=0x%llX inflight_after=%u caller_tid=%lu rolled_back_pid=%u",
+                "refresh_kernel_context_post op=%s pid=%u dtb_before=0x%llX dtb_after=0x0 kernel_dtb_after=0x0 base_after=0x0 kernel_attached=0 cached_dtb=0x%llX inflight_after=%u caller_tid=%lu rolled_back_pid=%u",
                 op_label,
                 pid,
                 static_cast<unsigned long long>(dtb_before),
-                static_cast<unsigned long long>(arc_dtb),
                 static_cast<unsigned long long>(ctx.cached_dtb),
                 g_remote_call_lower_inflight.load(std::memory_order_acquire),
                 static_cast<unsigned long>(caller_tid),
@@ -6363,23 +4760,18 @@ namespace driver_bridge
         ctx.cached_dtb = device->get_dtb();
 
         if (ctx.cached_image_base == 0) {
-            uint64_t image_base = arc_bridge_find_image();
-            if (image_base == 0) {
-                const ULONGLONG find_image_start = GetTickCount64();
-                image_base = device->find_image();
-                diag::log_tagged_critical_fmt("driver",
-                    "refresh_kernel_context_step op=%s pid=%u step_name=device_find_image elapsed_ms=%llu inflight_at_step=%u caller_tid=%lu",
-                    op_label,
-                    pid,
-                    static_cast<unsigned long long>(GetTickCount64() - find_image_start),
-                    g_remote_call_lower_inflight.load(std::memory_order_acquire),
-                    static_cast<unsigned long>(caller_tid));
-            }
-            ctx.cached_image_base = image_base;
+            const ULONGLONG find_image_start = GetTickCount64();
+            ctx.cached_image_base = device->find_image();
+            diag::log_tagged_critical_fmt("driver",
+                "refresh_kernel_context_step op=%s pid=%u step_name=device_find_image elapsed_ms=%llu inflight_at_step=%u caller_tid=%lu",
+                op_label,
+                pid,
+                static_cast<unsigned long long>(GetTickCount64() - find_image_start),
+                g_remote_call_lower_inflight.load(std::memory_order_acquire),
+                static_cast<unsigned long>(caller_tid));
         }
         if (ctx.cached_image_base != 0) {
             device->set_base_address(ctx.cached_image_base);
-            arc_bridge_set_base_address(ctx.cached_image_base);
         }
 
         if (ctx.cached_kernel_dtb != 0) {
@@ -6397,14 +4789,13 @@ namespace driver_bridge
             ctx.cached_kernel_dtb = device->get_kernel_dtb();
         }
         diag::log_tagged_fmt("driver",
-            "refresh_kernel_context_post op=%s pid=%u dtb_before=0x%llX dtb_after=0x%llX kernel_dtb_after=0x%llX base_after=0x%llX kernel_attached=1 arc_dtb=0x%llX cached_dtb=0x%llX cached_kernel_dtb=0x%llX cached_image_base=0x%llX inflight_after=%u caller_tid=%lu",
+            "refresh_kernel_context_post op=%s pid=%u dtb_before=0x%llX dtb_after=0x%llX kernel_dtb_after=0x%llX base_after=0x%llX kernel_attached=1 cached_dtb=0x%llX cached_kernel_dtb=0x%llX cached_image_base=0x%llX inflight_after=%u caller_tid=%lu",
             op_label,
             pid,
             static_cast<unsigned long long>(dtb_before),
             static_cast<unsigned long long>(device->get_dtb()),
             static_cast<unsigned long long>(device->get_kernel_dtb()),
             static_cast<unsigned long long>(device->get_base_address()),
-            static_cast<unsigned long long>(arc_dtb),
             static_cast<unsigned long long>(ctx.cached_dtb),
             static_cast<unsigned long long>(ctx.cached_kernel_dtb),
             static_cast<unsigned long long>(ctx.cached_image_base),
@@ -6618,7 +5009,6 @@ namespace driver_bridge
                     const uint64_t device_dtb_before = device->get_dtb();
                     const uint64_t device_shellcode_before = device->get_shellcode_address_diag();
 
-                    arc_bridge_set_process_id(restore_pid);
                     device->set_process_id(restore_pid);
                     device->set_dtb(saved_dtb);
                     device->set_kernel_dtb(saved_kernel_dtb);
@@ -6653,8 +5043,7 @@ namespace driver_bridge
                     g_has_vm_read = false;
                     g_kernel_attached = false;
                     if (kernel_ready) {
-                        if (!arc_bridge_clear_process_context())
-                            device->clear_process_context();
+                        device->clear_process_context();
                     }
                     diag::log_tagged_fmt("driver",
                         "detach_one_secondary_fallback_clear pid=%u primary_pid=%u primary_available=%d kernel_ready=%d",
@@ -6669,8 +5058,7 @@ namespace driver_bridge
                 g_has_vm_read = false;
                 g_kernel_attached = false;
                 if (g_kernel_mode && device && device->is_connected()) {
-                    if (!arc_bridge_clear_process_context())
-                        device->clear_process_context();
+                    device->clear_process_context();
                 }
             }
         } else {
@@ -6712,8 +5100,7 @@ namespace driver_bridge
         g_has_vm_read = false;
         g_kernel_attached = false;
         if (g_kernel_mode && device && device->is_connected()) {
-            if (!arc_bridge_clear_process_context())
-                device->clear_process_context();
+            device->clear_process_context();
         }
         clear_last_error_locked_after_success("clear_active_pid");
         diag::log_tagged_fmt("driver", "clear_active_pid_done active_generation=%llu", static_cast<unsigned long long>(active_generation));
@@ -7108,40 +5495,16 @@ namespace driver_bridge
         }
 
         {
-            struct enum_ctx { std::vector<thread_info_t>* out; uint32_t pid; };
-            enum_ctx ctx{&result, pid};
-            uint32_t arc_count = 0;
-            const bool arc_ok = arc_bridge_enumerate_threads(
-                [](const arc_comm_vtable_t::thread_info_t* info, void* user) {
-                    auto* c = static_cast<enum_ctx*>(user);
-                    thread_info_t t;
-                    t.tid = info->tid;
-                    t.owner_pid = c->pid;
-                    t.priority = 0;
-                    t.state = info->state;
-                    t.rip = info->rip;
-                    c->out->push_back(t);
-                },
-                &ctx,
-                &arc_count);
-            if (arc_ok) {
-                diag::log_tagged_fmt("driver",
-                    "enumerate_threads_arc_bridge pid=%u count=%u result=%zu",
-                    pid,
-                    arc_count,
-                    result.size());
-            } else {
-                auto kernel_threads = device->enumerate_threads();
-                result.reserve(kernel_threads.size());
-                for (const auto& kt : kernel_threads) {
-                    thread_info_t t;
-                    t.tid = kt.tid;
-                    t.owner_pid = pid;
-                    t.priority = 0;
-                    t.state = kt.state;
-                    t.rip = kt.rip;
-                    result.push_back(t);
-                }
+            auto kernel_threads = device->enumerate_threads();
+            result.reserve(kernel_threads.size());
+            for (const auto& kt : kernel_threads) {
+                thread_info_t t;
+                t.tid = kt.tid;
+                t.owner_pid = pid;
+                t.priority = 0;
+                t.state = kt.state;
+                t.rip = kt.rip;
+                result.push_back(t);
             }
         }
 
@@ -7187,102 +5550,35 @@ namespace driver_bridge
 
         if (kernel_mode) {
             {
-                struct enum_ctx { std::vector<memory_region_t>* out; size_t max; };
-                uint32_t arc_count = 0;
-                uint32_t retry_count = 0;
-                bool arc_ok = false;
-                auto run_arc_enum = [&](const char* phase) {
-                    result.clear();
-                    arc_count = 0;
-                    enum_ctx ctx{&result, max_regions};
-                    const bool ok = arc_bridge_enumerate_memory_regions(
-                        [](const arc_comm_vtable_t::memory_region_info_t* info, void* user) {
-                            auto* c = static_cast<enum_ctx*>(user);
-                            if (c->out->size() >= c->max) return;
-                            memory_region_t region;
-                            region.base    = info->base;
-                            region.size    = info->size;
-                            region.state   = info->state;
-                            region.protect = info->protect;
-                            region.type    = info->type;
-                            c->out->push_back(region);
-                        },
-                        &ctx,
-                        &arc_count);
-                    diag::log_tagged_fmt("driver",
-                        "enumerate_memory_regions_arc_bridge phase=%s pid=%u max=%zu arc_ok=%d arc_count=%u result=%zu kernel_attached=%d dtb=0x%llX",
-                        phase,
-                        pid,
-                        max_regions,
-                        ok ? 1 : 0,
-                        arc_count,
-                        result.size(),
-                        kernel_attached ? 1 : 0,
-                        static_cast<unsigned long long>((device && device->is_connected()) ? device->get_dtb() : 0));
-                    return ok;
-                };
-                auto run_direct_enum = [&](const char* reason, DWORD& gle_out, size_t& raw_count_out) {
-                    result.clear();
-                    raw_count_out = 0;
-                    gle_out = ERROR_SUCCESS;
-                    if (!device) {
-                        gle_out = ERROR_DEVICE_NOT_CONNECTED;
-                        SetLastError(gle_out);
-                        return;
-                    }
-                    SetLastError(ERROR_SUCCESS);
-                    const auto regions = device->enumerate_memory_regions(0, 0, false);
-                    gle_out = GetLastError();
-                    raw_count_out = regions.size();
-                    for (const auto& src : regions) {
-                        memory_region_t region;
-                        region.base = src.base;
-                        region.size = src.size;
-                        region.state = src.state;
-                        region.protect = src.protect;
-                        region.type = src.type;
-                        result.push_back(region);
-                        if (result.size() >= max_regions)
-                            break;
-                    }
-                    diag::log_tagged_fmt("driver",
-                        "enumerate_memory_regions_direct reason=%s pid=%u max=%zu raw_count=%zu copied=%zu gle=%lu kernel_attached=%d dtb=0x%llX",
-                        reason,
-                        pid,
-                        max_regions,
-                        raw_count_out,
-                        result.size(),
-                        static_cast<unsigned long>(gle_out),
-                        kernel_attached ? 1 : 0,
-                        static_cast<unsigned long long>((device && device->is_connected()) ? device->get_dtb() : 0));
-                };
-                arc_ok = run_arc_enum("initial");
-                while (arc_ok && result.empty() && pid != 0 && max_regions != 0 && retry_count < 2) {
-                    ++retry_count;
-                    Sleep(35);
-                    char phase[32];
-                    std::snprintf(phase, sizeof(phase), "retry%u", retry_count);
-                    arc_ok = run_arc_enum(phase);
+                DWORD direct_gle = ERROR_SUCCESS;
+                size_t raw_count = 0;
+                if (!device) {
+                    return result;
                 }
-                DWORD fallback_gle = ERROR_SUCCESS;
-                size_t fallback_raw_count = 0;
-                bool used_fallback = false;
-                if (!arc_ok || (pid != 0 && max_regions != 0 && result.empty())) {
-                    used_fallback = true;
-                    run_direct_enum(arc_ok ? "arc_zero_regions" : "arc_failed", fallback_gle, fallback_raw_count);
+                SetLastError(ERROR_SUCCESS);
+                const auto regions = device->enumerate_memory_regions(0, 0, false);
+                direct_gle = GetLastError();
+                raw_count = regions.size();
+                for (const auto& src : regions) {
+                    memory_region_t region;
+                    region.base = src.base;
+                    region.size = src.size;
+                    region.state = src.state;
+                    region.protect = src.protect;
+                    region.type = src.type;
+                    result.push_back(region);
+                    if (result.size() >= max_regions)
+                        break;
                 }
                 diag::log_tagged_fmt("driver",
-                    "enumerate_memory_regions_summary pid=%u max=%zu arc_ok=%d arc_count=%u retries=%u used_fallback=%d fallback_raw_count=%zu fallback_result=%zu fallback_gle=%lu final_count=%zu",
+                    "enumerate_memory_regions_direct pid=%u max=%zu raw_count=%zu copied=%zu gle=%lu kernel_attached=%d dtb=0x%llX",
                     pid,
                     max_regions,
-                    arc_ok ? 1 : 0,
-                    arc_count,
-                    retry_count,
-                    used_fallback ? 1 : 0,
-                    fallback_raw_count,
-                    used_fallback ? result.size() : 0,
-                    static_cast<unsigned long>(fallback_gle),
-                    result.size());
+                    raw_count,
+                    result.size(),
+                    static_cast<unsigned long>(direct_gle),
+                    kernel_attached ? 1 : 0,
+                    static_cast<unsigned long long>((device && device->is_connected()) ? device->get_dtb() : 0));
             }
             return result;
         }
@@ -7319,25 +5615,15 @@ namespace driver_bridge
         }
 
         if (kernel_mode) {
-            arc_comm_vtable_t::memory_region_info_t arc_info{};
-            if (arc_bridge_query_memory(address, &arc_info)) {
-                region.base    = arc_info.base;
-                region.size    = arc_info.size;
-                region.state   = arc_info.state;
-                region.protect = arc_info.protect;
-                region.type    = arc_info.type;
-                return true;
-            } else {
-                voyager::device_t::memory_region_info info = {};
-                if (!device->query_memory(address, info))
-                    return false;
-                region.base = info.base;
-                region.size = info.size;
-                region.state = info.state;
-                region.protect = info.protect;
-                region.type = info.type;
-                return true;
-            }
+            voyager::device_t::memory_region_info info = {};
+            if (!device->query_memory(address, info))
+                return false;
+            region.base = info.base;
+            region.size = info.size;
+            region.state = info.state;
+            region.protect = info.protect;
+            region.type = info.type;
+            return true;
         }
 
         if (process) {
@@ -7358,22 +5644,6 @@ namespace driver_bridge
 
     bool read_memory(uint64_t address, size_t size, std::vector<uint8_t>& out)
     {
-
-        {
-            uint64_t tok = anti_tamper::run_inline_check(anti_tamper::CHECK_CODE_INTEGRITY);
-            standalone_license::fold_integrity_token(tok);
-        }
-
-        {
-            uint64_t gt = standalone_license::inline_gate_check(
-                standalone_license::gate_driver_read_mem);
-            if (standalone_license::verify_gate_token(
-                    standalone_license::gate_driver_read_mem, gt) < 0.5) {
-                out.clear();
-                return false;
-            }
-        }
-
         out.clear();
         bool kernel_mode = false;
         bool kernel_attached = false;
@@ -7419,12 +5689,9 @@ namespace driver_bridge
 
         out.resize(size);
         size_t bytes_read = 0;
-        bool arc_read_invoked = false;
-        const size_t arc_bytes = arc_bridge_read_raw(address, out.data(), size, &arc_read_invoked);
-        bytes_read = arc_bytes;
         size_t direct_bytes = 0;
 
-        if (bytes_read == 0 && device && device->get_dtb() != 0) {
+        if (device && device->get_dtb() != 0) {
             direct_bytes = device->read_raw(address, out.data(), size);
             bytes_read = direct_bytes;
         }
@@ -7433,10 +5700,9 @@ namespace driver_bridge
             static int s_read_log_count = 0;
             if (s_read_log_count < 50) {
                 s_read_log_count++;
-                logf("read_memory: addr=0x%llX sz=%llu kernel=%d vtable=%d dtb=0x%llX bytes=%llu\n",
+                logf("read_memory: addr=0x%llX sz=%llu kernel=%d dtb=0x%llX bytes=%llu\n",
                     (unsigned long long)address, (unsigned long long)size,
                     kernel_mode ? 1 : 0,
-                    arc_read_invoked ? 1 : 0,
                     device ? (unsigned long long)device->get_dtb() : 0ULL,
                     (unsigned long long)bytes_read);
             }
@@ -7444,7 +5710,6 @@ namespace driver_bridge
 
         if (bytes_read == 0) {
             bool re_resolved = false;
-            bool refresh_attempted = true;
             uint64_t dtb_before_refresh = device ? device->get_dtb() : 0;
             uint64_t dtb_after_refresh = 0;
             {
@@ -7454,79 +5719,43 @@ namespace driver_bridge
                     re_resolved = (device->get_dtb() != 0);
                     dtb_after_refresh = device->get_dtb();
                 }
-                if (!re_resolved) {
-                    uint64_t new_dtb = arc_bridge_solve_dtb(true);
-                    re_resolved = (new_dtb != 0);
-                    dtb_after_refresh = new_dtb;
-                }
             }
 
-            size_t retry_arc_bytes = 0;
             size_t retry_direct_bytes = 0;
             if (re_resolved) {
                 std::memset(out.data(), 0, size);
-                retry_arc_bytes = arc_bridge_read_raw(address, out.data(), size);
-                bytes_read = retry_arc_bytes;
-                if (bytes_read == 0 && device) {
+                if (device) {
                     retry_direct_bytes = device->read_raw(address, out.data(), size);
                     bytes_read = retry_direct_bytes;
                 }
             }
             const DWORD retry_gle = GetLastError();
             diag::log_tagged_fmt("driver",
-                "read_memory_kernel_retry pid=%u tid=%lu addr=0x%llX size=%llu refresh_attempted=%d re_resolved=%d dtb_before=0x%llX dtb_after=0x%llX arc_first=%llu direct_first=%llu retry_arc=%llu retry_direct=%llu final_bytes=%llu gle=%lu",
+                "read_memory_kernel_retry pid=%u tid=%lu addr=0x%llX size=%llu re_resolved=%d dtb_before=0x%llX dtb_after=0x%llX direct_first=%llu retry_direct=%llu final_bytes=%llu gle=%lu",
                 diag_pid,
                 static_cast<unsigned long>(diag_tid),
                 static_cast<unsigned long long>(address),
                 static_cast<unsigned long long>(size),
-                refresh_attempted ? 1 : 0,
                 re_resolved ? 1 : 0,
                 static_cast<unsigned long long>(dtb_before_refresh),
                 static_cast<unsigned long long>(dtb_after_refresh),
-                static_cast<unsigned long long>(arc_bytes),
                 static_cast<unsigned long long>(direct_bytes),
-                static_cast<unsigned long long>(retry_arc_bytes),
                 static_cast<unsigned long long>(retry_direct_bytes),
                 static_cast<unsigned long long>(bytes_read),
                 static_cast<unsigned long>(retry_gle));
-            if (bytes_read == 0 && retry_gle == ERROR_INVALID_FUNCTION) {
-                const unsigned prev = g_consecutive_invalid_function.fetch_add(1, std::memory_order_acq_rel);
-                const unsigned now_count = prev + 1u;
-                diag::log_tagged_fmt("driver",
-                    "read_memory_kernel_consecutive_invalid_function count=%u threshold=%u path=read_memory addr=0x%llX size=%llu pid=%u tid=%lu",
-                    now_count,
-                    kInvalidFunctionInvalidateThreshold,
-                    static_cast<unsigned long long>(address),
-                    static_cast<unsigned long long>(size),
-                    diag_pid,
-                    static_cast<unsigned long>(diag_tid));
-                if (now_count == kInvalidFunctionInvalidateThreshold) {
-                    diag::log_tagged_critical_fmt("driver",
-                        "operational_ioctl_invalidate_trigger consecutive=%u path=read_memory addr=0x%llX size=%llu pid=%u tid=%lu",
-                        now_count,
-                        static_cast<unsigned long long>(address),
-                        static_cast<unsigned long long>(size),
-                        diag_pid,
-                        static_cast<unsigned long>(diag_tid));
-                    invalidate_kernel_session("operational_ioctl_invalid_function");
-                }
-            }
             SetLastError(retry_gle);
         }
 
         if (bytes_read > 0) {
-            g_consecutive_invalid_function.store(0, std::memory_order_release);
             out.resize(bytes_read);
             const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
             diag::log_tagged_fmt("driver",
-                "read_memory_kernel_done pid=%u tid=%lu addr=0x%llX size=%llu ok=1 bytes=%llu arc_invoked=%d arc_bytes=%llu direct_bytes=%llu dtb_entry=0x%llX dtb_exit=0x%llX all_zero=%d first16=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+                "read_memory_kernel_done pid=%u tid=%lu addr=0x%llX size=%llu ok=1 bytes=%llu direct_bytes=%llu dtb_entry=0x%llX dtb_exit=0x%llX all_zero=%d first16=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
                 diag_pid,
                 static_cast<unsigned long>(diag_tid),
                 static_cast<unsigned long long>(address),
                 static_cast<unsigned long long>(size),
                 static_cast<unsigned long long>(bytes_read),
-                arc_read_invoked ? 1 : 0,
-                static_cast<unsigned long long>(arc_bytes),
                 static_cast<unsigned long long>(direct_bytes),
                 static_cast<unsigned long long>(dtb_entry),
                 static_cast<unsigned long long>(device ? device->get_dtb() : 0),
@@ -7547,15 +5776,13 @@ namespace driver_bridge
         const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
         const DWORD observed_gle_after_snapshot = GetLastError();
         diag::log_tagged_fmt("driver",
-            "read_memory_kernel_failed pid=%u tid=%lu addr=0x%llX sz=%llu dtb_entry=0x%llX dtb_exit=0x%llX arc_invoked=%d arc_bytes=%llu direct_bytes=%llu gle=%lu observed_gle_after_snapshot=%lu driver_last_error=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX consecutive_invalid_function=%u",
+            "read_memory_kernel_failed pid=%u tid=%lu addr=0x%llX sz=%llu dtb_entry=0x%llX dtb_exit=0x%llX direct_bytes=%llu gle=%lu observed_gle_after_snapshot=%lu driver_last_error=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
             diag_pid,
             static_cast<unsigned long>(diag_tid),
             static_cast<unsigned long long>(address),
             static_cast<unsigned long long>(size),
             static_cast<unsigned long long>(dtb_entry),
             static_cast<unsigned long long>(device ? device->get_dtb() : 0),
-            arc_read_invoked ? 1 : 0,
-            static_cast<unsigned long long>(arc_bytes),
             static_cast<unsigned long long>(direct_bytes),
             static_cast<unsigned long>(final_gle),
             static_cast<unsigned long>(observed_gle_after_snapshot),
@@ -7565,23 +5792,13 @@ namespace driver_bridge
             static_cast<unsigned long>(region_before.state),
             static_cast<unsigned long>(region_before.protect),
             static_cast<unsigned long>(region_after.state),
-            static_cast<unsigned long>(region_after.protect),
-            g_consecutive_invalid_function.load(std::memory_order_acquire));
+            static_cast<unsigned long>(region_after.protect));
         SetLastError(final_gle);
         return false;
     }
 
     bool write_memory(uint64_t address, const std::vector<uint8_t>& data)
     {
-        {
-            uint64_t gt = standalone_license::inline_gate_check(
-                standalone_license::gate_driver_read_mem);
-            if (standalone_license::verify_gate_token(
-                    standalone_license::gate_driver_read_mem, gt) < 0.5) {
-                return false;
-            }
-        }
-
         if (data.empty())
             return false;
 
@@ -7636,24 +5853,20 @@ namespace driver_bridge
             return n;
         };
 
-        const size_t arc_written = arc_bridge_write_raw(address, data.data(), data.size());
-        size_t bytes_written = arc_written;
+        size_t bytes_written = 0;
         size_t direct_written = 0;
-        size_t retry_arc_written = 0;
         size_t retry_direct_written = 0;
-        bool refresh_attempted = false;
         bool re_resolved = false;
         uint64_t dtb_before_refresh = dtb_entry;
         uint64_t dtb_after_refresh = dtb_entry;
 
-        if (bytes_written != data.size() && device && device->get_dtb() != 0) {
+        if (device && device->get_dtb() != 0) {
             direct_written = device->write_raw(address, data.data(), data.size());
             if (direct_written > bytes_written)
                 bytes_written = direct_written;
         }
 
         if (bytes_written != data.size()) {
-            refresh_attempted = true;
             dtb_before_refresh = device ? device->get_dtb() : 0;
             {
                 std::lock_guard<std::mutex> lk(g_state_mtx);
@@ -7662,36 +5875,23 @@ namespace driver_bridge
                     re_resolved = (device->get_dtb() != 0);
                     dtb_after_refresh = device->get_dtb();
                 }
-                if (!re_resolved) {
-                    uint64_t new_dtb = arc_bridge_solve_dtb(true);
-                    re_resolved = (new_dtb != 0);
-                    dtb_after_refresh = new_dtb;
-                }
             }
 
-            if (re_resolved) {
-                retry_arc_written = arc_bridge_write_raw(address, data.data(), data.size());
-                if (retry_arc_written > bytes_written)
-                    bytes_written = retry_arc_written;
-                if (bytes_written != data.size() && device) {
-                    retry_direct_written = device->write_raw(address, data.data(), data.size());
-                    if (retry_direct_written > bytes_written)
-                        bytes_written = retry_direct_written;
-                }
+            if (re_resolved && device) {
+                retry_direct_written = device->write_raw(address, data.data(), data.size());
+                if (retry_direct_written > bytes_written)
+                    bytes_written = retry_direct_written;
             }
             diag::log_tagged_fmt("driver",
-                "write_memory_kernel_retry pid=%u tid=%lu addr=0x%llX size=%llu refresh_attempted=%d re_resolved=%d dtb_before=0x%llX dtb_after=0x%llX arc_first=%llu direct_first=%llu retry_arc=%llu retry_direct=%llu final_bytes=%llu gle=%lu",
+                "write_memory_kernel_retry pid=%u tid=%lu addr=0x%llX size=%llu re_resolved=%d dtb_before=0x%llX dtb_after=0x%llX direct_first=%llu retry_direct=%llu final_bytes=%llu gle=%lu",
                 diag_pid,
                 static_cast<unsigned long>(diag_tid),
                 static_cast<unsigned long long>(address),
                 static_cast<unsigned long long>(data.size()),
-                refresh_attempted ? 1 : 0,
                 re_resolved ? 1 : 0,
                 static_cast<unsigned long long>(dtb_before_refresh),
                 static_cast<unsigned long long>(dtb_after_refresh),
-                static_cast<unsigned long long>(arc_written),
                 static_cast<unsigned long long>(direct_written),
-                static_cast<unsigned long long>(retry_arc_written),
                 static_cast<unsigned long long>(retry_direct_written),
                 static_cast<unsigned long long>(bytes_written),
                 static_cast<unsigned long>(GetLastError()));
@@ -7701,14 +5901,12 @@ namespace driver_bridge
             if (data.size() > kVerifyLimit) {
                 const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
                 diag::log_tagged_fmt("driver",
-                    "write_memory_kernel_done pid=%u tid=%lu addr=0x%llX size=%llu ok=1 verify_skipped=1 reason=size_limit arc_bytes=%llu direct_bytes=%llu retry_arc=%llu retry_direct=%llu dtb_entry=0x%llX dtb_exit=0x%llX region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+                    "write_memory_kernel_done pid=%u tid=%lu addr=0x%llX size=%llu ok=1 verify_skipped=1 reason=size_limit direct_bytes=%llu retry_direct=%llu dtb_entry=0x%llX dtb_exit=0x%llX region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
                     diag_pid,
                     static_cast<unsigned long>(diag_tid),
                     static_cast<unsigned long long>(address),
                     static_cast<unsigned long long>(data.size()),
-                    static_cast<unsigned long long>(arc_written),
                     static_cast<unsigned long long>(direct_written),
-                    static_cast<unsigned long long>(retry_arc_written),
                     static_cast<unsigned long long>(retry_direct_written),
                     static_cast<unsigned long long>(dtb_entry),
                     static_cast<unsigned long long>(device ? device->get_dtb() : 0),
@@ -7729,15 +5927,13 @@ namespace driver_bridge
             if (bridge_match) {
                 const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
                 diag::log_tagged_fmt("driver",
-                    "write_memory_kernel_done pid=%u tid=%lu addr=0x%llX size=%llu ok=1 verify_skipped=0 bridge_read=1 bridge_bytes=%llu arc_bytes=%llu direct_bytes=%llu retry_arc=%llu retry_direct=%llu dtb_entry=0x%llX dtb_exit=0x%llX expected_first16=%s actual_first16=%s all_zero_readback=0 region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+                    "write_memory_kernel_done pid=%u tid=%lu addr=0x%llX size=%llu ok=1 verify_skipped=0 bridge_read=1 bridge_bytes=%llu direct_bytes=%llu retry_direct=%llu dtb_entry=0x%llX dtb_exit=0x%llX expected_first16=%s actual_first16=%s all_zero_readback=0 region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
                     diag_pid,
                     static_cast<unsigned long>(diag_tid),
                     static_cast<unsigned long long>(address),
                     static_cast<unsigned long long>(data.size()),
                     static_cast<unsigned long long>(bridge_verify.size()),
-                    static_cast<unsigned long long>(arc_written),
                     static_cast<unsigned long long>(direct_written),
-                    static_cast<unsigned long long>(retry_arc_written),
                     static_cast<unsigned long long>(retry_direct_written),
                     static_cast<unsigned long long>(dtb_entry),
                     static_cast<unsigned long long>(device ? device->get_dtb() : 0),
@@ -7757,7 +5953,7 @@ namespace driver_bridge
             const uint8_t actual = mismatch < bridge_verify.size() ? bridge_verify[mismatch] : 0;
             const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
             diag::log_tagged_fmt("driver",
-                "write_memory kernel verify_mismatch pid=%u tid=%lu addr=0x%llX sz=%llu bridge_read=%d bridge_bytes=%llu mismatch=%llu expected=0x%02X actual=0x%02X expected_first16=%s actual_first16=%s all_zero_readback=%d arc_bytes=%llu direct_bytes=%llu retry_arc=%llu retry_direct=%llu dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+                "write_memory kernel verify_mismatch pid=%u tid=%lu addr=0x%llX sz=%llu bridge_read=%d bridge_bytes=%llu mismatch=%llu expected=0x%02X actual=0x%02X expected_first16=%s actual_first16=%s all_zero_readback=%d direct_bytes=%llu retry_direct=%llu dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
                 diag_pid,
                 static_cast<unsigned long>(diag_tid),
                 static_cast<unsigned long long>(address),
@@ -7770,9 +5966,7 @@ namespace driver_bridge
                 format_byte_prefix(data.data(), data.size()).c_str(),
                 format_byte_prefix(bridge_verify.data(), bridge_verify.size()).c_str(),
                 bytes_all_zero(bridge_verify.data(), bridge_verify.size()) ? 1 : 0,
-                static_cast<unsigned long long>(arc_written),
                 static_cast<unsigned long long>(direct_written),
-                static_cast<unsigned long long>(retry_arc_written),
                 static_cast<unsigned long long>(retry_direct_written),
                 static_cast<unsigned long long>(dtb_entry),
                 static_cast<unsigned long long>(device ? device->get_dtb() : 0),
@@ -7790,15 +5984,13 @@ namespace driver_bridge
         const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
         if (bytes_written > 0) {
             diag::log_tagged_fmt("driver",
-                "write_memory kernel partial pid=%u tid=%lu addr=0x%llX sz=%llu bytes=%llu arc_bytes=%llu direct_bytes=%llu retry_arc=%llu retry_direct=%llu dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+                "write_memory kernel partial pid=%u tid=%lu addr=0x%llX sz=%llu bytes=%llu direct_bytes=%llu retry_direct=%llu dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
                 diag_pid,
                 static_cast<unsigned long>(diag_tid),
                 static_cast<unsigned long long>(address),
                 static_cast<unsigned long long>(data.size()),
                 static_cast<unsigned long long>(bytes_written),
-                static_cast<unsigned long long>(arc_written),
                 static_cast<unsigned long long>(direct_written),
-                static_cast<unsigned long long>(retry_arc_written),
                 static_cast<unsigned long long>(retry_direct_written),
                 static_cast<unsigned long long>(dtb_entry),
                 static_cast<unsigned long long>(device ? device->get_dtb() : 0),
@@ -7812,18 +6004,15 @@ namespace driver_bridge
                 static_cast<unsigned long>(region_after.protect));
         } else {
             diag::log_tagged_fmt("driver",
-                "write_memory kernel failed pid=%u tid=%lu addr=0x%llX sz=%llu dtb_entry=0x%llX dtb_exit=0x%llX arc_bytes=%llu direct_bytes=%llu retry_arc=%llu retry_direct=%llu refresh_attempted=%d re_resolved=%d gle=%lu driver_last_error=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+                "write_memory kernel failed pid=%u tid=%lu addr=0x%llX sz=%llu dtb_entry=0x%llX dtb_exit=0x%llX direct_bytes=%llu retry_direct=%llu re_resolved=%d gle=%lu driver_last_error=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
                 diag_pid,
                 static_cast<unsigned long>(diag_tid),
                 static_cast<unsigned long long>(address),
                 static_cast<unsigned long long>(data.size()),
                 static_cast<unsigned long long>(dtb_entry),
                 static_cast<unsigned long long>(device ? device->get_dtb() : 0),
-                static_cast<unsigned long long>(arc_written),
                 static_cast<unsigned long long>(direct_written),
-                static_cast<unsigned long long>(retry_arc_written),
                 static_cast<unsigned long long>(retry_direct_written),
-                refresh_attempted ? 1 : 0,
                 re_resolved ? 1 : 0,
                 static_cast<unsigned long>(GetLastError()),
                 last_error().empty() ? "<empty>" : last_error().c_str(),
@@ -8026,14 +6215,14 @@ namespace driver_bridge
             static_cast<unsigned long long>(address),
             size,
             attached_pid());
-        const ULONGLONG t_arc_start = GetTickCount64();
+        const ULONGLONG t_enter_start = GetTickCount64();
         driver_bridge_pid_call::pid_scope_t scope;
         const bool enter_ok = driver_bridge_pid_call::enter(scope, pid);
-        const ULONGLONG arc_lookup_elapsed_ms = GetTickCount64() - t_arc_start;
+        const ULONGLONG enter_elapsed_ms = GetTickCount64() - t_enter_start;
         if (!enter_ok) {
             const std::string err = last_error();
             diag::log_tagged_fmt("driver_bridge",
-                "read_memory_for pid=%u addr=0x%llX size=%zu enter_failed active_pid=%u status=%s last_error=%s gle=%lu arc_lookup_elapsed_ms=%llu outer_elapsed_ms=%llu",
+                "read_memory_for pid=%u addr=0x%llX size=%zu enter_failed active_pid=%u status=%s last_error=%s gle=%lu enter_elapsed_ms=%llu outer_elapsed_ms=%llu",
                 pid,
                 static_cast<unsigned long long>(address),
                 size,
@@ -8041,16 +6230,16 @@ namespace driver_bridge
                 status().c_str(),
                 err.empty() ? "(empty)" : err.c_str(),
                 static_cast<unsigned long>(GetLastError()),
-                static_cast<unsigned long long>(arc_lookup_elapsed_ms),
+                static_cast<unsigned long long>(enter_elapsed_ms),
                 static_cast<unsigned long long>(GetTickCount64() - t0));
             diag::log_tagged_fmt("driver_bridge",
-                "read_memory_for_exit pid=%u tid=%lu addr=0x%llX size=%zu ok=0 outer_elapsed_ms=%llu arc_lookup_elapsed_ms=%llu kernel_call_elapsed_ms=0 reason=enter_failed",
+                "read_memory_for_exit pid=%u tid=%lu addr=0x%llX size=%zu ok=0 outer_elapsed_ms=%llu enter_elapsed_ms=%llu kernel_call_elapsed_ms=0 reason=enter_failed",
                 pid,
                 static_cast<unsigned long>(GetCurrentThreadId()),
                 static_cast<unsigned long long>(address),
                 size,
                 static_cast<unsigned long long>(GetTickCount64() - t0),
-                static_cast<unsigned long long>(arc_lookup_elapsed_ms));
+                static_cast<unsigned long long>(enter_elapsed_ms));
             return false;
         }
         const uint64_t dtb_entry = device ? device->get_dtb() : 0;
@@ -8061,7 +6250,7 @@ namespace driver_bridge
         const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
         const ULONGLONG outer_elapsed_ms = GetTickCount64() - t0;
         diag::log_tagged_fmt("driver_bridge",
-            "read_memory_for pid=%u active_pid=%u tid=%lu addr=0x%llX size=%zu ok=%d bytes=%zu dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s all_zero=%d first16=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX arc_lookup_elapsed_ms=%llu kernel_call_elapsed_ms=%llu outer_elapsed_ms=%llu",
+            "read_memory_for pid=%u active_pid=%u tid=%lu addr=0x%llX size=%zu ok=%d bytes=%zu dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s all_zero=%d first16=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX enter_elapsed_ms=%llu kernel_call_elapsed_ms=%llu outer_elapsed_ms=%llu",
             pid,
             attached_pid(),
             static_cast<unsigned long>(GetCurrentThreadId()),
@@ -8081,18 +6270,18 @@ namespace driver_bridge
             static_cast<unsigned long>(region_before.protect),
             static_cast<unsigned long>(region_after.state),
             static_cast<unsigned long>(region_after.protect),
-            static_cast<unsigned long long>(arc_lookup_elapsed_ms),
+            static_cast<unsigned long long>(enter_elapsed_ms),
             static_cast<unsigned long long>(kernel_call_elapsed_ms),
             static_cast<unsigned long long>(outer_elapsed_ms));
         diag::log_tagged_fmt("driver_bridge",
-            "read_memory_for_exit pid=%u tid=%lu addr=0x%llX size=%zu ok=%d outer_elapsed_ms=%llu arc_lookup_elapsed_ms=%llu kernel_call_elapsed_ms=%llu",
+            "read_memory_for_exit pid=%u tid=%lu addr=0x%llX size=%zu ok=%d outer_elapsed_ms=%llu enter_elapsed_ms=%llu kernel_call_elapsed_ms=%llu",
             pid,
             static_cast<unsigned long>(GetCurrentThreadId()),
             static_cast<unsigned long long>(address),
             size,
             ok ? 1 : 0,
             static_cast<unsigned long long>(outer_elapsed_ms),
-            static_cast<unsigned long long>(arc_lookup_elapsed_ms),
+            static_cast<unsigned long long>(enter_elapsed_ms),
             static_cast<unsigned long long>(kernel_call_elapsed_ms));
         return ok;
     }
@@ -8637,127 +6826,6 @@ namespace driver_bridge
         clear_last_error_after_success("write_kernel_memory");
         return true;
     }
-
-    bool kernel_read_user_memory(uint64_t addr, void* out, size_t len)
-    {
-        if (!out || len == 0)
-            return false;
-
-        bool kernel_mode = false;
-        uint32_t current_pid = 0;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-            current_pid = g_pid;
-        }
-        if (!kernel_mode) {
-            require_kernel_fail("kernel_read_user_memory");
-            return false;
-        }
-
-        size_t offset = 0;
-        while (offset < len) {
-            size_t chunk = (len - offset > 4096) ? 4096 : (len - offset);
-            if (!device->kernel_read_usermem(current_pid, addr + offset,
-                    static_cast<uint8_t*>(out) + offset, chunk)) {
-                diag::log_tagged_fmt("driver_bridge",
-                    "kernel_read_user_memory_failed addr=0x%llX offset=%zu chunk=%zu pid=%u",
-                    static_cast<unsigned long long>(addr),
-                    offset, chunk, current_pid);
-                return false;
-            }
-            offset += chunk;
-        }
-
-        clear_last_error_after_success("kernel_read_user_memory");
-        return true;
-    }
-
-    bool verify_cross_ring_evidence(const uint8_t* evidence_data, uint32_t evidence_size)
-    {
-        if (!evidence_data || evidence_size == 0)
-            return false;
-
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            require_kernel_fail("verify_cross_ring_evidence");
-            return false;
-        }
-
-        diag::log_tagged_fmt("driver_bridge",
-            "verify_cross_ring_evidence size=%u pid=%lu",
-            evidence_size, GetCurrentProcessId());
-
-        std::vector<uint8_t> io_buffer(evidence_data, evidence_data + evidence_size);
-        DWORD xrev_code = ioctl_codes::XREV();
-        uint32_t bytes_returned = 0;
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->send_ioctl_raw(xrev_code,
-            io_buffer.data(), evidence_size, bytes_returned);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-
-        if (!ok) {
-            diag::log_tagged_fmt("driver_bridge",
-                "verify_cross_ring_evidence_failed err=%lu size=%u ioctl=0x%08X",
-                static_cast<unsigned long>(err), evidence_size, xrev_code);
-            return false;
-        }
-
-        clear_last_error_after_success("verify_cross_ring_evidence");
-        return true;
-    }
-
-    bool verify_cross_ring_evidence(const cross_ring_evidence_t& evidence)
-    {
-        if (evidence.region_base == 0 || evidence.region_size == 0)
-            return false;
-
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            require_kernel_fail("verify_cross_ring_evidence_struct");
-            return false;
-        }
-
-        voyager::detail::cross_ring_evidence_abi_t raw{};
-        raw.detecting_checker_id = evidence.detecting_checker_id;
-        raw.target_checker_id = evidence.target_checker_id;
-        raw.region_base = evidence.region_base;
-        raw.region_size = evidence.region_size;
-        std::memcpy(raw.expected_hash, evidence.expected_hash, 32);
-        std::memcpy(raw.actual_hash, evidence.actual_hash, 32);
-        raw.modified_bytes_len = evidence.modified_bytes_len;
-        raw._pad = 0;
-        uint32_t copy_len = evidence.modified_bytes_len > 256 ? 256 : evidence.modified_bytes_len;
-        std::memcpy(raw.modified_bytes, evidence.modified_bytes, copy_len);
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->verify_cross_ring_evidence(raw);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-
-        if (!ok) {
-            diag::log_tagged_fmt("driver_bridge",
-                "verify_cross_ring_evidence_struct_failed err=%lu checker=%u target=%u region=0x%llX",
-                static_cast<unsigned long>(err),
-                evidence.detecting_checker_id,
-                evidence.target_checker_id,
-                static_cast<unsigned long long>(evidence.region_base));
-            SetLastError(err);
-            return false;
-        }
-
-        clear_last_error_after_success("verify_cross_ring_evidence_struct");
-        return true;
-    }
-
 
     uint64_t allocate_memory(size_t size)
     {
@@ -9948,147 +8016,6 @@ namespace driver_bridge
             return 0;
         }
 
-        diag::log_tagged_fmt("driver",
-            "call_function_arc_begin call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u generation=%llu fn=0x%llX cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu elapsed_ms=%llu",
-            static_cast<unsigned long long>(call_id),
-            call_ctx.label,
-            call_ctx.tool,
-            call_ctx.diag_id,
-            call_ctx.pid,
-            attached_pid(),
-            static_cast<unsigned long long>(g_active_pid_generation.load(std::memory_order_acquire)),
-            static_cast<unsigned long long>(function_address),
-            current_remote_call_cancelled() ? 1 : 0,
-            call_ctx.timeout_ms,
-            static_cast<unsigned long long>(call_ctx.deadline_ms),
-            static_cast<unsigned long long>(deadline_remaining_ms(call_ctx.deadline_ms, GetTickCount64())),
-            static_cast<unsigned long long>(GetTickCount64() - call_start));
-        auto arc_outcome = run_bounded_lower_remote_call("arc",
-            call_id,
-            call_ctx,
-            active_at_entry,
-            generation_at_entry,
-            function_address,
-            call_start,
-            [function_address, arg1, arg2, arg3, arg4, allow_zero_result = call_ctx.allow_zero_result](uint64_t& result, DWORD& gle, bool& zero_result_rejected) -> bool {
-                result = 0;
-                SetLastError(ERROR_SUCCESS);
-                const bool ok = arc_bridge_remote_call(function_address, arg1, arg2, arg3, arg4, result, allow_zero_result, zero_result_rejected);
-                gle = ok ? ERROR_SUCCESS : GetLastError();
-                if (!ok && gle == ERROR_SUCCESS)
-                    gle = ERROR_GEN_FAILURE;
-                return ok;
-            });
-        if (!arc_outcome.completed) {
-            SetLastError(arc_outcome.gle);
-            diag::log_tagged_fmt("driver",
-                "call_function_arc_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX ok=0 lower_completed=%d lower_ok=%d lower_reason=%s gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d late_completion=%d lower_uninterruptible=%d stale_generation=%d elapsed_ms=%llu status=%s last_error=%s",
-                static_cast<unsigned long long>(call_id),
-                call_ctx.label,
-                call_ctx.tool,
-                call_ctx.diag_id,
-                call_ctx.pid,
-                active_at_entry,
-                arc_outcome.active_pid_after,
-                static_cast<unsigned long long>(generation_at_entry),
-                static_cast<unsigned long long>(arc_outcome.generation_after),
-                static_cast<unsigned long long>(function_address),
-                arc_outcome.completed ? 1 : 0,
-                arc_outcome.lower_ok ? 1 : 0,
-                arc_outcome.completion_reason.c_str(),
-                static_cast<unsigned long>(arc_outcome.gle),
-                arc_outcome.cancelled ? 1 : 0,
-                call_ctx.timeout_ms,
-                static_cast<unsigned long long>(call_ctx.deadline_ms),
-                arc_outcome.deadline_expired ? 1 : 0,
-                1,
-                lower_remote_call_uninterruptible(arc_outcome) ? 1 : 0,
-                arc_outcome.stale_generation ? 1 : 0,
-                static_cast<unsigned long long>(arc_outcome.elapsed_ms),
-                status().c_str(),
-                last_error().c_str());
-            return 0;
-        }
-        if (arc_outcome.lower_ok) {
-            const bool arc_success = !arc_outcome.stale_generation && !arc_outcome.cancelled && !arc_outcome.deadline_expired;
-            diag::log_tagged_fmt("driver",
-                "call_function_arc_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX result=0x%llX ok=%d lower_completed=%d lower_ok=%d lower_reason=%s gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d late_completion=%d lower_uninterruptible=%d stale_generation=%d elapsed_ms=%llu status=%s last_error=%s",
-                static_cast<unsigned long long>(call_id),
-                call_ctx.label,
-                call_ctx.tool,
-                call_ctx.diag_id,
-                call_ctx.pid,
-                active_at_entry,
-                arc_outcome.active_pid_after,
-                static_cast<unsigned long long>(generation_at_entry),
-                static_cast<unsigned long long>(arc_outcome.generation_after),
-                static_cast<unsigned long long>(function_address),
-                static_cast<unsigned long long>(arc_outcome.result),
-                arc_success ? 1 : 0,
-                arc_outcome.completed ? 1 : 0,
-                arc_outcome.lower_ok ? 1 : 0,
-                arc_outcome.completion_reason.c_str(),
-                static_cast<unsigned long>(arc_outcome.stale_generation ? ERROR_OPERATION_ABORTED : (arc_outcome.cancelled ? ERROR_CANCELLED : (arc_outcome.deadline_expired ? ERROR_TIMEOUT : ERROR_SUCCESS))),
-                arc_outcome.cancelled ? 1 : 0,
-                call_ctx.timeout_ms,
-                static_cast<unsigned long long>(call_ctx.deadline_ms),
-                arc_outcome.deadline_expired ? 1 : 0,
-                (arc_outcome.deadline_expired || arc_outcome.stale_generation || arc_outcome.cancelled) ? 1 : 0,
-                lower_remote_call_uninterruptible(arc_outcome) ? 1 : 0,
-                arc_outcome.stale_generation ? 1 : 0,
-                static_cast<unsigned long long>(arc_outcome.elapsed_ms),
-                status().c_str(),
-                last_error().c_str());
-            if (arc_outcome.stale_generation || arc_outcome.cancelled || arc_outcome.deadline_expired) {
-                SetLastError(arc_outcome.stale_generation ? ERROR_OPERATION_ABORTED : (arc_outcome.cancelled ? ERROR_CANCELLED : ERROR_TIMEOUT));
-                return 0;
-            }
-            SetLastError(ERROR_SUCCESS);
-            return arc_outcome.result;
-        }
-        const DWORD arc_gle = arc_outcome.gle;
-        diag::log_tagged_fmt("driver",
-            "call_function_arc_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX ok=0 lower_completed=%d lower_ok=%d lower_reason=%s gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu deadline_expired_after=%d stale_generation=%d elapsed_ms=%llu status=%s last_error=%s",
-            static_cast<unsigned long long>(call_id),
-            call_ctx.label,
-            call_ctx.tool,
-            call_ctx.diag_id,
-            call_ctx.pid,
-            active_at_entry,
-            arc_outcome.active_pid_after,
-            static_cast<unsigned long long>(generation_at_entry),
-            static_cast<unsigned long long>(arc_outcome.generation_after),
-            static_cast<unsigned long long>(function_address),
-            arc_outcome.completed ? 1 : 0,
-            arc_outcome.lower_ok ? 1 : 0,
-            arc_outcome.completion_reason.c_str(),
-            static_cast<unsigned long>(arc_gle),
-            current_remote_call_cancelled() ? 1 : 0,
-            call_ctx.timeout_ms,
-            static_cast<unsigned long long>(call_ctx.deadline_ms),
-            static_cast<unsigned long long>(deadline_remaining_ms(call_ctx.deadline_ms, GetTickCount64())),
-            arc_outcome.deadline_expired ? 1 : 0,
-            arc_outcome.stale_generation ? 1 : 0,
-            static_cast<unsigned long long>(arc_outcome.elapsed_ms),
-            status().c_str(),
-            last_error().c_str());
-        if (arc_outcome.stale_generation) {
-            SetLastError(ERROR_OPERATION_ABORTED);
-            diag::log_tagged_fmt("driver",
-                "call_function_stale_reject call_id=%llu phase=arc label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX elapsed_ms=%llu",
-                static_cast<unsigned long long>(call_id),
-                call_ctx.label,
-                call_ctx.tool,
-                call_ctx.diag_id,
-                call_ctx.pid,
-                active_at_entry,
-                arc_outcome.active_pid_after,
-                static_cast<unsigned long long>(generation_at_entry),
-                static_cast<unsigned long long>(arc_outcome.generation_after),
-                static_cast<unsigned long long>(function_address),
-                static_cast<unsigned long long>(arc_outcome.elapsed_ms));
-            return 0;
-        }
         if (current_remote_call_cancelled() || (call_ctx.deadline_ms != 0 && GetTickCount64() >= call_ctx.deadline_ms)) {
             const bool cancelled = current_remote_call_cancelled();
             SetLastError(cancelled ? ERROR_CANCELLED : ERROR_TIMEOUT);
@@ -10368,156 +8295,6 @@ namespace driver_bridge
         return device->spoof_debug_flags(result_flags);
     }
 
-    bool refresh_heartbeat()
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode)
-            return false;
-
-        return device->refresh_heartbeat();
-    }
-
-    static dynamic_ioctl_state_t sentinel_dynamic_ioctl_preflight_state()
-    {
-        dynamic_ioctl_state_t out{};
-        std::lock_guard<std::mutex> lk(g_state_mtx);
-        out.loaded = g_initialized;
-        out.kernel = g_kernel_mode;
-        out.connected = device && device->is_connected();
-        if (device)
-        {
-            device->sync_dynamic_security_state();
-            out.instance_server_seed = device->has_server_seed() ? 1u : 0u;
-            out.instance_ioctl_seed = device->has_server_ioctl_seed() ? 1u : 0u;
-            out.global_server_seed = dynamic_key::g_server_seed != 0 ? 1u : 0u;
-            out.global_ioctl_seed = ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u;
-            out.ioctl_seed_hash = device->get_server_ioctl_seed_hash();
-            out.heartbeat_ioctl_seed_hash = device->get_last_heartbeat_ioctl_seed_hash();
-        }
-        out.ready = out.connected && out.kernel &&
-            out.instance_server_seed != 0 &&
-            out.instance_ioctl_seed != 0 &&
-            out.global_server_seed != 0 &&
-            out.global_ioctl_seed != 0;
-        return out;
-    }
-
-    static bool sentinel_dynamic_ioctl_ready_preflight(const char* op, ULONGLONG start, dynamic_ioctl_state_t* out_state = nullptr)
-    {
-        dynamic_ioctl_state_t dyn = sentinel_dynamic_ioctl_preflight_state();
-        if (out_state)
-            *out_state = dyn;
-        if (dyn.ready)
-            return true;
-        SetLastError(ERROR_NOT_READY);
-        diag::log_tagged_fmt("driver",
-            "preauth_skipped_dynamic_ioctl_not_ready phase=driver_bridge_sentinel op=%s loaded=%d kernel=%d connected=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X elapsed_ms=%llu",
-            op && *op ? op : "unknown",
-            dyn.loaded ? 1 : 0,
-            dyn.kernel ? 1 : 0,
-            dyn.connected ? 1 : 0,
-            dyn.instance_server_seed,
-            dyn.instance_ioctl_seed,
-            dyn.global_server_seed,
-            dyn.global_ioctl_seed,
-            dyn.ioctl_seed_hash,
-            dyn.heartbeat_ioctl_seed_hash,
-            static_cast<unsigned long long>(GetTickCount64() - start));
-        return false;
-    }
-
-    bool sentinel_bridge_ready()
-    {
-        const ULONGLONG start = GetTickCount64();
-        bool kernel_mode = false;
-        bool initialized = false;
-        bool kernel_flag = false;
-        bool connected = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            initialized = g_initialized;
-            kernel_flag = g_kernel_mode;
-            connected = device && device->is_connected();
-            kernel_mode = kernel_flag && connected;
-        }
-        if (!kernel_mode) {
-            diag::log_tagged_fmt("driver",
-                "sentinel_bridge_ready_preflight_failed initialized=%d kernel=%d connected=%d elapsed_ms=%llu",
-                initialized ? 1 : 0,
-                kernel_flag ? 1 : 0,
-                connected ? 1 : 0,
-                static_cast<unsigned long long>(GetTickCount64() - start));
-            return false;
-        }
-
-        dynamic_ioctl_state_t dyn{};
-        if (!sentinel_dynamic_ioctl_ready_preflight("sentinel_bridge_ready", start, &dyn)) {
-            diag::log_tagged_fmt("driver",
-                "sentinel_bridge_ready_result heartbeat_ok=0 heartbeat_gle=%lu heartbeat_ms=0 ready=0 ready_gle=%lu ready_ms=0 total_ms=%llu dyn_ready=%d",
-                static_cast<unsigned long>(ERROR_NOT_READY),
-                static_cast<unsigned long>(ERROR_NOT_READY),
-                static_cast<unsigned long long>(GetTickCount64() - start),
-                dyn.ready ? 1 : 0);
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        const ULONGLONG hb_start = GetTickCount64();
-        bool hb_ok = device->refresh_heartbeat();
-        DWORD hb_gle = hb_ok ? ERROR_SUCCESS : GetLastError();
-        const ULONGLONG ready_start = GetTickCount64();
-        bool ready = device->sentinel_bridge_ready();
-        DWORD ready_gle = ready ? ERROR_SUCCESS : GetLastError();
-        diag::log_tagged_fmt("driver",
-            "sentinel_bridge_ready_result heartbeat_ok=%d heartbeat_gle=%lu heartbeat_ms=%llu ready=%d ready_gle=%lu ready_ms=%llu total_ms=%llu",
-            hb_ok ? 1 : 0,
-            static_cast<unsigned long>(hb_gle),
-            static_cast<unsigned long long>(ready_start - hb_start),
-            ready ? 1 : 0,
-            static_cast<unsigned long>(ready_gle),
-            static_cast<unsigned long long>(GetTickCount64() - ready_start),
-            static_cast<unsigned long long>(GetTickCount64() - start));
-        const uint64_t ready_since = ready ? device->sentinel_ready_since_tsc() : 0;
-        diag::log_tagged_fmt("driver",
-            "sentinel_metadata_bridge_summary heartbeat_ok=%d bridge_ready=%d bridge_proof_tsc=%llu mapper_cached_size_authoritative=0 zero_cached_size_security_decision=0 fail_closed_on_bridge_failure=1 fail_closed_on_zero_base=1 total_ms=%llu",
-            hb_ok ? 1 : 0,
-            ready ? 1 : 0,
-            static_cast<unsigned long long>(ready_since),
-            static_cast<unsigned long long>(GetTickCount64() - start));
-        SetLastError(ready ? ERROR_SUCCESS : ready_gle);
-        return ready;
-    }
-
-    uint64_t sentinel_ready_since_tsc()
-    {
-        const ULONGLONG start = GetTickCount64();
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode)
-            return 0;
-
-        if (!sentinel_dynamic_ioctl_ready_preflight("sentinel_ready_since_tsc", start))
-            return 0;
-
-        if (!device->refresh_heartbeat()) {
-            DWORD gle = GetLastError();
-            diag::log_tagged_fmt("driver",
-                "sentinel_ready_since_tsc_heartbeat_failed gle=%lu elapsed_ms=%llu",
-                static_cast<unsigned long>(gle),
-                static_cast<unsigned long long>(GetTickCount64() - start));
-            SetLastError(gle);
-            return 0;
-        }
-        return device->sentinel_ready_since_tsc();
-    }
-
     uint64_t driver_watchdog_age_ms()
     {
         const uint64_t last_ok = g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire);
@@ -10525,1251 +8302,6 @@ namespace driver_bridge
             return 0;
         const uint64_t now = static_cast<uint64_t>(GetTickCount64());
         return now >= last_ok ? now - last_ok : 0;
-    }
-
-    dynamic_ioctl_state_t dynamic_ioctl_state()
-    {
-        dynamic_ioctl_state_t out{};
-        std::lock_guard<std::mutex> lk(g_state_mtx);
-        out.loaded = g_initialized;
-        out.kernel = g_kernel_mode;
-        out.connected = device && device->is_connected();
-        if (device)
-        {
-            device->sync_dynamic_security_state();
-            out.instance_server_seed = device->has_server_seed() ? 1u : 0u;
-            out.instance_ioctl_seed = device->has_server_ioctl_seed() ? 1u : 0u;
-            out.global_server_seed = dynamic_key::g_server_seed != 0 ? 1u : 0u;
-            out.global_ioctl_seed = ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u;
-            out.ioctl_seed_hash = device->get_server_ioctl_seed_hash();
-            out.heartbeat_ioctl_seed_hash = device->get_last_heartbeat_ioctl_seed_hash();
-        }
-        out.ready = out.connected && out.kernel &&
-            out.instance_server_seed != 0 &&
-            out.instance_ioctl_seed != 0 &&
-            out.global_server_seed != 0 &&
-            out.global_ioctl_seed != 0;
-        return out;
-    }
-
-    bool dynamic_ioctls_ready()
-    {
-        return dynamic_ioctl_state().ready;
-    }
-
-    bool require_dynamic_session_ready(uint32_t timeout_ms)
-    {
-        const uint64_t start_ms = static_cast<uint64_t>(GetTickCount64());
-        const uint64_t deadline_ms = start_ms + timeout_ms;
-        dynamic_ioctl_state_t initial_state = dynamic_ioctl_state();
-        bool relay_requested = false;
-        if (initial_state.connected && initial_state.kernel && !initial_state.ready) {
-            relay_requested = standalone_license::request_immediate_relay("driver_bridge_net_phase_barrier");
-        }
-        bool seeded = initial_state.ready;
-        dynamic_ioctl_state_t observed = initial_state;
-        while (!seeded) {
-            const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
-            if (now_ms >= deadline_ms)
-                break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            observed = dynamic_ioctl_state();
-            if (observed.ready) {
-                seeded = true;
-                break;
-            }
-            if (observed.connected && observed.kernel) {
-                std::lock_guard<std::mutex> lk(g_state_mtx);
-                if (device && device->is_dynamic_session_seeded()) {
-                    seeded = true;
-                    break;
-                }
-            }
-        }
-        const uint64_t elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - start_ms;
-        diag::log_tagged_critical_fmt("driver_bridge_net",
-            "network_phase_barrier dyn_ready=%d seeded=%d connected=%d kernel=%d inst_seed=%u/%u glob_seed=%u/%u relay_requested=%d elapsed_ms=%llu timeout_ms=%u",
-            observed.ready ? 1 : 0,
-            seeded ? 1 : 0,
-            observed.connected ? 1 : 0,
-            observed.kernel ? 1 : 0,
-            observed.instance_server_seed,
-            observed.instance_ioctl_seed,
-            observed.global_server_seed,
-            observed.global_ioctl_seed,
-            relay_requested ? 1 : 0,
-            static_cast<unsigned long long>(elapsed_ms),
-            static_cast<unsigned>(timeout_ms));
-        return seeded;
-    }
-
-    bool register_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size,
-                                 uint64_t expected_hash, uint32_t check_interval_ms)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        driver_critical_fmt(
-            "register_dll_protection_pre kernel=%d pid=%lu tid=%lu module=0x%llX text=0x%llX size=0x%X hash=0x%016llX interval=%u tick=%llu",
-            kernel_mode ? 1 : 0,
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(module_base),
-            static_cast<unsigned long long>(text_va),
-            text_size,
-            static_cast<unsigned long long>(expected_hash),
-            check_interval_ms,
-            static_cast<unsigned long long>(started));
-        if (!kernel_mode) {
-            require_kernel_fail("register_dll_protection");
-            driver_critical_fmt("register_dll_protection_post ok=0 err=%lu reason=no_kernel elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->register_dll_protection(module_base, text_va, text_size,
-                                                  expected_hash, check_interval_ms);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("register_dll_protection_post ok=%d err=%lu elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        if (!ok) SetLastError(err);
-        return ok;
-    }
-
-    bool register_self_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size,
-                                      uint64_t expected_hash, uint32_t check_interval_ms)
-    {
-        const uint32_t self_pid = static_cast<uint32_t>(GetCurrentProcessId());
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        std::lock_guard<std::mutex> lk(g_state_mtx);
-        bool kernel_mode = g_kernel_mode && device && device->is_connected();
-        if (!kernel_mode) {
-            require_kernel_fail("register_self_dll_protection");
-            driver_critical_fmt("register_self_dll_protection_post ok=0 err=%lu reason=no_kernel elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        if (anti_tamper::state::get().violation_latched.load(std::memory_order_acquire)) {
-            SetLastError(ERROR_ACCESS_DENIED);
-            driver_critical_fmt("register_self_dll_protection_post ok=0 err=%lu reason=violation_latched elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        const uint32_t saved_pid = device->get_process_id();
-        const uint64_t saved_base = device->get_base_address();
-        const uint64_t saved_dtb = device->get_dtb();
-
-        device->set_process_id(self_pid);
-        device->solve_dtb();
-        uint64_t self_dtb = device->get_dtb();
-        driver_critical_fmt(
-            "register_self_dll_protection_dtb pid=%u dtb=0x%llX saved_pid=%u saved_dtb=0x%llX elapsed_ms=%llu",
-            self_pid,
-            static_cast<unsigned long long>(self_dtb),
-            saved_pid,
-            static_cast<unsigned long long>(saved_dtb),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->register_dll_protection_for_pid(self_pid,
-                                                          module_base, text_va, text_size,
-                                                          expected_hash, check_interval_ms);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-
-        device->set_process_id(saved_pid);
-        device->set_base_address(saved_base);
-        device->set_dtb(saved_dtb);
-
-        SetLastError(err);
-        driver_critical_fmt("register_self_dll_protection_post ok=%d err=%lu dtb=0x%llX elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(self_dtb),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        return ok;
-    }
-
-    bool query_dll_protection(dll_protect_status_t& out)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            require_kernel_fail("query_dll_protection");
-            return false;
-        }
-
-        voyager::device_t::dll_protect_status raw{};
-        if (!device->query_dll_protection(raw))
-            return false;
-
-        out.status         = raw.status;
-        out.current_hash   = raw.current_hash;
-        out.expected_hash  = raw.expected_hash;
-        out.last_check_tsc = raw.last_check_tsc;
-        return true;
-    }
-
-    bool unregister_dll_protection()
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            require_kernel_fail("unregister_dll_protection");
-            return false;
-        }
-
-        return device->unregister_dll_protection();
-    }
-
-    bool unregister_self_dll_protection(uint64_t module_base)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            require_kernel_fail("unregister_self_dll_protection");
-            return false;
-        }
-
-        return device->unregister_dll_protection_for_pid(static_cast<uint32_t>(GetCurrentProcessId()), module_base);
-    }
-
-    bool trigger_kernel_bsod(uint32_t reason_code, uint64_t evidence_hash)
-    {
-        if (destructive_driver_action_suppressed()) {
-            uint64_t full_test_suppression_remaining = 0;
-            anti_tamper::state::full_test_suppression_active(&full_test_suppression_remaining);
-            diag::log_tagged_critical_fmt("driver",
-                "trigger_kernel_bsod_SUPPRESSED reason=0x%08X evidence=0x%016llX full_test_latch=%d post_full_test_ms=%llu env_full_test=%d env_disable=%d",
-                reason_code,
-                static_cast<unsigned long long>(evidence_hash),
-                anti_tamper::state::get().full_test_running.load(std::memory_order_acquire) ? 1 : 0,
-                static_cast<unsigned long long>(full_test_suppression_remaining),
-                env_flag_enabled("AIDA_FULL_TEST_RUNNING") ? 1 : 0,
-                env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT") ? 1 : 0);
-            return false;
-        }
-
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode)
-            return false;
-
-
-        return device->trigger_kernel_bsod(reason_code, evidence_hash);
-    }
-
-    bool latch_targeting_from_usermode(uint32_t reason)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode)
-            return false;
-
-        return device->latch_targeting_from_usermode(reason);
-    }
-
-    bool tier_a_driver_present_query(bool* out_present, uint32_t* out_mask, uint64_t* out_first_base)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        if (out_present) *out_present = false;
-        if (out_mask) *out_mask = 0;
-        if (out_first_base) *out_first_base = 0;
-
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        driver_critical_fmt("tier_a_driver_present_query_pre kernel=%d pid=%lu tid=%lu tick=%llu",
-            kernel_mode ? 1 : 0,
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(started));
-        if (!kernel_mode) {
-            driver_critical_fmt("tier_a_driver_present_query_post ok=0 err=%lu reason=no_kernel elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        bool present = false;
-        uint32_t mask = 0;
-        uint64_t base = 0;
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->tier_a_driver_present_query(present, &mask, &base);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("tier_a_driver_present_query_post ok=%d err=%lu present=%d mask=0x%08X first_base=0x%llX elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            present ? 1 : 0,
-            mask,
-            static_cast<unsigned long long>(base),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        if (!ok)
-            return false;
-
-        if (out_present) *out_present = present;
-        if (out_mask) *out_mask = mask;
-        if (out_first_base) *out_first_base = base;
-        return true;
-    }
-
-    bool tier_a_driver_present()
-    {
-        bool present = false;
-        if (!tier_a_driver_present_query(&present, nullptr, nullptr))
-            return false;
-        return present;
-    }
-
-    bool canary_register(void* va, size_t size)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        driver_critical_fmt("canary_register_bridge_pre kernel=%d pid=%lu tid=%lu va=0x%llX size=0x%llX tick=%llu",
-            kernel_mode ? 1 : 0,
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(va)),
-            static_cast<unsigned long long>(size),
-            static_cast<unsigned long long>(started));
-        if (!kernel_mode) {
-            diag::log_tagged_fmt("driver", "canary_register_skip kernel_mode=0 va=%p size=%llu",
-                va,
-                static_cast<unsigned long long>(size));
-            driver_critical_fmt("canary_register_bridge_post ok=0 err=%lu reason=no_kernel elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        diag::log_tagged_fmt("driver", "canary_register_pre va=%p size=%llu",
-            va,
-            static_cast<unsigned long long>(size));
-        SetLastError(ERROR_SUCCESS);
-        bool registered = device->canary_register(reinterpret_cast<uint64_t>(va),
-                                                  static_cast<uint64_t>(size));
-        DWORD err = registered ? ERROR_SUCCESS : GetLastError();
-        diag::log_tagged_fmt("driver", "canary_register_post va=%p size=%llu registered=%d",
-            va,
-            static_cast<unsigned long long>(size),
-            registered ? 1 : 0);
-        driver_critical_fmt("canary_register_bridge_post ok=%d err=%lu elapsed_ms=%llu",
-            registered ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        return registered;
-    }
-
-    bool re_confirmed_usermode_bsod(const re_evidence_blob_t& evidence)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) return false;
-
-        voyager::detail::re_evidence_blob_t raw{};
-        raw.magic = evidence.magic;
-        raw.version = evidence.version;
-        raw.signal_family = evidence.signal_family;
-        raw.signal_id = evidence.signal_id;
-        raw.score = evidence.score;
-        raw.pid = evidence.pid;
-        raw.reserved0 = evidence.reserved0;
-        raw.caller_image_hash = evidence.caller_image_hash;
-        raw.signals_bitmap_hash = evidence.signals_bitmap_hash;
-        raw.timestamp = evidence.timestamp;
-
-        return device->re_confirmed_usermode_bsod(raw);
-    }
-
-    bool register_usermode_hash(uint64_t text_base, uint32_t text_size,
-                                uint64_t reloc_delta,
-                                const uint8_t sha256[32],
-                                const reloc_mask_entry_t* mask_entries,
-                                uint32_t mask_count)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            driver_critical_fmt("register_usermode_hash ok=0 reason=no_kernel elapsed_ms=%llu",
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        if (mask_count > voyager::detail::MAX_RELOC_MASK_ENTRIES_ABI) {
-            SetLastError(ERROR_INVALID_PARAMETER);
-            return false;
-        }
-
-        std::vector<voyager::detail::reloc_mask_entry_abi_t> abi_entries;
-        if (mask_count > 0 && mask_entries) {
-            abi_entries.resize(mask_count);
-            for (uint32_t i = 0; i < mask_count; i++) {
-                abi_entries[i].offset = mask_entries[i].offset;
-                abi_entries[i].size = mask_entries[i].size;
-                abi_entries[i].reloc_type = mask_entries[i].reloc_type;
-                abi_entries[i]._pad = 0;
-                std::memcpy(abi_entries[i].original_value, mask_entries[i].original_value, 8);
-            }
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->register_usermode_hash(
-            text_base, text_size, reloc_delta, sha256,
-            abi_entries.empty() ? nullptr : abi_entries.data(),
-            mask_count);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("register_usermode_hash ok=%d err=%lu base=0x%llX size=0x%X delta=0x%llX mask_count=%u elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(text_base),
-            text_size,
-            static_cast<unsigned long long>(reloc_delta),
-            mask_count,
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        if (!ok) SetLastError(err);
-        return ok;
-    }
-
-    bool query_dma_protection_state(dma_protection_state_t& out)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_INVALID_HANDLE);
-            return false;
-        }
-
-        voyager::detail::dma_protection_state raw{};
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->query_dma_protection_state(raw);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("query_dma_protection_state_post ok=%d err=%lu elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        if (!ok) return false;
-
-        out.iommu.dmar_present = raw.iommu.dmar_present;
-        out.iommu.ivrs_present = raw.iommu.ivrs_present;
-        out.iommu.vtd_enabled = raw.iommu.vtd_enabled;
-        out.iommu.amd_vi_enabled = raw.iommu.amd_vi_enabled;
-        out.iommu.iommu_present = raw.iommu.iommu_present;
-        out.iommu.remapping_bypassed = raw.iommu.remapping_bypassed;
-        out.iommu.dmar_table_pa = raw.iommu.dmar_table_pa;
-        out.iommu.ivrs_table_pa = raw.iommu.ivrs_table_pa;
-        out.iommu.remapping_units = raw.iommu.remapping_units;
-        out.iommu.risk_level = raw.iommu.risk_level;
-        out.iommu.detection_timestamp = raw.iommu.detection_timestamp;
-        out.canary_count = raw.canary_count;
-        out.canary_hits = raw.canary_hits;
-        out.pcie_unknown_count = raw.pcie_unknown_count;
-        out.ept_anomaly_count = raw.ept_anomaly_count;
-        out.tier1_refused = raw.tier1_refused;
-        out.tier2_bsod_armed = raw.tier2_bsod_armed;
-        out.timestamp = raw.timestamp;
-        return true;
-    }
-
-    bool query_iommu_status(iommu_status_t& out)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_INVALID_HANDLE);
-            return false;
-        }
-
-        voyager::detail::iommu_status raw{};
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->query_iommu_status(raw);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("query_iommu_status_post ok=%d err=%lu risk=%u elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            raw.risk_level,
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        if (!ok) return false;
-
-        out.dmar_present = raw.dmar_present;
-        out.ivrs_present = raw.ivrs_present;
-        out.vtd_enabled = raw.vtd_enabled;
-        out.amd_vi_enabled = raw.amd_vi_enabled;
-        out.iommu_present = raw.iommu_present;
-        out.remapping_bypassed = raw.remapping_bypassed;
-        out.dmar_table_pa = raw.dmar_table_pa;
-        out.ivrs_table_pa = raw.ivrs_table_pa;
-        out.remapping_units = raw.remapping_units;
-        out.risk_level = raw.risk_level;
-        out.detection_timestamp = raw.detection_timestamp;
-        return true;
-    }
-
-    bool enumerate_pcie_devices(pcie_enum_result_t& out)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_INVALID_HANDLE);
-            return false;
-        }
-
-        voyager::detail::pcie_enum_result raw{};
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->enumerate_pcie_devices(raw);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("enumerate_pcie_devices_post ok=%d err=%lu devices=%u unknown=%u elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            raw.device_count,
-            raw.unknown_count,
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        if (!ok) return false;
-
-        out.device_count = raw.device_count;
-        out.unknown_count = raw.unknown_count;
-        for (std::size_t i = 0; i < MAX_PCIE_DEVICES && i < raw.device_count; ++i) {
-            const auto& src = raw.entries[i];
-            auto& dst = out.entries[i];
-            dst.vendor_id = src.vendor_id;
-            dst.device_id = src.device_id;
-            dst.class_code = src.class_code;
-            dst.bus = src.bus;
-            dst.device = src.device;
-            dst.function = src.function;
-            dst.header_type = src.header_type;
-            for (int j = 0; j < 6; ++j) dst.bar_pa[j] = src.bar_pa[j];
-            dst.bar_size = src.bar_size;
-            dst.flags = src.flags;
-            dst.whitelist_status = src.whitelist_status;
-        }
-        return true;
-    }
-
-    bool add_pcie_whitelist(uint16_t vendor_id, uint16_t device_id)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_INVALID_HANDLE);
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->add_pcie_whitelist(vendor_id, device_id);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("add_pcie_whitelist_post ok=%d err=%lu vid=0x%04X did=0x%04X",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned>(vendor_id),
-            static_cast<unsigned>(device_id));
-        return ok;
-    }
-
-    bool register_canary_poison(uint64_t va, uint64_t poison_signature)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_INVALID_HANDLE);
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->register_canary_poison(va, poison_signature);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("register_canary_poison_post ok=%d err=%lu va=0x%llX sig=0x%llX",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(va),
-            static_cast<unsigned long long>(poison_signature));
-        return ok;
-    }
-
-    bool protect_page_pte(uint64_t va)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_INVALID_HANDLE);
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->protect_page_pte(va);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("protect_page_pte_post ok=%d err=%lu va=0x%llX",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(va));
-        return ok;
-    }
-
-    bool unprotect_page_pte(uint64_t va)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_INVALID_HANDLE);
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->unprotect_page_pte(va);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("unprotect_page_pte_post ok=%d err=%lu va=0x%llX",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(va));
-        return ok;
-    }
-
-    bool check_ept_state(ept_check_result_t& out)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_INVALID_HANDLE);
-            return false;
-        }
-
-        voyager::detail::ept_check_result raw{};
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->check_ept_state(raw);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("check_ept_state_post ok=%d err=%lu ept=%d npte=%d hook=%d risk=%u elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            raw.ept_present ? 1 : 0,
-            raw.npte_present ? 1 : 0,
-            raw.ept_hook_detected ? 1 : 0,
-            raw.risk_level,
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        if (!ok) return false;
-
-        out.ept_present = raw.ept_present;
-        out.npte_present = raw.npte_present;
-        out.ept_hook_detected = raw.ept_hook_detected;
-        out.vmm_present = raw.vmm_present;
-        out.ept_pointer_msr = raw.ept_pointer_msr;
-        out.npte_anomaly_count = raw.npte_anomaly_count;
-        out.risk_level = raw.risk_level;
-        out.detection_timestamp = raw.detection_timestamp;
-        return true;
-    }
-
-    bool trigger_dma_countermeasure(uint32_t action, uint32_t reason)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_INVALID_HANDLE);
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->trigger_dma_countermeasure(action, reason);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("trigger_dma_countermeasure_post ok=%d err=%lu action=%u reason=0x%08X",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            action,
-            reason);
-        return ok;
-    }
-
-    bool update_re_tool_hashes(const uint8_t* hashes, uint32_t count)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_INVALID_HANDLE);
-            return false;
-        }
-        if (!hashes || count == 0) {
-            SetLastError(ERROR_INVALID_PARAMETER);
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->update_re_tool_hashes(hashes, count);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("update_re_tool_hashes_post ok=%d err=%lu count=%u",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            count);
-        return ok;
-    }
-
-    bool update_werfault_hashes(const uint8_t* hashes, uint32_t count)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_INVALID_HANDLE);
-            return false;
-        }
-        if (!hashes || count == 0) {
-            SetLastError(ERROR_INVALID_PARAMETER);
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->update_werfault_hashes(hashes, count);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("update_werfault_hashes_post ok=%d err=%lu count=%u",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            count);
-        return ok;
-    }
-
-    bool update_ce_driver_hashes(const uint8_t* hashes, uint32_t count)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_INVALID_HANDLE);
-            return false;
-        }
-        if (!hashes || count == 0) {
-            SetLastError(ERROR_INVALID_PARAMETER);
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->update_ce_driver_hashes(hashes, count);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("update_ce_driver_hashes_post ok=%d err=%lu count=%u",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            count);
-        return ok;
-    }
-
-    bool kernel_anti_debug_query(anti_debug_result_t& out)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            driver_critical_fmt("kernel_anti_debug_query_post ok=0 err=%lu reason=no_kernel pid=%lu tid=%lu elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                GetCurrentProcessId(),
-                GetCurrentThreadId(),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        voyager::device_t::anti_debug_result raw{};
-        SetLastError(ERROR_SUCCESS);
-        if (!device->kernel_anti_debug_query(raw))
-        {
-            DWORD err = GetLastError();
-            driver_critical_fmt("kernel_anti_debug_query_post ok=0 err=%lu elapsed_ms=%llu",
-                static_cast<unsigned long>(err),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        out.result_flags = raw.result_flags;
-        out.detected_debugger_pid = raw.detected_debugger_pid;
-        out.dr_clear_count = raw.dr_clear_count;
-        const uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - started;
-        if (out.result_flags != 0 || out.detected_debugger_pid != 0 || elapsed >= 250) {
-            driver_critical_fmt("kernel_anti_debug_query_post ok=1 flags=0x%08X debugger_pid=%llu dr_clear=%llu elapsed_ms=%llu",
-                out.result_flags,
-                static_cast<unsigned long long>(out.detected_debugger_pid),
-                static_cast<unsigned long long>(out.dr_clear_count),
-                static_cast<unsigned long long>(elapsed));
-        }
-        if (out.result_flags != 0 || out.detected_debugger_pid != 0) {
-            const DWORD preserved_error = GetLastError();
-            auto input = anti_tamper::kernel_adbg::make_input(out, "driver_bridge", "kernel_anti_debug_query");
-            uint64_t scan_pid = 0;
-            SetLastError(ERROR_SUCCESS);
-            input.scan_sampled = true;
-            input.scan_ok = kernel_anti_debug_scan_debuggers(&scan_pid);
-            const DWORD scan_error = input.scan_ok ? ERROR_SUCCESS : GetLastError();
-            input.scan_pid = scan_pid;
-            const auto decision = anti_tamper::kernel_adbg::classify(input);
-            const std::string line = anti_tamper::kernel_adbg::format_decision(input, decision);
-            driver_critical_fmt("%s", line.c_str());
-            if (!input.scan_ok) {
-                driver_critical_fmt("kernel_adbg_decision_scan_failed err=%lu flags=0x%08X debugger_pid=%llu reason=%s",
-                    static_cast<unsigned long>(scan_error),
-                    out.result_flags,
-                    static_cast<unsigned long long>(out.detected_debugger_pid),
-                    decision.reason ? decision.reason : "unknown");
-            }
-            SetLastError(preserved_error);
-        }
-        return true;
-    }
-
-    bool kernel_anti_debug_clear_dr(uint64_t* out_clear_count)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            driver_critical_fmt("kernel_anti_debug_clear_dr_post ok=0 err=%lu reason=no_kernel pid=%lu tid=%lu elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                GetCurrentProcessId(),
-                GetCurrentThreadId(),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->kernel_anti_debug_clear_dr(out_clear_count);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        const uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - started;
-        const uint64_t clear_count = out_clear_count ? *out_clear_count : 0;
-        if (!ok || clear_count != 0 || elapsed >= 250) {
-            driver_critical_fmt("kernel_anti_debug_clear_dr_post ok=%d err=%lu clear_count=%llu elapsed_ms=%llu",
-                ok ? 1 : 0,
-                static_cast<unsigned long>(err),
-                static_cast<unsigned long long>(clear_count),
-                static_cast<unsigned long long>(elapsed));
-        }
-        if (!ok) SetLastError(err);
-        return ok;
-    }
-
-    bool kernel_anti_debug_clear_process_dr(uint32_t pid, uint64_t* out_clear_count)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            driver_critical_fmt("kernel_anti_debug_clear_process_dr_post ok=0 err=%lu reason=no_kernel pid=%u caller_pid=%lu tid=%lu elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                pid,
-                GetCurrentProcessId(),
-                GetCurrentThreadId(),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->kernel_anti_debug_clear_process_dr(pid, out_clear_count);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        const uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - started;
-        const uint64_t clear_count = out_clear_count ? *out_clear_count : 0;
-        if (!ok || clear_count != 0 || elapsed >= 250) {
-            driver_critical_fmt("kernel_anti_debug_clear_process_dr_post ok=%d err=%lu clear_count=%llu pid=%u elapsed_ms=%llu",
-                ok ? 1 : 0,
-                static_cast<unsigned long>(err),
-                static_cast<unsigned long long>(clear_count),
-                pid,
-                static_cast<unsigned long long>(elapsed));
-        }
-        if (!ok) SetLastError(err);
-        return ok;
-    }
-
-    bool kernel_anti_debug_scan_debuggers(uint64_t* out_debugger_pid)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            driver_critical_fmt("kernel_anti_debug_scan_debuggers_post ok=0 err=%lu reason=no_kernel pid=%lu tid=%lu elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                GetCurrentProcessId(),
-                GetCurrentThreadId(),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->kernel_anti_debug_scan_debuggers(out_debugger_pid);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        if (!ok)
-        {
-            diag::log_tagged_fmt("driver",
-                "adbg_scan_debuggers_failed err=%lu",
-                static_cast<unsigned long>(err));
-            SetLastError(err);
-        }
-        const uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - started;
-        const uint64_t debugger_pid = out_debugger_pid ? *out_debugger_pid : 0;
-        if (!ok || debugger_pid != 0 || elapsed >= 250) {
-            driver_critical_fmt("kernel_anti_debug_scan_debuggers_post ok=%d err=%lu debugger_pid=%llu elapsed_ms=%llu",
-                ok ? 1 : 0,
-                static_cast<unsigned long>(err),
-                static_cast<unsigned long long>(debugger_pid),
-                static_cast<unsigned long long>(elapsed));
-        }
-        if (!ok) SetLastError(err);
-        return ok;
-    }
-
-    bool kernel_anti_debug_scan_text(uint64_t module_base, uint64_t exception_dir_va,
-        uint32_t exception_dir_size, uint64_t* hit_rva)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            driver_critical_fmt("kernel_anti_debug_scan_text_post ok=0 err=%lu reason=no_kernel pid=%lu tid=%lu elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                GetCurrentProcessId(),
-                GetCurrentThreadId(),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->kernel_anti_debug_scan_text(
-            module_base, exception_dir_va, exception_dir_size, hit_rva);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        if (!ok)
-        {
-            diag::log_tagged_fmt("driver",
-                "adbg_scan_text_failed err=%lu",
-                static_cast<unsigned long>(err));
-            SetLastError(err);
-        }
-        const uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - started;
-        const uint64_t hit = hit_rva ? *hit_rva : 0;
-        driver_critical_fmt("kernel_anti_debug_scan_text_post ok=%d err=%lu module_base=0x%llX hit_rva=0x%llX elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(module_base),
-            static_cast<unsigned long long>(hit),
-            static_cast<unsigned long long>(elapsed));
-        if (!ok) SetLastError(err);
-        return ok;
-    }
-
-    bool kernel_anti_debug_hide_thread(uint32_t pid, uint32_t tid)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        driver_critical_fmt("kernel_anti_debug_hide_thread_pre kernel=%d pid=%u tid_target=%u caller_pid=%lu caller_tid=%lu tick=%llu",
-            kernel_mode ? 1 : 0,
-            pid,
-            tid,
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(started));
-        if (!kernel_mode) {
-            driver_critical_fmt("kernel_anti_debug_hide_thread_post ok=0 err=%lu reason=no_kernel elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->kernel_anti_debug_hide_thread(pid, tid);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("kernel_anti_debug_hide_thread_post ok=%d err=%lu elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        if (!ok) SetLastError(err);
-        return ok;
-    }
-
-    bool kernel_anti_debug_hide_all_threads(uint32_t pid)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        driver_critical_fmt("kernel_anti_debug_hide_all_threads_pre pid=%u caller_pid=%lu caller_tid=%lu tick=%llu",
-            pid,
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(started));
-
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            driver_critical_fmt("kernel_anti_debug_hide_all_threads_post ok=0 err=%lu reason=no_kernel elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->kernel_anti_debug_hide_all_threads(pid);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("kernel_anti_debug_hide_all_threads_post ok=%d err=%lu elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        if (!ok) SetLastError(err);
-        return ok;
-    }
-
-    bool kernel_anti_debug_install_instrumentation(uint32_t pid, void* callback)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) return false;
-
-        return device->kernel_anti_debug_install_instrumentation(pid, callback);
-    }
-
-    bool kernel_anti_debug_remove_instrumentation(uint32_t pid)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) return false;
-
-        return device->kernel_anti_debug_remove_instrumentation(pid);
-    }
-
-    bool kernel_anti_dump_full(uint32_t pid)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        driver_critical_fmt("kernel_anti_dump_full_pre kernel=%d pid=%u caller_pid=%lu caller_tid=%lu tick=%llu",
-            kernel_mode ? 1 : 0,
-            pid,
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(started));
-        if (!kernel_mode) {
-            driver_critical_fmt("kernel_anti_dump_full_post ok=0 err=%lu reason=no_kernel elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->kernel_anti_dump_full(pid);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("kernel_anti_dump_full_post ok=%d err=%lu elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        return ok;
-    }
-
-    bool kernel_anti_dump_register_filter(uint32_t pid)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) return false;
-
-        return device->kernel_anti_dump_register_filter(pid);
-    }
-
-    bool kernel_anti_dump_hide_threads(uint32_t pid)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) return false;
-
-        return device->kernel_anti_dump_hide_threads(pid);
-    }
-
-    bool kernel_anti_dump_erase_headers(uint32_t pid)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) return false;
-
-        return device->kernel_anti_dump_erase_headers(pid);
-    }
-
-    bool kernel_anti_dump_query(anti_dump_result_t& out)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) return false;
-
-        voyager::device_t::anti_dump_result raw{};
-        if (!device->kernel_anti_dump_query(raw))
-            return false;
-
-        out.blocks_count = raw.blocks_count;
-        return true;
-    }
-
-    bool kernel_anti_dump_permit_pid(uint32_t pid)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) return false;
-        return device->kernel_anti_dump_permit_pid(pid);
-    }
-
-    bool kernel_anti_dump_unpermit_pid(uint32_t pid)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) return false;
-        return device->kernel_anti_dump_unpermit_pid(pid);
-    }
-
-    bool kernel_anti_dump_stop_continuous()
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) return false;
-        return device->kernel_anti_dump_stop_continuous();
-    }
-
-    bool kernel_anti_dump_start_continuous(uint32_t pid)
-    {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        driver_critical_fmt("kernel_anti_dump_start_continuous_pre kernel=%d pid=%u caller_pid=%lu caller_tid=%lu tick=%llu",
-            kernel_mode ? 1 : 0,
-            pid,
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(started));
-        if (!kernel_mode) {
-            driver_critical_fmt("kernel_anti_dump_start_continuous_post ok=0 err=%lu reason=no_kernel elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-        SetLastError(ERROR_SUCCESS);
-        bool ok = device->kernel_anti_dump_start_continuous(pid);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("kernel_anti_dump_start_continuous_post ok=%d err=%lu elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        return ok;
     }
 
     bool malware_safe_protect_pid(uint32_t pid, uint32_t flags, uint64_t* out_denials)
@@ -11871,105 +8403,6 @@ namespace driver_bridge
             "malware_safe_pull_packets pid=%u max=%u returned=%zu dropped_since=%llu",
             pid, max_records, out.size(), (unsigned long long)dropped);
         return true;
-    }
-
-    bool relay_server_token(uint32_t token_hash, uint64_t server_nonce)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) return false;
-
-        return device->relay_server_token(token_hash, server_nonce);
-    }
-
-    bool relay_server_token_v2(uint32_t token_hash, uint64_t server_nonce, uint64_t* out_driver_proof)
-    {
-        bool kernel_mode = false;
-        bool initialized = false;
-        bool kernel_flag = false;
-        bool connected = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            initialized = g_initialized;
-            kernel_flag = g_kernel_mode;
-            connected = device && device->is_connected();
-            kernel_mode = kernel_flag && connected;
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_DEVICE_NOT_CONNECTED);
-            diag::log_tagged_fmt("driver",
-                "relay_server_token_v2_preflight_failed initialized=%d kernel_mode=%d connected=%d token_set=%d nonce_set=%d",
-                initialized ? 1 : 0,
-                kernel_flag ? 1 : 0,
-                connected ? 1 : 0,
-                token_hash != 0 ? 1 : 0,
-                server_nonce != 0 ? 1 : 0);
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        const ULONGLONG start = GetTickCount64();
-        bool ok = device->relay_server_token_v2(token_hash, server_nonce, out_driver_proof);
-        DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
-        diag::log_tagged_fmt("driver",
-            "relay_server_token_v2_result ok=%d gle=%lu proof=%d elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(gle),
-            (out_driver_proof && *out_driver_proof != 0) ? 1 : 0,
-            static_cast<unsigned long long>(GetTickCount64() - start));
-        SetLastError(gle);
-        return ok;
-    }
-
-    bool initiate_driver_handshake(uint8_t out_driver_challenge[32])
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_DEVICE_NOT_CONNECTED);
-            diag::log_tagged_fmt("driver", "initiate_driver_handshake_preflight_failed kernel=%d", kernel_mode ? 1 : 0);
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        const ULONGLONG start = GetTickCount64();
-        bool ok = device->initiate_driver_handshake(out_driver_challenge);
-        DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
-        diag::log_tagged_fmt("driver", "initiate_driver_handshake_result ok=%d gle=%lu elapsed_ms=%llu",
-            ok ? 1 : 0, static_cast<unsigned long>(gle),
-            static_cast<unsigned long long>(GetTickCount64() - start));
-        SetLastError(gle);
-        return ok;
-    }
-
-    bool complete_driver_challenge(const uint8_t driver_challenge[32])
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            SetLastError(ERROR_DEVICE_NOT_CONNECTED);
-            diag::log_tagged_fmt("driver", "complete_driver_challenge_preflight_failed kernel=%d", kernel_mode ? 1 : 0);
-            return false;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-        const ULONGLONG start = GetTickCount64();
-        bool ok = device->complete_driver_challenge(driver_challenge);
-        DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
-        diag::log_tagged_fmt("driver", "complete_driver_challenge_result ok=%d gle=%lu elapsed_ms=%llu",
-            ok ? 1 : 0, static_cast<unsigned long>(gle),
-            static_cast<unsigned long long>(GetTickCount64() - start));
-        SetLastError(gle);
-        return ok;
     }
 
     bool traffic_redirect_op(uint32_t operation, uint32_t rule_id, uint32_t protocol,
@@ -12689,101 +9122,6 @@ namespace driver_bridge
         return ok;
     }
 
-    bool run_kernel_hv_detection(hv_kernel_detect_result_t& result) {
-        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        bool kernel_mode = false;
-        bool connected_snapshot = false;
-        voyager::device_t* local_device = nullptr;
-        driver_critical_fmt("run_kernel_hv_detection_state_lock_pre pid=%lu tid=%lu tick=%llu",
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(started));
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            local_device = device.get();
-            connected_snapshot = local_device && local_device->is_connected();
-            kernel_mode = g_kernel_mode && connected_snapshot;
-        }
-        driver_critical_fmt("run_kernel_hv_detection_state_lock_post kernel=%d connected=%d device=%p elapsed_ms=%llu",
-            kernel_mode ? 1 : 0,
-            connected_snapshot ? 1 : 0,
-            local_device,
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        if (!kernel_mode) {
-            driver_critical_fmt("run_kernel_hv_detection_post ok=0 err=%lu reason=no_kernel pid=%lu tid=%lu elapsed_ms=%llu",
-                static_cast<unsigned long>(GetLastError()),
-                GetCurrentProcessId(),
-                GetCurrentThreadId(),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-            return false;
-        }
-
-        driver_critical_fmt("run_kernel_hv_detection_pre pid=%lu tid=%lu tick=%llu",
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(started));
-        voyager::detail::hv_detect_result raw{};
-        SetLastError(ERROR_SUCCESS);
-        driver_critical_fmt("run_kernel_hv_detection_device_call_pre device=%p connected_snapshot=%d elapsed_ms=%llu",
-            local_device,
-            connected_snapshot ? 1 : 0,
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        bool ok = local_device->run_hv_detect(raw);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        if (ok) {
-            result.sidt_lock_prefix    = raw.sidt_lock_prefix;
-            result.sidt_invalid_pf     = raw.sidt_invalid_pf;
-            result.sidt_tlb_only       = raw.sidt_tlb_only;
-            result.sidt_timing         = raw.sidt_timing;
-            result.sidt_compat_mode    = raw.sidt_compat_mode;
-            result.sidt_noncanonical_gp = raw.sidt_noncanonical_gp;
-            result.sidt_noncanonical_ss = raw.sidt_noncanonical_ss;
-            result.sidt_cpl3_umip_off  = raw.sidt_cpl3_umip_off;
-            result.sidt_cpl3_umip_on   = raw.sidt_cpl3_umip_on;
-            result.lidt_lock_prefix    = raw.lidt_lock_prefix;
-            result.lidt_invalid_pf     = raw.lidt_invalid_pf;
-            result.lidt_tlb_only       = raw.lidt_tlb_only;
-            result.lidt_timing         = raw.lidt_timing;
-            result.lidt_noncanonical_gp = raw.lidt_noncanonical_gp;
-            result.lidt_noncanonical_ss = raw.lidt_noncanonical_ss;
-            result.lidt_cpl3_gp        = raw.lidt_cpl3_gp;
-            result.ve_trigger          = raw.ve_trigger;
-            result.ve_lbr_stack        = raw.ve_lbr_stack;
-            result.ve_xsetbv_gp        = raw.ve_xsetbv_gp;
-            result.ve_cr4_vmxe         = raw.ve_cr4_vmxe;
-            result.vmf_cpuid_vendor    = raw.vmf_cpuid_vendor;
-            result.vmf_hyperv_guest    = raw.vmf_hyperv_guest;
-            result.vmf_smbios_vm       = raw.vmf_smbios_vm;
-            result.vmf_acpi_vm         = raw.vmf_acpi_vm;
-            result.vmf_pci_vm          = raw.vmf_pci_vm;
-            result.vmf_disk_vm         = raw.vmf_disk_vm;
-            result.vmf_mac_vm          = raw.vmf_mac_vm;
-            result.vmf_registry_vm     = raw.vmf_registry_vm;
-            result.total_run           = raw.total_run;
-            result.total_failed        = raw.total_failed;
-            result.ms_hv_root          = raw.ms_hv_root;
-            result.is_virtual_machine  = raw.is_virtual_machine;
-            std::memcpy(result.vm_vendor_name, raw.vm_vendor_name, sizeof(result.vm_vendor_name));
-            std::memcpy(result.measurements_hmac, raw.measurements_hmac, sizeof(result.measurements_hmac));
-        }
-        driver_critical_fmt("run_kernel_hv_detection_post ok=%d err=%lu cpuid=%u hyperv_guest=%u smbios=%u acpi=%u pci=%u disk=%u mac=%u registry=%u total_run=%u total_failed=%u hmac_hash=0x%016llX elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned>(raw.vmf_cpuid_vendor),
-            static_cast<unsigned>(raw.vmf_hyperv_guest),
-            static_cast<unsigned>(raw.vmf_smbios_vm),
-            static_cast<unsigned>(raw.vmf_acpi_vm),
-            static_cast<unsigned>(raw.vmf_pci_vm),
-            static_cast<unsigned>(raw.vmf_disk_vm),
-            static_cast<unsigned>(raw.vmf_mac_vm),
-            static_cast<unsigned>(raw.vmf_registry_vm),
-            static_cast<unsigned>(raw.total_run),
-            static_cast<unsigned>(raw.total_failed),
-            static_cast<unsigned long long>(driver_fnv1a64(raw.measurements_hmac, sizeof(raw.measurements_hmac))),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        return ok;
-    }
-
     bool drain_debug_events(std::vector<debug_event_t>& out,
                             size_t max_events,
                             debug_event_stats_t* out_stats)
@@ -12831,48 +9169,6 @@ namespace driver_bridge
     uint64_t watchdog_last_ok_tick()
     {
         return g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire);
-    }
-
-    bool kernel_read_prologue_hash(uint64_t va, uint32_t size, uint64_t& out_hash)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            return false;
-        }
-        SetLastError(ERROR_SUCCESS);
-        return device->kernel_read_prologue_hash(va, size, out_hash);
-    }
-
-    bool query_sentinel_dispatch_guard(uint8_t& hook_detected, uint64_t& hook_target)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            return false;
-        }
-        SetLastError(ERROR_SUCCESS);
-        return device->query_sentinel_dispatch_guard(hook_detected, hook_target);
-    }
-
-    bool query_sentinel_callback_scan(uint8_t& hostile_drivers, uint8_t& modified_callbacks)
-    {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            return false;
-        }
-        SetLastError(ERROR_SUCCESS);
-        return device->query_sentinel_callback_scan(hostile_drivers, modified_callbacks);
     }
 }
 

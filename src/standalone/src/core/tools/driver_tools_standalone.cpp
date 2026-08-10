@@ -18,11 +18,9 @@
 #include "../runtime/standalone_driver.hpp"
 #include "../runtime/kernel_symbols.hpp"
 #include "../analysis/stealth_engine.hpp"
-#include "../anti-tamper/state.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../diagnostics/metadata_ring.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
-#include "../anti-tamper/self_guard.hpp"
 
 #include <Zydis/Zydis.h>
 #include "zydis_disasm.hpp"
@@ -184,8 +182,6 @@ static std::string to_lower_ascii_copy(std::string value)
 
 static bool full_test_mode_active()
 {
-    if (anti_tamper::state::get().full_test_running.load(std::memory_order_acquire))
-        return true;
     char buf[8] = {};
     DWORD n = GetEnvironmentVariableA("AIDA_FULL_TEST_RUNNING", buf, static_cast<DWORD>(sizeof(buf)));
     return n > 0 && (buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y');
@@ -811,16 +807,6 @@ static std::optional<tool_result_t> ensure_attached_process_context(const json& 
             return tool_result_t::error(OBFSTR("Failed to solve DTB for the attached process."));
     }
 
-    {
-        self_guard::self_guard_context_t sg_ctx;
-        sg_ctx.tool_name = "driver_tools";
-        sg_ctx.has_pid = true;
-        sg_ctx.target_pid = driver_bridge::attached_pid();
-        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
-        if (sg_result != self_guard::self_guard_result_t::allow)
-            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
-    }
-
     return std::nullopt;
 }
 
@@ -1188,18 +1174,6 @@ tool_result_t driver_read_pointer_chain(const json& params)
     auto ea_opt = sa_parse_address(base_address);
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address. Use address='0x...' (alias base_address is supported)."));
-
-    {
-        self_guard::self_guard_context_t sg_ctx;
-        sg_ctx.tool_name = "driver_read_pointer_chain";
-        sg_ctx.has_pid = true;
-        sg_ctx.target_pid = driver_bridge::attached_pid();
-        sg_ctx.has_address = true;
-        sg_ctx.target_address = *ea_opt;
-        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
-        if (sg_result != self_guard::self_guard_result_t::allow)
-            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
-    }
 
     std::vector<std::int64_t> offsets;
     if (params.contains("offsets") && params["offsets"].is_array())
@@ -2822,18 +2796,6 @@ tool_result_t driver_free_memory(const json& params)
 
     std::uint64_t address = static_cast<std::uint64_t>(*addr_opt);
 
-    {
-        self_guard::self_guard_context_t sg_ctx;
-        sg_ctx.tool_name = "driver_free_memory";
-        sg_ctx.has_pid = true;
-        sg_ctx.target_pid = driver_bridge::attached_pid();
-        sg_ctx.has_address = true;
-        sg_ctx.target_address = address;
-        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
-        if (sg_result != self_guard::self_guard_result_t::allow)
-            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
-    }
-
     voyager::device_t::memory_region_info before{};
     const bool query_before_free = device->query_memory(address, before);
 
@@ -2871,19 +2833,6 @@ tool_result_t driver_call_function(const json& params)
         return tool_result_t::error(OBFSTR("Invalid function address."));
 
     std::uint64_t func_addr = static_cast<std::uint64_t>(*func_opt);
-
-    {
-        self_guard::self_guard_context_t sg_ctx;
-        sg_ctx.tool_name = "driver_call_function";
-        sg_ctx.has_pid = true;
-        sg_ctx.target_pid = driver_bridge::attached_pid();
-        sg_ctx.has_address = true;
-        sg_ctx.target_address = func_addr;
-        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
-        if (sg_result != self_guard::self_guard_result_t::allow)
-            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
-    }
-
 
     const bool dry_run = params.value("dry_run", false);
     const bool unsafe_confirmed =
@@ -2984,19 +2933,6 @@ tool_result_t driver_protect_memory(const json& params)
     if (size == 0)
         return tool_result_t::error(OBFSTR("Size is required"));
 
-    {
-        self_guard::self_guard_context_t sg_ctx;
-        sg_ctx.tool_name = "driver_protect_memory";
-        sg_ctx.has_pid = true;
-        sg_ctx.target_pid = driver_bridge::attached_pid();
-        sg_ctx.has_address = true;
-        sg_ctx.target_address = address;
-        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
-        if (sg_result != self_guard::self_guard_result_t::allow)
-            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
-    }
-
-
     std::uint32_t new_protect = 0x40;
     if (params.contains("protect")) {
         if (params["protect"].is_string())
@@ -3069,18 +3005,6 @@ tool_result_t driver_set_hw_breakpoint(const json& params)
     if (params.contains("address"))
         address = sa_parse_address(params["address"].get<std::string>()).value_or(0);
     if (address == 0) return tool_result_t::error(OBFSTR("Address is required"));
-
-    {
-        self_guard::self_guard_context_t sg_ctx;
-        sg_ctx.tool_name = "driver_set_hw_breakpoint";
-        sg_ctx.has_pid = true;
-        sg_ctx.target_pid = driver_bridge::attached_pid();
-        sg_ctx.has_address = true;
-        sg_ctx.target_address = address;
-        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
-        if (sg_result != self_guard::self_guard_result_t::allow)
-            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
-    }
 
     int index = 0;
     if (params.contains("index")) index = params["index"].get<int>();
@@ -3234,19 +3158,6 @@ tool_result_t driver_virtual_to_physical(const json& params)
     if (params.contains("address"))
         vaddr = sa_parse_address(params["address"].get<std::string>()).value_or(0);
     if (vaddr == 0) return tool_result_t::error(OBFSTR("Address is required"));
-
-    {
-        self_guard::self_guard_context_t sg_ctx;
-        sg_ctx.tool_name = "driver_virtual_to_physical";
-        sg_ctx.has_pid = true;
-        sg_ctx.target_pid = driver_bridge::attached_pid();
-        sg_ctx.has_address = true;
-        sg_ctx.target_address = vaddr;
-        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
-        if (sg_result != self_guard::self_guard_result_t::allow)
-            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
-    }
-
 
     std::uint64_t paddr = device->virtual_to_physical(vaddr);
     if (paddr == 0)
@@ -6330,19 +6241,6 @@ tool_result_t driver_assemble(const json& params)
         return 0x140000000ULL;
     }();
 
-    {
-        self_guard::self_guard_context_t sg_ctx;
-        sg_ctx.tool_name = "driver_assemble";
-        sg_ctx.has_pid = true;
-        sg_ctx.target_pid = driver_bridge::attached_pid();
-        sg_ctx.has_address = true;
-        sg_ctx.target_address = address;
-        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
-        if (sg_result != self_guard::self_guard_result_t::allow)
-            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
-    }
-
-
     std::vector<std::uint8_t> output;
     std::string error_msg;
 
@@ -6670,19 +6568,6 @@ tool_result_t driver_find_references(const json& params)
     const int limit = std::min(params.value("limit", 100), 5000);
     const bool scan_code = params.value("scan_code", true);
     const bool scan_data = params.value("scan_data", true);
-
-    {
-        self_guard::self_guard_context_t sg_ctx;
-        sg_ctx.tool_name = "driver_find_references";
-        sg_ctx.has_pid = true;
-        sg_ctx.target_pid = driver_bridge::attached_pid();
-        sg_ctx.has_address = true;
-        sg_ctx.target_address = target;
-        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
-        if (sg_result != self_guard::self_guard_result_t::allow)
-            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
-    }
-
 
     std::uint8_t target_bytes[8];
     std::memcpy(target_bytes, &target, 8);
@@ -7080,19 +6965,6 @@ tool_result_t driver_set_page_guard(const json& params)
 
     const std::uint64_t target_addr = *addr_opt;
     const std::size_t size = params.value("size", 4096);
-
-    {
-        self_guard::self_guard_context_t sg_ctx;
-        sg_ctx.tool_name = "driver_set_page_guard";
-        sg_ctx.has_pid = true;
-        sg_ctx.target_pid = driver_bridge::attached_pid();
-        sg_ctx.has_address = true;
-        sg_ctx.target_address = target_addr;
-        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
-        if (sg_result != self_guard::self_guard_result_t::allow)
-            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
-    }
-
 
     if (operation == "set")
     {

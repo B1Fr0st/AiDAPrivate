@@ -12,7 +12,6 @@
 #include "../runtime/standalone_driver.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
-#include "../anti-tamper/self_guard.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -901,26 +900,6 @@ static std::string results_to_json(size_t limit = 100) {
 
 
 static tool_result_t handle_first_scan(const json& params) {
-	{
-		self_guard::self_guard_context_t sg_ctx;
-		sg_ctx.tool_name = "scanner_first_scan";
-		const std::uint32_t attached_pid = driver_bridge::attached_pid();
-		if (attached_pid != 0) {
-			sg_ctx.has_pid = true;
-			sg_ctx.target_pid = attached_pid;
-		}
-		uint64_t scan_base = 0, scan_size = 0;
-		parse_u64_param(params, "range_base", scan_base);
-		parse_u64_param(params, "range_size", scan_size);
-		if (scan_base != 0) {
-			sg_ctx.has_address = true;
-			sg_ctx.target_address = scan_base;
-		}
-		auto sg_result = self_guard::invoke_self_guard(sg_ctx);
-		if (sg_result != self_guard::self_guard_result_t::allow)
-			self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
-	}
-
 	mcp_standalone::downstream::producer_identity_t fs_id;
 	fs_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
 	fs_id.tool_name = "scanner_first_scan";
@@ -1037,19 +1016,6 @@ static tool_result_t handle_first_scan(const json& params) {
 }
 
 static tool_result_t handle_next_scan(const json& params) {
-	{
-		self_guard::self_guard_context_t sg_ctx;
-		sg_ctx.tool_name = "scanner_next_scan";
-		const std::uint32_t attached_pid = driver_bridge::attached_pid();
-		if (attached_pid != 0) {
-			sg_ctx.has_pid = true;
-			sg_ctx.target_pid = attached_pid;
-		}
-		auto sg_result = self_guard::invoke_self_guard(sg_ctx);
-		if (sg_result != self_guard::self_guard_result_t::allow)
-			self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
-	}
-
 	mcp_standalone::downstream::producer_identity_t ns_id;
 	ns_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
 	ns_id.tool_name = "scanner_next_scan";
@@ -2236,24 +2202,6 @@ static tool_result_t handle_assert_memory_type(const json& params) {
 
 static tool_result_t handle_write_value(const json& params) {
 	const std::uint32_t attached_pid = driver_bridge::attached_pid();
-	{
-		self_guard::self_guard_context_t sg_ctx;
-		sg_ctx.tool_name = "scanner_write_value";
-		if (attached_pid != 0) {
-			sg_ctx.has_pid = true;
-			sg_ctx.target_pid = attached_pid;
-		}
-		if (params.contains("address") && params["address"].is_string()) {
-			auto parsed = sa_parse_address(params["address"].get<std::string>());
-			if (parsed) {
-				sg_ctx.has_address = true;
-				sg_ctx.target_address = *parsed;
-			}
-		}
-		auto sg_result = self_guard::invoke_self_guard(sg_ctx);
-		if (sg_result != self_guard::self_guard_result_t::allow)
-			self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
-	}
 	driver_bridge::identity::live_target_identity_t authorized_identity;
 	std::string identity_error;
 	const bool identity_captured = attached_pid != 0 &&

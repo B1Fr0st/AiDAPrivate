@@ -62,11 +62,6 @@ PVOID g_DriverLoadAddress = nullptr;
 WCHAR g_DonorCopyPath[520] = { 0 };
 WCHAR g_DonorSignerName[256] = { 0 };
 
-
-WCHAR g_SentinelServicePath[128] = { 0 };
-PVOID g_SentinelLoadAddress = nullptr;
-ULONG g_SentinelImageSize = 0;
-
 WCHAR g_ShadowFsServicePath[128] = { 0 };
 
 static ULONG_PTR g_LastPatchListHead = 0;

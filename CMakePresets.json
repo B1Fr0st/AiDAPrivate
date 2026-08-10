@@ -4,8 +4,8 @@
   "configurePresets": [
     {
       "name": "ninja-msvc-release",
-      "displayName": "Ninja + MSVC + sccache (RELEASE, full protector)",
-      "description": "Canonical production build. Ninja drives the build graph (single-graph parallelism beats per-vcxproj /m), sccache caches every .obj keyed on preprocessed input (second clean rebuild is mostly cache hits), /Z7 embeds debug info via CMP0141 (no mspdbsrv.exe serialization). The AiDAProtector POST_BUILD step runs on every end-user binary (AiDAStandalone.exe, aida_core.dll, AiDA.dll). This is the only supported build configuration. Run from a 'x64 Native Tools Command Prompt for VS 2022' so cl.exe is on PATH, or use the VS Code task which calls vcvars64.bat first.",
+      "displayName": "Ninja + MSVC + sccache (RELEASE)",
+      "description": "Canonical production build. Ninja drives the build graph (single-graph parallelism beats per-vcxproj /m), sccache caches every .obj keyed on preprocessed input (second clean rebuild is mostly cache hits), /Z7 embeds debug info via CMP0141 (no mspdbsrv.exe serialization). This is the only supported build configuration. Run from a 'x64 Native Tools Command Prompt for VS 2022' so cl.exe is on PATH, or use the VS Code task which calls vcvars64.bat first.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build-ninja",
       "cacheVariables": {
@@ -15,7 +15,6 @@
         "CMAKE_MAKE_PROGRAM": "C:/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe",
         "AIDA_ENABLE_LTCG": "OFF",
         "AIDA_FAST_LINK":   "ON",
-        "AIDA_REGENERATE_LEGACY_DRIVER_MAPPER_FROM_BINARY": "ON",
         "AIDA_CAMOUFOX_BUILD_REVERSE_MCP_EXE": "ON",
         "AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS": "ON"
       },

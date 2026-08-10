@@ -31,10 +31,6 @@ namespace ida_utils
     qstring apply_renames_from_ai(ea_t func_ea, const std::string& cpp_code);
 
     std::string get_binary_metadata();
-    bool is_self_target_database();
-    bool idb_is_aida_binary();
-    void compute_self_identity();
-    bool get_self_sha256(uint8_t out[32]);
     std::string get_imports_for_function(ea_t ea);
     std::string get_type_context_for_function(ea_t ea);
     nlohmann::json get_rag_context(ea_t ea, const settings_t& settings, const nlohmann::json* cached_context = nullptr);

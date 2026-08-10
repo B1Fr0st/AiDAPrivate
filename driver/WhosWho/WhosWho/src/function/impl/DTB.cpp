@@ -52,7 +52,7 @@ NTSTATUS functions::handle777d(p_dtb_solve request) {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
     PEPROCESS process = nullptr;
 
-    status = stack_spoof::spoofed_PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)request->pid, &process);
+    status = _PsLookupProcessByProcessId ? _PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)request->pid, &process) : STATUS_NOT_SUPPORTED;
     if (!NT_SUCCESS(status) || !process) {
         WW_LOG("DTB_RESOLVE_FAIL pid=%u status=0x%08X reason=PsLookupProcessByProcessId_failed", request->pid, static_cast<ULONG>(status));
         return status;
@@ -65,11 +65,11 @@ NTSTATUS functions::handle777d(p_dtb_solve request) {
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         WW_LOG("DTB_RESOLVE_FAIL pid=%u status=STATUS_ACCESS_VIOLATION reason=dir_base_read_exception offset=0x%llX", request->pid, static_cast<unsigned long long>(KPROCESS_DIRECTORYTABLEBASE_OFFSET));
-        stack_spoof::spoofed_ObfDereferenceObject(process);
+        if (_ObfDereferenceObject) _ObfDereferenceObject(process);
         return STATUS_ACCESS_VIOLATION;
     }
 
-    stack_spoof::spoofed_ObfDereferenceObject(process);
+    if (_ObfDereferenceObject) _ObfDereferenceObject(process);
 
     if (dir_base != 0 && dtb_guard::is_valid_dtb(dir_base)) {
         request->dtb = dir_base & 0x000FFFFFFFFFF000ULL;

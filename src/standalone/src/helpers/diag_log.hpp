@@ -21,8 +21,6 @@
 #include <vector>
 #include <process.h>
 
-#include "../core/runtime/manual_map_tls.hpp"
-
 #if defined(_M_X64)
 #include <intrin.h>
 #endif
@@ -949,7 +947,6 @@ inline async_log_stats_t async_log_stats()
 
 inline unsigned __stdcall async_log_thread_main(void*)
 {
-    aida::manual_map_tls::ensure_current_thread();
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     std::uint64_t last_metric_summary_ms = 0;
     for (;;) {
@@ -1105,7 +1102,6 @@ inline bool sync_critical_tag(const char* tag)
 
 inline void log_tagged_direct(const char* tag, const char* msg, bool force)
 {
-    aida::manual_map_tls::ensure_current_thread();
     std::lock_guard<std::mutex> lk(log_file_mutex());
     HANDLE hf = get_cached_log_handle();
     if (hf == INVALID_HANDLE_VALUE) return;
@@ -1119,7 +1115,6 @@ inline void log_tagged_direct(const char* tag, const char* msg, bool force)
 
 inline void log_tagged_async_or_direct(const char* tag, const char* msg, bool force)
 {
-    aida::manual_map_tls::ensure_current_thread();
     if (force && sync_critical_tag(tag)) {
         log_tagged_direct(tag, msg, true);
         return;
@@ -1203,7 +1198,6 @@ inline void log_tagged_critical_fmt(const char* tag, const char* fmt, ...)
 
 inline bool write_crash_log(const char* msg, bool append = false)
 {
-    aida::manual_map_tls::ensure_current_thread();
     HANDLE hf = open_log_handle("aida_crash.log",
         append ? (FILE_APPEND_DATA | SYNCHRONIZE) : (GENERIC_WRITE | SYNCHRONIZE),
         append ? OPEN_ALWAYS : CREATE_ALWAYS,

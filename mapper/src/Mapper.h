@@ -294,11 +294,6 @@ extern PVOID g_DriverLoadAddress;
 extern WCHAR g_DonorCopyPath[520];
 extern WCHAR g_DonorSignerName[256];
 
-
-extern WCHAR g_SentinelServicePath[128];
-extern PVOID g_SentinelLoadAddress;
-extern ULONG g_SentinelImageSize;
-
 extern WCHAR g_ShadowFsServicePath[128];
 
 namespace Utils {
@@ -348,14 +343,14 @@ namespace VulnDriver {
 }
 
 namespace MapperCore {
-    NTSTATUS TriggerExploit(PCWSTR targetDriverFileName, PCWSTR sentinelDriverFileName = nullptr,
-                            PCWSTR shadowFsDriverFileName = nullptr);
-    NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath, PCWSTR sentinelPath = nullptr,
+    NTSTATUS TriggerExploit(PCWSTR targetDriverFileName,
+                            PCWSTR shadowFsDriverFileName = nullptr, PCWSTR targetDriverFullPath = nullptr,
+                            PCWSTR shadowFsDriverFullPath = nullptr,
+                            PCWSTR loaderDriverFullPath = nullptr);
+    NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath,
                             PCWSTR shadowFsPath = nullptr);
     NTSTATUS RestoreCiCallback(HANDLE device);
     NTSTATUS CleanupArtifacts();
-    BOOL WriteSentinelGlobals(HANDLE device, PVOID sentinelBase, ULONG sentinelImageSize,
-                              PVOID whoswhoBase, ULONG whoswhoImageSize);
 }
 
 namespace SignedMemory {

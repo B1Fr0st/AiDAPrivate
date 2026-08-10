@@ -10,7 +10,7 @@ namespace test_all_features {
 	bool trigger_from_hotkey(const char* source);
 	void cancel_tests();
 	void begin_test_guard(const char* source);
-	void end_test_guard(const char* source, bool arm_post_suppression = true);
+	void end_test_guard(const char* source);
 	void render_overlay(float vw, float vh);
 	bool is_running();
 	bool is_unattended_full_test_active();

@@ -1,7 +1,6 @@
 #include "../Functions.h"
 #include "../../imports/Defs.h"
 #include "driver/Strong.h"
-#include <Crypter.h>
 #include <stddef.h>
 #include <intrin.h>
 

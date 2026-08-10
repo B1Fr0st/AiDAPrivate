@@ -5441,7 +5441,7 @@ bool AutoResponder::start() {
 
     if (!kernel_session_ok) {
         diag::log_tagged_critical_fmt("net_sec",
-            "AutoResponder::start rejected session_invalidated reason=%.96s tid=%lu",
+            "AutoResponder::start rejected session_unavailable reason=%.96s tid=%lu",
             session_reason.empty() ? "kernel_session_unavailable" : session_reason.c_str(),
             static_cast<unsigned long>(entry_tid));
         return false;

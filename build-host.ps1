@@ -223,17 +223,14 @@ if (-not [string]::IsNullOrWhiteSpace($env:AIDA_BUILD_JOBS)) {
 
 if ($Drivers) {
     $driverParts = @(
-        "(if not exist build-ninja\Release mkdir build-ninja\Release)",
-        "driver\Sentinel\nuget.exe restore driver\Sentinel\Sentinel.sln",
-        "driver\Sentinel\nuget.exe restore driver\WhosWho\WhosWho.sln"
+        "(if not exist build-ninja\Release mkdir build-ninja\Release)"
     )
+    if (Get-Command nuget.exe -ErrorAction SilentlyContinue) {
+        $driverParts += "nuget.exe restore driver\WhosWho\WhosWho.sln"
+    }
     if ($CleanDrivers) {
-        $driverParts += "msbuild mapper\WindMapper.sln /t:Clean /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
-        $driverParts += "msbuild driver\Sentinel\Sentinel.sln /t:Clean /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
         $driverParts += "msbuild driver\WhosWho\WhosWho.sln /t:Clean /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
     }
-    $driverParts += "msbuild mapper\WindMapper.sln /t:Build /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
-    $driverParts += "msbuild driver\Sentinel\Sentinel.sln /t:Build /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
     $driverParts += "msbuild driver\WhosWho\WhosWho.sln /t:Build /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
     $steps.Add((New-Step "drivers" ($driverParts -join " && ") "driver.log" (Join-Path $env:TEMP "aida_driver_build_out.txt")))
 }
@@ -243,7 +240,7 @@ if ($Configure) {
 }
 
 if ($Drivers) {
-    $steps.Add((New-Step "driver-stamps" "cmake -E remove build-ninja\whoswho_encrypted.stamp build-ninja\sentinel_encrypted.stamp build-ninja\windmapper_encrypted.stamp" "driver-stamps.log" (Join-Path $env:TEMP "aida_driver_stamps_out.txt")))
+    $steps.Add((New-Step "driver-stamps" "cmake -E remove build-ninja\whoswho_embedded.stamp" "driver-stamps.log" (Join-Path $env:TEMP "aida_driver_stamps_out.txt")))
 }
 
 $steps.Add((New-Step "build" "cmake --build --preset $Preset$BuildParallelArg" "build.log" (Join-Path $env:TEMP "aida_build_out.txt")))

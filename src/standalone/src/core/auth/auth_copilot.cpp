@@ -167,7 +167,7 @@ std::string last_error()
 #include "auth_store.hpp"
 #include "auth_http.hpp"
 #include "auth_browser_launch.hpp"
-#include "anti-tamper/webhook.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <windows.h>
 
@@ -203,7 +203,7 @@ namespace copilot {
 			last_error_ref() = text;
 			if (!text.empty()) {
 				const std::string line = std::string("[aida.auth.copilot] ") + text;
-				anti_tamper::webhook::write_log("auth.copilot", line.c_str());
+				diag::log_tagged("auth.copilot", line.c_str());
 			}
 		}
 
@@ -671,7 +671,7 @@ namespace copilot {
 		(void)access_token;
 		(void)refresh_token_value;
 		(void)client_id_override;
-		anti_tamper::webhook::write_log("auth.copilot",
+		diag::log_tagged("auth.copilot",
 			"[aida.auth.copilot] revoke_tokens: GitHub does not support per-token "
 			"revocation without an OAuth app client secret; skipping server-side "
 			"revoke and proceeding with local clear");

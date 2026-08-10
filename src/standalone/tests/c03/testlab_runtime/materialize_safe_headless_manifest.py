@@ -38,10 +38,10 @@ EXPECTED_RESOURCE_POLICY_CASES = {
 ALLOWED_CATEGORIES = {
     "contract", "fixture", "provider", "layout", "store", "scheduler",
     "reader", "container", "decode", "recovery", "query", "persistence", "decompiler",
-    "worker", "mcp", "workbench", "performance", "surface", "security",
+    "worker", "mcp", "workbench", "performance", "surface",
 }
 REQUIRED_REQUIREMENTS = (
-    {"SURF-01", "SEC-01", "DEP-02", "VER-02"}
+    {"SURF-01", "DEP-02"}
     | {f"PERF-{index:02d}" for index in range(1, 11)}
     | {f"FMT-{index:02d}" for index in range(1, 4)}
     | {f"ARCH-{index:02d}" for index in range(1, 3)}

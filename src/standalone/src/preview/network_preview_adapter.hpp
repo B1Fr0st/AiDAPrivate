@@ -7,10 +7,6 @@ namespace network_view {
 struct state_t;
 }
 
-namespace standalone_license {
-bool is_valid();
-}
-
 namespace aida::preview::network {
 
 void initialize(network_view::state_t& state);

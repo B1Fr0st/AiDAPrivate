@@ -166,7 +166,7 @@ std::string last_error()
 #include "auth_codex.hpp"
 
 #include "auth_store.hpp"
-#include "anti-tamper/webhook.hpp"
+#include "../../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
 
 #include <winsock2.h>
@@ -219,7 +219,7 @@ namespace codex {
 			last_error_ref() = text;
 			if (!text.empty()) {
 				const std::string line = std::string("[aida.auth.codex] ") + text;
-				anti_tamper::webhook::write_log("auth.codex", line.c_str());
+				diag::log_tagged("auth.codex", line.c_str());
 			}
 		}
 
@@ -823,7 +823,7 @@ namespace codex {
 			}
 			dispatch_listener_cancel(ctx);
 			if (!ctx->worker_done.load(std::memory_order_acquire))
-				anti_tamper::webhook::write_log("auth.codex",
+				diag::log_tagged("auth.codex",
 					"[aida.auth.codex] listener task retained until socket-close cancellation completes");
 		}
 

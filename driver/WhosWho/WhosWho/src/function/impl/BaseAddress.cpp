@@ -37,22 +37,20 @@ NTSTATUS functions::handle777f(p_base_address request) {
     base_guard::timing_scatter();
 
     PEPROCESS process = nullptr;
-    NTSTATUS status = stack_spoof::spoofed_PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)request->pid, &process);
+    NTSTATUS status = _PsLookupProcessByProcessId ? _PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)request->pid, &process) : STATUS_NOT_SUPPORTED;
 
     if (!NT_SUCCESS(status) || !process) {
         return status;
     }
 
-    stack_spoof::pre_call_setup();
+    if (!_PsGetProcessSectionBaseAddress) {
+        if (_ObfDereferenceObject) _ObfDereferenceObject(process);
+        return STATUS_NOT_SUPPORTED;
+    }
 
-    volatile auto func = _PsGetProcessSectionBaseAddress;
-    KeMemoryBarrier();
+    const ULONGLONG image_base = (ULONGLONG)_PsGetProcessSectionBaseAddress(process);
 
-    const ULONGLONG image_base = (ULONGLONG)func(process);
-
-    stack_spoof::post_call_cleanup();
-
-    stack_spoof::spoofed_ObfDereferenceObject(process);
+    if (_ObfDereferenceObject) _ObfDereferenceObject(process);
 
     if (!image_base) {
         return STATUS_NOT_FOUND;

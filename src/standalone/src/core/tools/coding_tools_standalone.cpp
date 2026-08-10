@@ -11,7 +11,6 @@
 #include "mcp_standalone.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "standalone_tools_fwd.hpp"
-#include "standalone_license.hpp"
 #include "standalone_settings.hpp"
 #include "auto_approval.hpp"
 #include "event_bus.hpp"
@@ -122,31 +121,11 @@ static bool path_within_workspace(const std::string& canonical_path)
     return p_str.find(ws_str) == 0;
 }
 
-static bool ensure_coding_tool_runtime(const char* tool_name, tool_result_t& out)
-{
-    uint64_t gt = standalone_license::inline_gate_check(
-        standalone_license::gate_coding_tool_exec);
-    if (!standalone_license::verify_tool_runtime(
-            standalone_license::gate_coding_tool_exec, gt, tool_name)) {
-        out = tool_result_t::error("Service unavailable.");
-        return false;
-    }
-    return true;
-}
-
-
 static tool_result_t tool_read_file(const json& params)
 {
     diag::log_tagged_fmt("coding", "read_file entry path='%.120s'",
         params.contains("path") && params["path"].is_string()
             ? params["path"].get<std::string>().c_str() : "");
-    tool_result_t gate_error;
-    if (!ensure_coding_tool_runtime("read_file", gate_error))
-    {
-        diag::log_tagged_fmt("coding", "read_file gate fail");
-        return gate_error;
-    }
-
     if (!params.contains("path") || !params["path"].is_string())
     {
         diag::log_tagged_fmt("coding", "read_file missing path");
@@ -243,13 +222,6 @@ static tool_result_t tool_write_file(const json& params)
     diag::log_tagged_fmt("coding", "write_file entry path='%.120s'",
         params.contains("path") && params["path"].is_string()
             ? params["path"].get<std::string>().c_str() : "");
-    tool_result_t gate_error;
-    if (!ensure_coding_tool_runtime("write_file", gate_error))
-    {
-        diag::log_tagged_fmt("coding", "write_file gate fail");
-        return gate_error;
-    }
-
     if (!params.contains("path") || !params["path"].is_string())
     {
         diag::log_tagged_fmt("coding", "write_file missing path");
@@ -312,13 +284,6 @@ static tool_result_t tool_edit_file(const json& params)
     diag::log_tagged_fmt("coding", "edit_file entry path='%.120s'",
         params.contains("path") && params["path"].is_string()
             ? params["path"].get<std::string>().c_str() : "");
-    tool_result_t gate_error;
-    if (!ensure_coding_tool_runtime("edit_file", gate_error))
-    {
-        diag::log_tagged_fmt("coding", "edit_file gate fail");
-        return gate_error;
-    }
-
     if (!params.contains("path") || !params["path"].is_string())
     {
         diag::log_tagged_fmt("coding", "edit_file missing path");
@@ -418,13 +383,6 @@ static tool_result_t tool_list_directory(const json& params)
     diag::log_tagged_fmt("coding", "list_directory entry path='%.120s'",
         params.contains("path") && params["path"].is_string()
             ? params["path"].get<std::string>().c_str() : "");
-    tool_result_t gate_error;
-    if (!ensure_coding_tool_runtime("list_directory", gate_error))
-    {
-        diag::log_tagged_fmt("coding", "list_directory gate fail");
-        return gate_error;
-    }
-
     std::string path;
     if (params.contains("path") && params["path"].is_string())
         path = sanitize_path(params["path"].get<std::string>());
@@ -487,13 +445,6 @@ static tool_result_t tool_search_workspace(const json& params)
     diag::log_tagged_fmt("coding", "search_workspace entry query='%.80s'",
         params.contains("query") && params["query"].is_string()
             ? params["query"].get<std::string>().c_str() : "");
-    tool_result_t gate_error;
-    if (!ensure_coding_tool_runtime("search_workspace", gate_error))
-    {
-        diag::log_tagged_fmt("coding", "search_workspace gate fail");
-        return gate_error;
-    }
-
     if (!params.contains("query") || !params["query"].is_string())
     {
         diag::log_tagged_fmt("coding", "search_workspace missing query");
@@ -691,13 +642,6 @@ static tool_result_t tool_run_command(const json& params)
     diag::log_tagged_fmt("coding", "run_command entry cmd='%.120s'",
         params.contains("command") && params["command"].is_string()
             ? params["command"].get<std::string>().c_str() : "");
-    tool_result_t gate_error;
-    if (!ensure_coding_tool_runtime("run_command", gate_error))
-    {
-        diag::log_tagged_fmt("coding", "run_command gate fail");
-        return gate_error;
-    }
-
     if (!params.contains("command") || !params["command"].is_string())
     {
         diag::log_tagged_fmt("coding", "run_command missing command");
@@ -1163,13 +1107,6 @@ static tool_result_t tool_cancel_command(const json& params)
     diag::log_tagged_fmt("coding", "cancel_command entry session_id='%s'",
         params.contains("session_id") && params["session_id"].is_string()
             ? params["session_id"].get<std::string>().c_str() : "");
-    tool_result_t gate_error;
-    if (!ensure_coding_tool_runtime("cancel_command", gate_error))
-    {
-        diag::log_tagged_fmt("coding", "cancel_command gate fail");
-        return gate_error;
-    }
-
     if (!params.contains("session_id") || !params["session_id"].is_string())
     {
         diag::log_tagged_fmt("coding", "cancel_command missing session_id");
@@ -1270,13 +1207,6 @@ static tool_result_t tool_cancel_command(const json& params)
 static tool_result_t tool_list_commands(const json& /*params*/)
 {
     diag::log_tagged_fmt("coding", "list_commands entry");
-    tool_result_t gate_error;
-    if (!ensure_coding_tool_runtime("list_commands", gate_error))
-    {
-        diag::log_tagged_fmt("coding", "list_commands gate fail");
-        return gate_error;
-    }
-
     auto ids = command_sessions::list_sessions();
     diag::log_tagged_fmt("coding", "list_commands session_count=%zu", ids.size());
 

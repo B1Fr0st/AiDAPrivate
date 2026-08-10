@@ -81,19 +81,6 @@ bool failure_retention_state(task_state_t state_value) {
     return failure_state(state_value) || state_value == task_state_t::cancelled;
 }
 
-bool protected_job_identity(const std::string& owner, const std::string& label) {
-    std::string identity = owner + " " + label;
-    std::transform(identity.begin(), identity.end(), identity.begin(),
-        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    static const char* protected_markers[] = {
-        "license", "arc", "integrity", "heartbeat", "sentinel", "anti-tamper", "security_liveness"
-    };
-    for (const char* marker : protected_markers)
-        if (identity.find(marker) != std::string::npos)
-            return true;
-    return false;
-}
-
 std::string bounded_redacted(std::string value, std::size_t limit = 256) {
     for (char& ch : value) {
         const unsigned char byte = static_cast<unsigned char>(ch);
@@ -364,8 +351,6 @@ static bool register_task_impl(task_registration_t registration,
     record.snapshot.progress = registration.progress;
     record.snapshot.state = registration.started_ms != 0 ? task_state_t::running : task_state_t::queued;
     record.snapshot.security_critical = registration.security_critical;
-    record.snapshot.security_critical = record.snapshot.security_critical ||
-        protected_job_identity(record.snapshot.owner, record.snapshot.label);
     record.callbacks = std::move(registration.callbacks);
     record.runtime_job_id = runtime_job_id;
     record.explicit_registration = true;
@@ -404,7 +389,7 @@ bool register_taskflow_job(aida::infra::taskflow_runtime::job_handle_t handle,
     if (registration.source.empty())
         registration.source = "taskflow";
     if (registration.cancellation_is_safe && !registration.security_critical &&
-        !protected_job_identity(registration.owner, registration.label) && !registration.callbacks.cancel)
+        !registration.callbacks.cancel)
         registration.callbacks.cancel = [handle] { return aida::infra::taskflow_runtime::cancel(handle.id); };
     return register_task_impl(std::move(registration), handle.id, false);
 }
@@ -416,7 +401,7 @@ bool register_executor_job(std::uint64_t task_id, task_registration_t registrati
     if (registration.id.empty())
         registration.id = runtime_id(task_id);
     if (registration.cancellation_is_safe && !registration.security_critical &&
-        !protected_job_identity(registration.owner, registration.label) && !registration.callbacks.cancel)
+        !registration.callbacks.cancel)
         registration.callbacks.cancel = [task_id] { return aida::infra::executor::cancel(task_id); };
     return register_taskflow_job({task_id}, std::move(registration));
 }
@@ -428,7 +413,6 @@ bool try_register_executor_job(std::uint64_t task_id, task_registration_t regist
     if (registration.id.empty())
         registration.id = runtime_id(task_id);
     if (registration.cancellation_is_safe && !registration.security_critical &&
-        !protected_job_identity(registration.owner, registration.label) &&
         !registration.callbacks.cancel)
         registration.callbacks.cancel = [task_id] { return aida::infra::executor::cancel(task_id); };
     return register_task_impl(std::move(registration), task_id, true);
@@ -450,7 +434,7 @@ bool register_analysis_task(std::shared_ptr<aida::analysis::analysis_scheduler_t
     registration.queued_ms = initial.task.submitted_milliseconds;
     registration.started_ms = initial.task.started_milliseconds;
     if (registration.cancellation_is_safe && !registration.security_critical &&
-        !protected_job_identity(registration.owner, registration.label) && !registration.callbacks.cancel)
+        !registration.callbacks.cancel)
         registration.callbacks.cancel = [scheduler, task_id] {
             const auto result = scheduler->cancel_task(task_id);
             return result.error.ok() && (result.queued_cancelled != 0 || result.active_signalled != 0);

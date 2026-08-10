@@ -36,7 +36,6 @@
 #include "../../preview/shell_preview_platform.hpp"
 #include "../../preview/studio_semantics.hpp"
 #else
-#include "../anti-tamper/webhook.hpp"
 #include "../helpers/diag_log.hpp"
 #endif
 #include "../ui/theme.hpp"
@@ -1114,7 +1113,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		if (aida::ui::button("Build Pointer Map", aida::ui::button_kind_t::primary,
 				aida::ui::size_t_::md, ImVec2(field_w, 0.f), !live_now)) {
-			anti_tamper::webhook::write_log("scan_audit",
+			diag::log_tagged("scan_audit",
 				"[scan_audit] pointer_scanner build_reverse_map");
 			pointer_scanner::build_reverse_map();
 		}
@@ -1141,7 +1140,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			const char* p = st.addr_buf;
 			if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
 			st.config.target_address = strtoull(p, nullptr, 16);
-			anti_tamper::webhook::write_log("scan_audit",
+			diag::log_tagged("scan_audit",
 				"[scan_audit] pointer_scanner scan_chains");
 			pointer_scanner::start_scan();
 		}
@@ -1163,7 +1162,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (aida::ui::button("Validate All", aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md, ImVec2(field_w, 0.f),
 				scanning || building || validating || !live_now)) {
-			anti_tamper::webhook::write_log("scan_audit",
+			diag::log_tagged("scan_audit",
 				"[scan_audit] pointer_scanner validate_all");
 			pointer_scanner::validate_all_results();
 		}

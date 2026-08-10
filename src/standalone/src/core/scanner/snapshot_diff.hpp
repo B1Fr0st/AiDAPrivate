@@ -32,7 +32,6 @@
 #include "../../preview/scan_preview_runtime.hpp"
 #else
 #include "standalone_driver.hpp"
-#include "../anti-tamper/webhook.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../helpers/win32_dialog.hpp"
 #include "../infra/executor.hpp"
@@ -1199,7 +1198,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		const char* lbl = taking ? "Capturing..." : "Take Snapshot";
 		if (aida::ui::button(lbl, aida::ui::button_kind_t::primary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), busy || !live_attach, nullptr, taking)) {
-			anti_tamper::webhook::write_log("scan_audit",
+			diag::log_tagged("scan_audit",
 				"[scan_audit] snapshot_diff take_snapshot");
 			take_snapshot();
 		}
@@ -1225,7 +1224,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		const char* lbl = comparing ? "Comparing..." : "Compare";
 		if (aida::ui::button(lbl, aida::ui::button_kind_t::primary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !can_compare, nullptr, comparing)) {
-			anti_tamper::webhook::write_log("scan_audit",
+			diag::log_tagged("scan_audit",
 				"[scan_audit] snapshot_diff compare");
 			compare_snapshots(selected_snapshot_a, selected_snapshot_b);
 		}

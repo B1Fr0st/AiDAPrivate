@@ -11,9 +11,6 @@
 #endif
 
 #include "globals.h"
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-#include "standalone_license.hpp"
-#endif
 #include "hex_view.hpp"
 #include "image_view.hpp"
 #include "analysis_session.hpp"
@@ -1345,16 +1342,6 @@ void open_path(const std::string& path)
         aida::ui::application_views::open_or_focus(
             aida::ui::stable_view_id_t("view.project_explorer"));
         return;
-    }
-
-    {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_file_browser_open);
-        if (standalone_license::verify_gate_token(
-                standalone_license::gate_file_browser_open, gt) < 0.5) {
-            diag::log_tagged_fmt("file_browser", "open_path denied path=%s reason=gate", path.c_str());
-            return;
-        }
     }
 
     std::string fname;

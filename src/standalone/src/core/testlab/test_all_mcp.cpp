@@ -50,7 +50,6 @@
 #include "../infra/executor.hpp"
 #include "../infra/taskflow_runtime.hpp"
 #include "../runtime/standalone_driver.hpp"
-#include "../runtime/standalone_license.hpp"
 #include "../scanner/crypto_scanner.hpp"
 #include "../scanner/memory_scanner.hpp"
 #include "../ui/ui_thread_dispatcher.hpp"
@@ -1346,36 +1345,12 @@ namespace {
                 }
                 if (test_bytes == 0) {
                     log_msg(hf, tag,
-                        "WARN -- restore_mcp_target kernel_ioctl_probe_failed attempt=%d pid=%u test_addr=0x%016llX test_bytes=%zu bridge_alive=%d triggering force_relay_now_blocking",
+                        "WARN -- restore_mcp_target kernel_ioctl_probe_failed attempt=%d pid=%u test_addr=0x%016llX test_bytes=%zu bridge_alive=%d",
                         attempt,
                         target_pid,
                         static_cast<unsigned long long>(test_read_addr),
                         test_bytes,
                         bridge_alive ? 1 : 0);
-                    const bool relay_ok = standalone_license::force_relay_now_blocking(2000);
-                    log_msg(hf, tag,
-                        "INFO -- restore_mcp_target relay_recovery attempt=%d pid=%u relay_ok=%d status=\"%s\" last_error=\"%s\"",
-                        attempt,
-                        target_pid,
-                        relay_ok ? 1 : 0,
-                        driver_bridge::status().c_str(),
-                        driver_bridge::last_error().c_str());
-                    if (relay_ok) {
-                        std::vector<uint8_t> retry_buf;
-                        const bool retry_read_ok = driver_bridge::read_memory(test_read_addr, 16, retry_buf);
-                        test_bytes = retry_read_ok ? retry_buf.size() : 0;
-                        log_msg(hf, tag,
-                            "INFO -- restore_mcp_target relay_recovery_retry attempt=%d pid=%u test_addr=0x%016llX retry_bytes=%zu ok=%d",
-                            attempt,
-                            target_pid,
-                            static_cast<unsigned long long>(test_read_addr),
-                            test_bytes,
-                            retry_read_ok ? 1 : 0);
-                    }
-                    if (test_bytes > 0) {
-                        g_mcp_target_unavailable = false;
-                        return true;
-                    }
                 } else {
                     g_mcp_target_unavailable = false;
                     return true;
@@ -1386,7 +1361,7 @@ namespace {
         std::string kernel_session_reason;
         const bool kernel_session_ok = driver_bridge::kernel_session_available(&kernel_session_reason);
         log_msg(hf, tag,
-            "FAIL -- restore_mcp_target_all_attempts_failed pid=%u kernel_session_available=%d kernel_session_reason=\"%s\" driver_status=\"%s\" driver_last_error=\"%s\" hint=run relay-keepalive recovery via force_relay_now_blocking",
+            "FAIL -- restore_mcp_target_all_attempts_failed pid=%u kernel_session_available=%d kernel_session_reason=\"%s\" driver_status=\"%s\" driver_last_error=\"%s\"",
             target_pid,
             kernel_session_ok ? 1 : 0,
             kernel_session_reason.c_str(),
@@ -16191,8 +16166,8 @@ namespace {
         return WaitForSingleObject(event_handle, 0);
     }
 
-    std::string find_network_hook_sidecar_path(bool protected_mode) {
-        const char* exe = protected_mode ? "AiDA_NetworkHookSidecar_Protected.exe" : "AiDA_NetworkHookSidecar.exe";
+    std::string find_network_hook_sidecar_path() {
+        const char* exe = "AiDA_NetworkHookSidecar.exe";
         const std::string self = get_self_path_narrow();
         const std::string dir = dirname_narrow(self);
         const std::string parent = dirname_narrow(dir);
@@ -16237,9 +16212,9 @@ namespace {
         return true;
     }
 
-    bool launch_network_hook_sidecar(HANDLE hf, const char* tag, bool protected_mode, network_hook_sidecar_proc_t& proc) {
-        proc.mode = protected_mode ? "protected" : "plain";
-        proc.exe_path = find_network_hook_sidecar_path(protected_mode);
+    bool launch_network_hook_sidecar(HANDLE hf, const char* tag, network_hook_sidecar_proc_t& proc) {
+        proc.mode = "plain";
+        proc.exe_path = find_network_hook_sidecar_path();
         if (proc.exe_path.empty()) {
             log_msg(hf, tag, "SKIP -- %s sidecar executable not found", proc.mode.c_str());
             return false;
@@ -17113,8 +17088,8 @@ namespace {
         failed
     };
 
-    sidecar_case_result_t run_network_hook_sidecar_e2e(HANDLE hf, bool protected_mode) {
-        const char* tag = protected_mode ? "mcp.network_hooks.sidecar.protected" : "mcp.network_hooks.sidecar.plain";
+    sidecar_case_result_t run_network_hook_sidecar_e2e(HANDLE hf) {
+        const char* tag = "mcp.network_hooks.sidecar.plain";
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "SKIP -- kernel driver is required for remote page-guard and hardware-breakpoint capture");
             return sidecar_case_result_t::failed;
@@ -17239,7 +17214,7 @@ namespace {
             return sidecar_case_result_t::failed;
         };
 
-        if (!launch_network_hook_sidecar(hf, tag, protected_mode, proc)) {
+        if (!launch_network_hook_sidecar(hf, tag, proc)) {
             close_network_hook_sidecar(hf, tag, proc, true);
             return sidecar_case_result_t::failed;
         }
@@ -17352,13 +17327,12 @@ namespace {
 
         std::string pg_aggregate;
         sidecar_capture_coverage_t pg_coverage;
-        const size_t required_pg_iterations = protected_mode ? 2 : 3;
+        const size_t required_pg_iterations = 3;
         const bool pg_seen = wait_page_guard_marker_coverage(hf, tag, page_guard_session, "AIDA_PG_SNIFF_DETERMINISTIC_BUFFER", required_pg_iterations, 20000, pg_aggregate, pg_coverage);
 
-        const DWORD sidecar_done_timeout_ms = protected_mode ? (pg_seen ? 30000UL : 8000UL) : 90000UL;
-        log_msg(hf, tag, "DONE-WAIT-BEGIN -- timeout_ms=%lu protected=%d pg_seen=%d captures=%zu iterations=%zu output_len=%zu",
+        const DWORD sidecar_done_timeout_ms = 90000UL;
+        log_msg(hf, tag, "DONE-WAIT-BEGIN -- timeout_ms=%lu pg_seen=%d captures=%zu iterations=%zu output_len=%zu",
             static_cast<unsigned long>(sidecar_done_timeout_ms),
-            protected_mode ? 1 : 0,
             pg_seen ? 1 : 0,
             pg_coverage.captures,
             pg_coverage.iterations.size(),
@@ -29514,16 +29488,7 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
 
     void test_network_hook_sidecar_plain_e2e(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
-        const sidecar_case_result_t result = run_network_hook_sidecar_e2e(hf, false);
-        if (result == sidecar_case_result_t::passed)
-            passed.fetch_add(1);
-        else
-            failed.fetch_add(1);
-    }
-
-    void test_network_hook_sidecar_protected_e2e(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const sidecar_case_result_t result = run_network_hook_sidecar_e2e(hf, true);
+        const sidecar_case_result_t result = run_network_hook_sidecar_e2e(hf);
         if (result == sidecar_case_result_t::passed)
             passed.fetch_add(1);
         else
@@ -36006,7 +35971,6 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_network_pg_sniff(hf, passed, failed, skipped);
     if (!cancelled()) test_network_pg_sniff_payload_serialization(hf, passed, failed, skipped);
     if (!cancelled()) test_network_hook_sidecar_plain_e2e(hf, passed, failed, skipped);
-    if (!cancelled()) test_network_hook_sidecar_protected_e2e(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_packet_callstack(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_pre_encrypt_hook(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_display_filter(hf, passed, failed, skipped);

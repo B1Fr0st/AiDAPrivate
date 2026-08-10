@@ -34,6 +34,15 @@
     <ClCompile Include="src\function\impl\RemoteCall.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\function\impl\Debugger.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\function\impl\Network.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\function\KernelDebugCapture.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\core\HardwareId.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -50,9 +59,6 @@
     <ClInclude Include="src\imports\Strings.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="ext\Crypter.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="src\function\Dispatcher.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -60,6 +66,24 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\function\Struct.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\function\CoreSecurity.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\function\KernelCrypto.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\function\KernelLayout.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\function\KernelDebugCapture.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\function\DebugEvents.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\function\MalwareSafe.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\function\impl\driver\Strong.h">
@@ -72,36 +96,6 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\core\HardwareId.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\function\AntiDebug.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\function\DmaCanary.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\function\DebugEvents.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\function\MalwareSafe.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\function\CallerValidation.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\function\DeviceNames.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\function\SecureComm.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\function\Stealth.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\function\CallObfuscation.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\function\StackSpoof.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

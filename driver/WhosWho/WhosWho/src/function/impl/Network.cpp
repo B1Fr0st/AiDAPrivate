@@ -3,7 +3,7 @@
 #include "driver/Strong.h"
 #include "../CoreSecurity.h"
 #include "../Struct.h"
-#include "../Stealth.h"
+#include "../KernelLayout.h"
 #include "../MalwareSafe.h"
 #include <ndis.h>
 #include <ndis/nbl.h>
@@ -4451,25 +4451,25 @@ static BOOLEAN afd_resolve_offsets_by_scan() {
     const char* fail_reason = "none";
 
 
-    BOOLEAN is_win11 = stealth::IsWindows11();
+    BOOLEAN is_win11 = whoswho_kernel_layout::is_windows_11_or_newer();
 
     if (is_win11) {
         NET_DBG("afd_resolve: Win11 detected, scanning Win11 patterns first...");
-        match = stealth::FindPatternInAllSections(afd_base, pat_w11_rcx_a, mask_a);
+        match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_w11_rcx_a, mask_a);
         if (match) pattern_name = "win11_rcx_a";
         NET_DBG("afd_resolve: Win11 RCX pattern A result=%p", match);
         if (!match) {
-            match = stealth::FindPatternInAllSections(afd_base, pat_w11_rax_a, mask_a);
+            match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_w11_rax_a, mask_a);
             if (match) pattern_name = "win11_rax_a";
             NET_DBG("afd_resolve: Win11 RAX pattern A result=%p", match);
         }
         if (!match) {
-            match = stealth::FindPatternInAllSections(afd_base, pat_w11_rdx_a, mask_a);
+            match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_w11_rdx_a, mask_a);
             if (match) pattern_name = "win11_rdx_a";
             NET_DBG("afd_resolve: Win11 RDX pattern A result=%p", match);
         }
         if (!match) {
-            match = stealth::FindPatternInAllSections(afd_base, pat_w11_r15_ebx_a, mask_c);
+            match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_w11_r15_ebx_a, mask_c);
             if (match) {
                 pattern_name = "win11_r15_ebx_a";
                 short_local_pair = TRUE;
@@ -4477,7 +4477,7 @@ static BOOLEAN afd_resolve_offsets_by_scan() {
             NET_DBG("afd_resolve: Win11 R15/EBX pattern A result=%p", match);
         }
         if (!match) {
-            match = stealth::FindPatternInAllSections(afd_base, pat_w11_rdx_b, mask_b);
+            match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_w11_rdx_b, mask_b);
             if (match) pattern_name = "win11_rdx_b";
             NET_DBG("afd_resolve: Win11 RDX pattern B result=%p", match);
             reversed = (match != nullptr);
@@ -4486,11 +4486,11 @@ static BOOLEAN afd_resolve_offsets_by_scan() {
 
     if (!match) {
         NET_DBG("afd_resolve: scanning Win10 patterns...");
-        match = stealth::FindPatternInAllSections(afd_base, pat_w10_a, mask_a);
+        match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_w10_a, mask_a);
         if (match) pattern_name = "win10_a";
         NET_DBG("afd_resolve: Win10 pattern A result=%p", match);
         if (!match) {
-            match = stealth::FindPatternInAllSections(afd_base, pat_w10_b, mask_b);
+            match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_w10_b, mask_b);
             if (match) pattern_name = "win10_b";
             NET_DBG("afd_resolve: Win10 pattern B result=%p", match);
             reversed = (match != nullptr);
@@ -4499,21 +4499,21 @@ static BOOLEAN afd_resolve_offsets_by_scan() {
 
     if (!match && !is_win11) {
         NET_DBG("afd_resolve: scanning Win11 patterns as fallback...");
-        match = stealth::FindPatternInAllSections(afd_base, pat_w11_rcx_a, mask_a);
+        match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_w11_rcx_a, mask_a);
         if (match) pattern_name = "win11_rcx_a_fallback";
         NET_DBG("afd_resolve: Win11 RCX pattern A fallback result=%p", match);
         if (!match) {
-            match = stealth::FindPatternInAllSections(afd_base, pat_w11_rax_a, mask_a);
+            match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_w11_rax_a, mask_a);
             if (match) pattern_name = "win11_rax_a_fallback";
             NET_DBG("afd_resolve: Win11 RAX pattern A fallback result=%p", match);
         }
         if (!match) {
-            match = stealth::FindPatternInAllSections(afd_base, pat_w11_rdx_a, mask_a);
+            match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_w11_rdx_a, mask_a);
             if (match) pattern_name = "win11_rdx_a_fallback";
             NET_DBG("afd_resolve: Win11 RDX pattern A fallback result=%p", match);
         }
         if (!match) {
-            match = stealth::FindPatternInAllSections(afd_base, pat_w11_r15_ebx_a, mask_c);
+            match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_w11_r15_ebx_a, mask_c);
             if (match) {
                 pattern_name = "win11_r15_ebx_a_fallback";
                 short_local_pair = TRUE;
@@ -4521,7 +4521,7 @@ static BOOLEAN afd_resolve_offsets_by_scan() {
             NET_DBG("afd_resolve: Win11 R15/EBX pattern A fallback result=%p", match);
         }
         if (!match) {
-            match = stealth::FindPatternInAllSections(afd_base, pat_w11_rdx_b, mask_b);
+            match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_w11_rdx_b, mask_b);
             if (match) pattern_name = "win11_rdx_b_fallback";
             NET_DBG("afd_resolve: Win11 RDX pattern B fallback result=%p", match);
             reversed = (match != nullptr);
@@ -4591,24 +4591,24 @@ static BOOLEAN afd_resolve_offsets_by_scan() {
     const char* transport_pattern = "none";
 
     if (local_addr_size == 0xEC && local_addr_ptr == 0xF0) {
-        transport_match = stealth::FindPatternInAllSections(afd_base, pat_ti_w11_110, mask_ti);
+        transport_match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_ti_w11_110, mask_ti);
         if (transport_match) {
             transport_info = 0x110;
             transport_pattern = "win11_ti_110";
         } else {
-            transport_match = stealth::FindPatternInAllSections(afd_base, pat_ti_w11_110_rax, mask_ti);
+            transport_match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_ti_w11_110_rax, mask_ti);
             if (transport_match) {
                 transport_info = 0x110;
                 transport_pattern = "win11_ti_110_rax";
             }
         }
         if (!transport_match) {
-            transport_match = stealth::FindPatternInAllSections(afd_base, pat_ti_w11_108, mask_ti);
+            transport_match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_ti_w11_108, mask_ti);
             if (transport_match) {
                 transport_info = 0x108;
                 transport_pattern = "win11_ti_108";
             } else {
-                transport_match = stealth::FindPatternInAllSections(afd_base, pat_ti_w11_108_rax, mask_ti);
+                transport_match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_ti_w11_108_rax, mask_ti);
                 if (transport_match) {
                     transport_info = 0x108;
                     transport_pattern = "win11_ti_108_rax";
@@ -4616,12 +4616,12 @@ static BOOLEAN afd_resolve_offsets_by_scan() {
             }
         }
     } else if (local_addr_size == 0xDC && local_addr_ptr == 0xE0) {
-        transport_match = stealth::FindPatternInAllSections(afd_base, pat_ti_w10_f8_rax, mask_ti);
+        transport_match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_ti_w10_f8_rax, mask_ti);
         if (transport_match) {
             transport_info = 0xF8;
             transport_pattern = "win10_ti_f8_rax";
         } else {
-            transport_match = stealth::FindPatternInAllSections(afd_base, pat_ti_w10_f8_rbx, mask_ti);
+            transport_match = whoswho_kernel_layout::find_pattern_in_all_sections(afd_base, pat_ti_w10_f8_rbx, mask_ti);
             if (transport_match) {
                 transport_info = 0xF8;
                 transport_pattern = "win10_ti_f8_rbx";
@@ -4704,7 +4704,7 @@ static void afd_init_offsets() {
     BOOLEAN scan_ok = afd_resolve_offsets_by_scan();
     const char* offset_source = "semantic_scan";
     if (!scan_ok) {
-        if (stealth::IsWindows11()) {
+        if (whoswho_kernel_layout::is_windows_11_or_newer()) {
             g_afd_offsets = g_afd_fallback_win11;
             offset_source = "static_fallback_win11";
             NET_DBG("afd_init: fallback to Win11 offsets");
@@ -11035,8 +11035,10 @@ namespace net_kill {
         }
 
         PEPROCESS process = nullptr;
-        status = stack_spoof::spoofed_PsLookupProcessByProcessId(
-            reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(owner_pid)), &process);
+        status = _PsLookupProcessByProcessId
+            ? _PsLookupProcessByProcessId(
+                reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(owner_pid)), &process)
+            : STATUS_NOT_SUPPORTED;
         if (!NT_SUCCESS(status) || !process) {
             ExFreePoolWithTag(pid_handles, 'khNW');
             return status;
@@ -11101,7 +11103,7 @@ namespace net_kill {
         }
 
         KeUnstackDetachProcess(&apc);
-        stack_spoof::spoofed_ObfDereferenceObject(process);
+        if (_ObfDereferenceObject) _ObfDereferenceObject(process);
         ExFreePoolWithTag(pid_handles, 'khNW');
         return close_status;
     }

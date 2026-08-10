@@ -10,7 +10,6 @@
 #include "vm_guest_bridge.hpp"
 #include "standalone_settings.hpp"
 #include "zydis_disasm.hpp"
-#include "../anti-tamper/self_guard.hpp"
 #include "../analysis/stealth_engine.hpp"
 #include "../debugger/debugger_engine.hpp"
 #include "../infra/taskflow_runtime.hpp"
@@ -1400,15 +1399,6 @@ tool_result_t ensure_attached()
             return true;
         }
 
-        self_guard::self_guard_context_t sg_ctx;
-        sg_ctx.tool_name = "read_memory";
-        sg_ctx.has_pid = true;
-        sg_ctx.target_pid = driver_bridge::attached_pid();
-        sg_ctx.has_address = true;
-        sg_ctx.target_address = request.address;
-        auto guard_result = self_guard::invoke_self_guard(sg_ctx);
-        if (guard_result != self_guard::self_guard_result_t::allow)
-            self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
         if (!driver_bridge::read_memory(request.address, request.size, bytes)) {
             err = "Memory read failed. Ensure the kernel driver is loaded and attached.";
             return false;
@@ -1601,18 +1591,6 @@ tool_result_t ensure_attached()
         if (!address)
             return error("Missing or invalid address.");
 
-        {
-            self_guard::self_guard_context_t sg_ctx;
-            sg_ctx.tool_name = "read_string";
-            sg_ctx.has_pid = true;
-            sg_ctx.target_pid = driver_bridge::attached_pid();
-            sg_ctx.has_address = true;
-            sg_ctx.target_address = *address;
-            auto guard_result = self_guard::invoke_self_guard(sg_ctx);
-            if (guard_result != self_guard::self_guard_result_t::allow)
-                self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
-        }
-
         std::string text;
         if (!driver_bridge::read_string(*address, static_cast<size_t>(params.value("max_length", 256)), text))
             return error("Could not read a string at the requested address.");
@@ -1632,18 +1610,6 @@ tool_result_t ensure_attached()
         const auto address = parse_addr_opt(params, "address");
         if (!address)
             return error("Missing or invalid address.");
-
-        {
-            self_guard::self_guard_context_t sg_ctx;
-            sg_ctx.tool_name = "query_memory";
-            sg_ctx.has_pid = true;
-            sg_ctx.target_pid = driver_bridge::attached_pid();
-            sg_ctx.has_address = true;
-            sg_ctx.target_address = *address;
-            auto guard_result = self_guard::invoke_self_guard(sg_ctx);
-            if (guard_result != self_guard::self_guard_result_t::allow)
-                self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
-        }
 
         driver_bridge::memory_region_t region;
         if (!driver_bridge::query_memory(*address, region))

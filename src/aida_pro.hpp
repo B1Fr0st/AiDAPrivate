@@ -319,7 +319,6 @@ inline std::string json_str(const nlohmann::json& j, const std::string& key, con
 
 #include "obfuscation.hpp"
 #include "settings.hpp"
-#include "license.hpp"
 #include "agent_tools.hpp"
 #include "ida_utils.hpp"
 #include "instance_registry.hpp"

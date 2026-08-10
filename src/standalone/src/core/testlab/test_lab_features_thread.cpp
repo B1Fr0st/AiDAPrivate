@@ -366,16 +366,9 @@ namespace {
 			r.ok = false;
 			return;
 		}
-		device->sync_dynamic_security_state();
 		const std::uint32_t attached_pid = driver_bridge::attached_pid();
 		const std::uint32_t device_pid = device->get_process_id();
 		const std::uint32_t requested_ioctl = ioctl_codes::TCTX();
-		std::uint32_t decoded_offset = 0;
-		const bool decoded_offset_valid = device->decode_ioctl_offset_snapshot(static_cast<DWORD>(requested_ioctl), decoded_offset);
-		const DWORD effective_ioctl = decoded_offset_valid
-			? device->make_ioctl_snapshot(decoded_offset)
-			: static_cast<DWORD>(requested_ioctl);
-		const std::uint32_t ioctl_base = device->compute_ioctl_base_snapshot();
 		driver_bridge::thread_info_t before{};
 		driver_bridge::thread_info_t after{};
 		const bool before_found = find_thread_snapshot(s.pid, s.tid, before);
@@ -383,16 +376,7 @@ namespace {
 		const user_context_probe_t user_probe_before = probe_user_context(s.tid, thread_access);
 		push_u32_field(r, "input_pid", s.pid);
 		push_u32_field(r, "input_tid", s.tid);
-		push_u32_field(r, "attached_pid", attached_pid);
-		push_u32_field(r, "device_pid", device_pid);
 		push_hex_field(r, "raw_ioctl_requested_code", requested_ioctl);
-		push_hex_field(r, "raw_ioctl_effective_code", effective_ioctl);
-		push_hex_field(r, "raw_ioctl_base", ioctl_base);
-		push_u32_field(r, "raw_ioctl_decoded_offset", decoded_offset);
-		push_bool_field(r, "raw_ioctl_decoded_offset_valid", decoded_offset_valid);
-		push_bool_field(r, "server_seed_present", device->has_server_seed());
-		push_bool_field(r, "server_ioctl_seed_present", device->has_server_ioctl_seed());
-		push_hex_field(r, "server_ioctl_seed_hash", device->get_server_ioctl_seed_hash());
 		push_u64_dec_field(r, "raw_ioctl_bytes_in", sizeof(voyager::detail::thread_ctx_request));
 		push_u64_dec_field(r, "raw_ioctl_bytes_out_capacity", sizeof(voyager::detail::thread_ctx_request));
 		push_u32_field(r, "request_should_set", 0);
@@ -403,16 +387,12 @@ namespace {
 		push_user_probe_fields(r, "user_probe_before_raw", user_probe_before);
 		push_thread_snapshot(r, "thread_before", before_found, before);
 		::diag::log_tagged_fmt("testlab_tctx",
-			"START pid=%u tid=%u attached_pid=%u device_pid=%u requested_ioctl=0x%08X effective_ioctl=0x%08lX ioctl_base=0x%08X decoded_offset=%u decoded_valid=%d request_size=%zu should_set=0 register_mask=0x%llX thread_access=0x%08lX access_open=%d access_gle=%lu suspend_ok=%d suspend_gle=%lu get_ok=%d get_gle=%lu user_rip=0x%llX user_rsp=0x%llX before_found=%d before_state=%u before_rip=0x%llX",
+			"START pid=%u tid=%u attached_pid=%u device_pid=%u requested_ioctl=0x%08X request_size=%zu should_set=0 register_mask=0x%llX thread_access=0x%08lX access_open=%d access_gle=%lu suspend_ok=%d suspend_gle=%lu get_ok=%d get_gle=%lu user_rip=0x%llX user_rsp=0x%llX before_found=%d before_state=%u before_rip=0x%llX",
 			s.pid,
 			s.tid,
 			attached_pid,
 			device_pid,
 			requested_ioctl,
-			static_cast<unsigned long>(effective_ioctl),
-			ioctl_base,
-			decoded_offset,
-			decoded_offset_valid ? 1 : 0,
 			sizeof(voyager::detail::thread_ctx_request),
 			0ULL,
 			static_cast<unsigned long>(thread_access),
@@ -524,7 +504,6 @@ namespace {
 		push_u32_field(r, "raw_ioctl_suspended_retry_resume_prev_count", suspend_retry_resume_prev_count);
 		push_u64_dec_field(r, "raw_ioctl_suspended_retry_resume_elapsed_ms", suspend_retry_resume_elapsed);
 		push_hex_field(r, "raw_ioctl_requested_code_post", requested_ioctl);
-		push_hex_field(r, "raw_ioctl_effective_code_post", effective_ioctl);
 		push_u64_dec_field(r, "raw_ioctl_returned_bytes", bytes_returned);
 		push_bool_field(r, "raw_ioctl_ok", ok);
 		push_u32_field(r, "raw_ioctl_status", raw_status);
@@ -554,13 +533,12 @@ namespace {
 		push_text_field(r, "raw_ioctl_evidence_contract", "raw_driver_tctx_pass_requires_raw_ioctl_ok_and_user_canonical_rip_rsp_rflags");
 		push_text_field(r, "raw_ioctl_kernel_correlation", "aida_kernel.log TCTX entry/suspend/context/exit lines carry kernel-side constraint and exception evidence");
 		::diag::log_tagged_fmt("testlab_tctx",
-			"RAW pid=%u tid=%u attached_pid=%u device_pid=%u requested_ioctl=0x%08X effective_ioctl=0x%08lX ok=%d raw_valid=%d raw_driver_tctx_pass=%d status=0x%08X ntstatus=0x%08X gle=%lu effective_gle=%lu bytes_in=%zu bytes_out_capacity=%zu bytes_returned=%u elapsed_ms=%llu provenance=%s request_mask=0x%llX observed_mask=0x%llX rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=%d dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX failure_preserved=%d",
+			"RAW pid=%u tid=%u attached_pid=%u device_pid=%u requested_ioctl=0x%08X ok=%d raw_valid=%d raw_driver_tctx_pass=%d status=0x%08X ntstatus=0x%08X gle=%lu effective_gle=%lu bytes_in=%zu bytes_out_capacity=%zu bytes_returned=%u elapsed_ms=%llu provenance=%s request_mask=0x%llX observed_mask=0x%llX rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=%d dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX failure_preserved=%d",
 			s.pid,
 			s.tid,
 			attached_pid,
 			device_pid,
 			requested_ioctl,
-			static_cast<unsigned long>(effective_ioctl),
 			ok ? 1 : 0,
 			raw_context_valid ? 1 : 0,
 			(ok && raw_context_valid) ? 1 : 0,

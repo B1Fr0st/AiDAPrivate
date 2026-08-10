@@ -20,7 +20,6 @@
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/shell_preview_platform.hpp"
 #else
-#include "../anti-tamper/webhook.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
 #include "../ui/task_center.hpp"
@@ -969,7 +968,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				gen.address_input, gen.instruction_count,
 				static_cast<int>(gen.auto_wildcard),
 				static_cast<int>(generating));
-			anti_tamper::webhook::write_log("aob", "generate button clicked");
+			diag::log_tagged("aob", "generate button clicked");
 			toast_notification::push("AOB: Generating signature...",
 				toast_notification::toast_type_t::info, 1.5f);
 			uint64_t addr = 0;
@@ -1008,7 +1007,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				diag::log_tagged_fmt("aob",
 					"view generate refused parse_failed input='%s' live=%d pe=%d",
 					gen.address_input, live ? 1 : 0, pe ? 1 : 0);
-				anti_tamper::webhook::write_log("aob", "generate refused parse_failed");
+				diag::log_tagged("aob", "generate refused parse_failed");
 				toast_notification::push(
 					"AOB: Enter a hex address (e.g. 7FF6A1B20040) or click an instruction in the disassembly first.",
 					toast_notification::toast_type_t::warning, 5.0f);
@@ -1056,7 +1055,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				std::lock_guard<std::mutex> lk(gen.mutex);
 				to_optimize = gen.current;
 			}
-			anti_tamper::webhook::write_log("scan_audit",
+			diag::log_tagged("scan_audit",
 				"[scan_audit] aob optimize invoked");
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			aob_generator::optimize_signature(live_pid, to_optimize);
@@ -1279,7 +1278,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			bool attached_cmp = compare_pid != 0;
 			if (aida::ui::button("Compare", aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::sm, ImVec2(0.f, 0.f), !attached_cmp || compare_pending)) {
-				anti_tamper::webhook::write_log("scan_audit",
+				diag::log_tagged("scan_audit",
 					"[scan_audit] aob compare invoked");
 				detail::request_comparison(context, generator_state, view_state);
 			}
@@ -1526,28 +1525,28 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				"The saved signature has no mapped address.", [signature, context]() {
 					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 					disasm_view::goto_address(signature.address, context);
-					anti_tamper::webhook::write_log("scan_audit", "[scan_audit] aob saved ctx open_disasm");
+					diag::log_tagged("scan_audit", "[scan_audit] aob saved ctx open_disasm");
 					return aida::ui::action_handler_result_t::completed();
 				});
 			add("memory.entity.open_hex", signature.address != 0,
 				"The saved signature has no mapped address.", [signature, context]() {
 					detail::open_saved_in_hex(context, signature.address);
 					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
-					anti_tamper::webhook::write_log("scan_audit", "[scan_audit] aob saved ctx open_hex");
+					diag::log_tagged("scan_audit", "[scan_audit] aob saved ctx open_hex");
 					return aida::ui::action_handler_result_t::completed();
 				});
 			add("memory.aob.copy_pattern", !signature.bytes.empty(),
 				"The saved signature has no retained pattern bytes.", [signature]() {
 					const std::string text = aob_generator::format_signature(signature);
 					ImGui::SetClipboardText(text.c_str());
-					anti_tamper::webhook::write_log("scan_audit", "[scan_audit] aob saved ctx copy_pattern");
+					diag::log_tagged("scan_audit", "[scan_audit] aob saved ctx copy_pattern");
 					return aida::ui::action_handler_result_t::completed();
 				});
 			add("memory.aob.copy_ida_pattern", !signature.bytes.empty(),
 				"The saved signature has no retained pattern bytes.", [signature]() {
 					const std::string text = aob_generator::format_ida_signature(signature);
 					ImGui::SetClipboardText(text.c_str());
-					anti_tamper::webhook::write_log("scan_audit", "[scan_audit] aob saved ctx copy_ida");
+					diag::log_tagged("scan_audit", "[scan_audit] aob saved ctx copy_ida");
 					return aida::ui::action_handler_result_t::completed();
 				});
 			add("memory.entity.copy_address", signature.address != 0,
@@ -1555,7 +1554,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					char address[24]{};
 					std::snprintf(address, sizeof(address), "0x%llX", static_cast<unsigned long long>(signature.address));
 					ImGui::SetClipboardText(address);
-					anti_tamper::webhook::write_log("scan_audit", "[scan_audit] aob saved ctx copy_address");
+					diag::log_tagged("scan_audit", "[scan_audit] aob saved ctx copy_address");
 					return aida::ui::action_handler_result_t::completed();
 				});
 			char evidence_address[24]{};

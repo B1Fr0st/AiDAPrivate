@@ -2,7 +2,6 @@
 #include <ntifs.h>
 #include "Struct.h"
 #include "impl/driver/Strong.h"
-#include "AntiDebug.h"
 
 namespace functions {
     NTSTATUS handle777d(p_dtb_solve request);
@@ -60,12 +59,4 @@ namespace functions {
     NTSTATUS handle_net_iface_enum(p_net_interface_enum request);
     NTSTATUS handle_pcap_export(p_pcap_export_request request);
     NTSTATUS handle_net_fingerprint(p_net_fingerprint_request request);
-
-    NTSTATUS handle_dll_protect(p_dll_protect request);
-    NTSTATUS handle_anti_debug(p_anti_debug_request request);
-    NTSTATUS handle_server_token(p_server_token_relay request);
-
-    NTSTATUS handle_anti_dump(p_anti_dump_request request);
-    NTSTATUS handle_server_token_v2(p_server_token_relay_v2 request);
-    NTSTATUS handle_hide_process(p_hide_process_request_k request);
 }

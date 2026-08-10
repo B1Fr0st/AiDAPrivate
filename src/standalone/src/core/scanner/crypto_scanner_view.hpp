@@ -31,7 +31,6 @@
 #include "../../preview/shell_preview_platform.hpp"
 #include "../../preview/studio_semantics.hpp"
 #else
-#include "../anti-tamper/webhook.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
 #include "../ui/task_center.hpp"
@@ -1082,11 +1081,11 @@ inline void render(float, float, float width, float height,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !scanning && !attached_now, nullptr, false)) {
 			if (scanning) {
 				view_state->cancellation_requested.store(true, std::memory_order_release);
-				anti_tamper::webhook::write_log("scan_audit",
+				diag::log_tagged("scan_audit",
 					"[scan_audit] crypto_scanner cancel");
 			} else {
 				detail::start_workspace_scan(context, view_state, false);
-				anti_tamper::webhook::write_log("scan_audit",
+				diag::log_tagged("scan_audit",
 					"[scan_audit] crypto_scanner scan_process");
 			}
 		}
@@ -1098,7 +1097,7 @@ inline void render(float, float, float width, float height,
 		if (aida::ui::button("Scan File", aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), scanning || fl)) {
 			detail::start_workspace_scan(context, view_state, false);
-			anti_tamper::webhook::write_log("scan_audit",
+			diag::log_tagged("scan_audit",
 				"[scan_audit] crypto_scanner scan_file");
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;
@@ -1108,7 +1107,7 @@ inline void render(float, float, float width, float height,
 		if (aida::ui::button("Entropy", aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), scanning || !attached_now)) {
 			detail::start_workspace_scan(context, view_state, true);
-			anti_tamper::webhook::write_log("scan_audit",
+			diag::log_tagged("scan_audit",
 				"[scan_audit] crypto_scanner scan_entropy");
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;
@@ -1501,13 +1500,13 @@ inline void render(float, float, float width, float height,
 			add("memory.entity.open_disassembly", [hit, context]() {
 				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 				disasm_view::goto_address(hit.address, context);
-				anti_tamper::webhook::write_log("scan_audit", "[scan_audit] crypto_scanner ctx open_disasm");
+				diag::log_tagged("scan_audit", "[scan_audit] crypto_scanner ctx open_disasm");
 				return aida::ui::action_handler_result_t::completed();
 			});
 			add("memory.entity.open_hex", [hit, context]() {
 				detail::open_hit_in_hex(context, hit.address);
 				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
-				anti_tamper::webhook::write_log("scan_audit", "[scan_audit] crypto_scanner ctx open_hex");
+				diag::log_tagged("scan_audit", "[scan_audit] crypto_scanner ctx open_hex");
 				return aida::ui::action_handler_result_t::completed();
 			});
 			if (!hit.referencing_functions.empty()) {
@@ -1536,12 +1535,12 @@ inline void render(float, float, float width, float height,
 				char address[32]{};
 				std::snprintf(address, sizeof(address), "0x%llX", static_cast<unsigned long long>(hit.address));
 				ImGui::SetClipboardText(address);
-				anti_tamper::webhook::write_log("scan_audit", "[scan_audit] crypto_scanner ctx copy_address");
+				diag::log_tagged("scan_audit", "[scan_audit] crypto_scanner ctx copy_address");
 				return aida::ui::action_handler_result_t::completed();
 			});
 			add("memory.crypto.copy_algorithm", [hit]() {
 				ImGui::SetClipboardText(hit.algorithm.c_str());
-				anti_tamper::webhook::write_log("scan_audit", "[scan_audit] crypto_scanner ctx copy_algo");
+				diag::log_tagged("scan_audit", "[scan_audit] crypto_scanner ctx copy_algo");
 				return aida::ui::action_handler_result_t::completed();
 			});
 			char evidence_address[24]{};
@@ -1637,7 +1636,7 @@ inline void render(float, float, float width, float height,
 			aida::ui::application_views::open_or_focus(
 				aida::ui::stable_view_id_t("document.disassembly"));
 			disasm_view::goto_address(address, context);
-			anti_tamper::webhook::write_log(
+			diag::log_tagged(
 				"scan_audit", "[scan_audit] crypto_scanner ctx show_ref");
 			ImGui::CloseCurrentPopup();
 			return true;

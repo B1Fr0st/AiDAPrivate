@@ -1,9 +1,5 @@
 #include "driver_loader.hpp"
-#include "whoswho_encrypted.h"
-#include "sentinel_encrypted.h"
-#ifdef AIDA_LEGACY_DRIVER_MAPPER_AVAILABLE
-#include "windmapper_embedded.h"
-#endif
+#include "whoswho_embedded.h"
 #ifdef AIDA_STANDALONE
 #include "helpers/diag_log.hpp"
 #endif
@@ -29,9 +25,6 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "advapi32.lib")
 
-#ifndef STATUS_AUTH_TAG_MISMATCH
-#define STATUS_AUTH_TAG_MISMATCH ((NTSTATUS)0xC000A002L)
-#endif
 #ifndef STATUS_OBJECT_NAME_COLLISION
 #define STATUS_OBJECT_NAME_COLLISION ((NTSTATUS)0xC0000035L)
 #endif
@@ -72,7 +65,6 @@ namespace
         DWORD mapper_exit_code = 0;
         DWORD mapper_exit_gle = ERROR_SUCCESS;
         int whoswho_deleted = -1;
-        int sentinel_deleted = -1;
         int stage_dir_deleted = -1;
         int keep_stage = 0;
     };
@@ -120,7 +112,7 @@ namespace
         ++s_materialization_summary.total_files;
         s_materialization_summary.total_bytes += bytes;
         const bool driver_blob =
-            (label && (std::strcmp(label, "whoswho") == 0 || std::strcmp(label, "sentinel") == 0));
+            (label && std::strcmp(label, "whoswho") == 0);
         if (driver_blob) {
             ++s_materialization_summary.driver_files;
             s_materialization_summary.driver_bytes += bytes;
@@ -137,7 +129,7 @@ namespace
         s_materialization_summary.active = false;
         const ULONGLONG now = GetTickCount64();
         loader_diag_fmt(
-            "driver_materialization_summary mode=%s success=%d files=%u driver_files=%u runtime_files=%u bytes=%llu driver_bytes=%llu runtime_bytes=%llu mapper_pid=%lu mapper_tid=%lu create_gle=%lu wait=0x%08lX wait_gle=%lu exit=0x%08lX exit_gle=%lu cleanup_whoswho=%d cleanup_sentinel=%d cleanup_stage=%d keep_stage=%d elapsed_ms=%llu last_error_empty=%d",
+            "driver_materialization_summary mode=%s success=%d files=%u driver_files=%u runtime_files=%u bytes=%llu driver_bytes=%llu runtime_bytes=%llu mapper_pid=%lu mapper_tid=%lu create_gle=%lu wait=0x%08lX wait_gle=%lu exit=0x%08lX exit_gle=%lu cleanup_whoswho=%d cleanup_stage=%d keep_stage=%d elapsed_ms=%llu last_error_empty=%d",
             s_materialization_summary.mode ? s_materialization_summary.mode : "",
             g_loaded ? 1 : 0,
             s_materialization_summary.total_files,
@@ -154,7 +146,6 @@ namespace
             static_cast<unsigned long>(s_materialization_summary.mapper_exit_code),
             static_cast<unsigned long>(s_materialization_summary.mapper_exit_gle),
             s_materialization_summary.whoswho_deleted,
-            s_materialization_summary.sentinel_deleted,
             s_materialization_summary.stage_dir_deleted,
             s_materialization_summary.keep_stage,
             static_cast<unsigned long long>(now >= s_materialization_summary.started_ms ? now - s_materialization_summary.started_ms : 0),
@@ -227,19 +218,6 @@ namespace
         if (n == 0)
             n = GetEnvironmentVariableW(L"AIDA_KEEP_STAGE", env, static_cast<DWORD>(_countof(env)));
         return n > 0 && env[0] != L'\0' && env[0] != L'0';
-#endif
-    }
-
-    bool legacy_mapper_enabled()
-    {
-#ifndef AIDA_LEGACY_DRIVER_MAPPER_AVAILABLE
-        return false;
-#else
-        wchar_t env[16] = {};
-        DWORD n = GetEnvironmentVariableW(L"AIDA_DISABLE_LEGACY_DRIVER_MAPPER", env, static_cast<DWORD>(_countof(env)));
-        if (n == 0 || n >= static_cast<DWORD>(_countof(env)))
-            return true;
-        return !(env[0] == L'1' || _wcsicmp(env, L"true") == 0 || _wcsicmp(env, L"yes") == 0);
 #endif
     }
 
@@ -391,20 +369,6 @@ namespace
         return out;
     }
 
-    std::wstring make_stage_path(const std::wstring& dir, const wchar_t* ext)
-    {
-        if (dir.empty())
-            return {};
-        if (!ext || !*ext)
-            return {};
-        std::wstring token = random_token(12);
-        if (token.empty())
-            return {};
-        std::wstring name = token;
-        std::filesystem::path p = std::filesystem::path(dir) / (name + ext);
-        return p.wstring();
-    }
-
     std::wstring make_named_stage_path(const std::wstring& dir, const wchar_t* name)
     {
         if (dir.empty() || !name || !*name)
@@ -413,161 +377,37 @@ namespace
         return p.wstring();
     }
 
-    std::wstring get_mapper_runtime_dir()
+    std::wstring resolve_mapper_path()
     {
-        wchar_t* local = nullptr;
-        if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &local)) || !local)
+        wchar_t env_override[MAX_PATH] = {};
+        DWORD env_len = GetEnvironmentVariableW(L"AIDA_MAPPER_EXECUTABLE", env_override, MAX_PATH);
+        if (env_len > 0 && env_len < MAX_PATH && GetFileAttributesW(env_override) != INVALID_FILE_ATTRIBUTES)
+            return env_override;
+
+        const std::wstring module_dir = get_module_dir();
+        if (module_dir.empty())
             return {};
-        std::filesystem::path p(local);
-        CoTaskMemFree(local);
-        p /= L"AiDA";
-        p /= L"Standalone";
-        p /= L"DriverRuntime";
-        std::error_code ec;
-        std::filesystem::create_directories(p, ec);
-        if (ec)
-            return {};
-        return p.wstring();
+        const std::wstring aida_named = (std::filesystem::path(module_dir) / L"AiDAWindMapper.exe").wstring();
+        if (GetFileAttributesW(aida_named.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return aida_named;
+        const std::wstring plain_named = (std::filesystem::path(module_dir) / L"WindMapper.exe").wstring();
+        if (GetFileAttributesW(plain_named.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return plain_named;
+        return {};
     }
 
-    std::wstring get_mapper_runtime_path()
-    {
-        std::wstring dir = get_mapper_runtime_dir();
-        if (dir.empty())
-            return {};
-        return (std::filesystem::path(dir) / L"AiDAWindMapper.exe").wstring();
-    }
-
-    bool aes_gcm_decrypt(const unsigned char* ciphertext, unsigned long ciphertext_len,
-                         const unsigned char* key, unsigned long key_len,
-                         const unsigned char* nonce, unsigned long nonce_len,
-                         const unsigned char* tag, unsigned long tag_len,
-                         unsigned char* plaintext, unsigned long plaintext_len)
-    {
-        if (!ciphertext || !key || !nonce || !tag || !plaintext)
-            return false;
-        if (key_len != 32 || nonce_len != 12 || tag_len != 16)
-            return false;
-        if (ciphertext_len != plaintext_len)
-            return false;
-
-        BCRYPT_ALG_HANDLE alg = nullptr;
-        NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0);
-        if (!BCRYPT_SUCCESS(status)) {
-            set_last_error_status("BCryptOpenAlgorithmProvider failed", status);
-            return false;
-        }
-
-        status = BCryptSetProperty(alg, BCRYPT_CHAINING_MODE,
-                                   reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
-                                   sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
-        if (!BCRYPT_SUCCESS(status)) {
-            BCryptCloseAlgorithmProvider(alg, 0);
-            set_last_error_status("BCryptSetProperty(GCM) failed", status);
-            return false;
-        }
-
-        DWORD object_length = 0;
-        DWORD got = 0;
-        status = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH,
-                                   reinterpret_cast<PUCHAR>(&object_length),
-                                   sizeof(object_length), &got, 0);
-        if (!BCRYPT_SUCCESS(status) || got != sizeof(object_length) || object_length == 0) {
-            BCryptCloseAlgorithmProvider(alg, 0);
-            set_last_error_status("BCryptGetProperty(OBJECT_LENGTH) failed", status);
-            return false;
-        }
-
-        std::vector<unsigned char> key_object(object_length, 0);
-        BCRYPT_KEY_HANDLE hkey = nullptr;
-        status = BCryptGenerateSymmetricKey(alg, &hkey,
-                                            key_object.data(), object_length,
-                                            const_cast<PUCHAR>(key), key_len, 0);
-        if (!BCRYPT_SUCCESS(status)) {
-            BCryptCloseAlgorithmProvider(alg, 0);
-            set_last_error_status("BCryptGenerateSymmetricKey failed", status);
-            return false;
-        }
-
-        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info = {};
-        BCRYPT_INIT_AUTH_MODE_INFO(info);
-        info.pbNonce = const_cast<PUCHAR>(nonce);
-        info.cbNonce = nonce_len;
-        info.pbAuthData = nullptr;
-        info.cbAuthData = 0;
-        info.pbTag = const_cast<PUCHAR>(tag);
-        info.cbTag = tag_len;
-        info.pbMacContext = nullptr;
-        info.cbMacContext = 0;
-        info.cbAAD = 0;
-        info.cbData = 0;
-        info.dwFlags = 0;
-
-        ULONG out_len = 0;
-        status = BCryptDecrypt(hkey,
-                               const_cast<PUCHAR>(ciphertext), ciphertext_len,
-                               &info,
-                               nullptr, 0,
-                               plaintext, plaintext_len,
-                               &out_len, 0);
-
-        BCryptDestroyKey(hkey);
-        SecureZeroMemory(key_object.data(), key_object.size());
-        BCryptCloseAlgorithmProvider(alg, 0);
-
-        if (status == STATUS_AUTH_TAG_MISMATCH) {
-            SecureZeroMemory(plaintext, plaintext_len);
-            set_last_error("AES-GCM tag mismatch (driver blob tampered)");
-            return false;
-        }
-        if (!BCRYPT_SUCCESS(status)) {
-            SecureZeroMemory(plaintext, plaintext_len);
-            set_last_error_status("BCryptDecrypt failed", status);
-            return false;
-        }
-        if (out_len != plaintext_len) {
-            SecureZeroMemory(plaintext, plaintext_len);
-            set_last_error("AES-GCM decrypt produced unexpected length");
-            return false;
-        }
-        return true;
-    }
-
-    bool decrypt_and_write(const unsigned char* ciphertext, unsigned long ciphertext_len,
-                           const unsigned char* key, unsigned long key_len,
-                           const unsigned char* nonce, unsigned long nonce_len,
-                           const unsigned char* tag, unsigned long tag_len,
-                           const std::wstring& out_path,
-                           const char* label)
+    bool write_plain_staged_file(const unsigned char* data, unsigned long size,
+                                 const std::wstring& out_path,
+                                 const char* label)
     {
         const std::string out_path_utf8 = utf8_from_wide(out_path);
         loader_diag_fmt("stage_write_begin label=%s path=\"%s\" bytes=%lu",
             label ? label : "?",
             out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str(),
-            ciphertext_len);
+            size);
 
-        auto* buf = static_cast<unsigned char*>(
-            VirtualAlloc(nullptr, ciphertext_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-        if (!buf) {
-            set_last_error_fmt("VirtualAlloc failed for %s decrypt buffer gle=%lu bytes=%lu",
-                label ? label : "driver", static_cast<unsigned long>(GetLastError()), ciphertext_len);
-            return false;
-        }
-
-        if (!aes_gcm_decrypt(ciphertext, ciphertext_len,
-                             key, key_len,
-                             nonce, nonce_len,
-                             tag, tag_len,
-                             buf, ciphertext_len)) {
-            SecureZeroMemory(buf, ciphertext_len);
-            VirtualFree(buf, 0, MEM_RELEASE);
-            return false;
-        }
-
-        if (!verify_blob_integrity(buf, ciphertext_len, ciphertext_len)) {
-            SecureZeroMemory(buf, ciphertext_len);
-            VirtualFree(buf, 0, MEM_RELEASE);
-            set_last_error_fmt("Decrypted %s blob failed PE integrity check", label ? label : "driver");
+        if (!verify_blob_integrity(data, size, size)) {
+            set_last_error_fmt("Embedded %s blob failed PE integrity check", label ? label : "driver");
             return false;
         }
 
@@ -575,8 +415,6 @@ namespace
                                 CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
         if (hf == INVALID_HANDLE_VALUE) {
             DWORD gle = GetLastError();
-            SecureZeroMemory(buf, ciphertext_len);
-            VirtualFree(buf, 0, MEM_RELEASE);
             set_last_error_fmt("CreateFileW failed for staged %s gle=%lu path=\"%s\"",
                 label ? label : "driver", static_cast<unsigned long>(gle),
                 out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str());
@@ -584,19 +422,17 @@ namespace
         }
 
         DWORD written = 0;
-        BOOL ok = WriteFile(hf, buf, ciphertext_len, &written, nullptr);
+        BOOL ok = WriteFile(hf, data, size, &written, nullptr);
         DWORD write_gle = GetLastError();
         FlushFileBuffers(hf);
         CloseHandle(hf);
-        SecureZeroMemory(buf, ciphertext_len);
-        VirtualFree(buf, 0, MEM_RELEASE);
 
-        if (!ok || written != ciphertext_len) {
+        if (!ok || written != size) {
             set_last_error_fmt("WriteFile failed for staged %s ok=%d written=%lu expected=%lu gle=%lu path=\"%s\"",
                 label ? label : "driver",
                 ok ? 1 : 0,
                 static_cast<unsigned long>(written),
-                ciphertext_len,
+                size,
                 static_cast<unsigned long>(write_gle),
                 out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str());
             return false;
@@ -604,129 +440,8 @@ namespace
         loader_diag_fmt("stage_write_ok label=%s path=\"%s\" bytes=%lu",
             label ? label : "?",
             out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str(),
-            ciphertext_len);
-        record_materialized_file(label, ciphertext_len);
-        return true;
-    }
-
-    bool existing_file_matches(const std::wstring& path, const unsigned char* expected, unsigned long expected_len)
-    {
-        if (path.empty() || !expected)
-            return false;
-        HANDLE hf = CreateFileW(path.c_str(), GENERIC_READ,
-                                FILE_SHARE_READ | FILE_SHARE_DELETE,
-                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hf == INVALID_HANDLE_VALUE)
-            return false;
-        LARGE_INTEGER size = {};
-        if (!GetFileSizeEx(hf, &size) || size.QuadPart != static_cast<LONGLONG>(expected_len)) {
-            CloseHandle(hf);
-            return false;
-        }
-        unsigned char chunk[65536];
-        unsigned long offset = 0;
-        bool matches = true;
-        while (offset < expected_len) {
-            DWORD want = expected_len - offset > sizeof(chunk)
-                ? static_cast<DWORD>(sizeof(chunk))
-                : static_cast<DWORD>(expected_len - offset);
-            DWORD got = 0;
-            if (!ReadFile(hf, chunk, want, &got, nullptr) || got != want ||
-                memcmp(chunk, expected + offset, want) != 0) {
-                matches = false;
-                break;
-            }
-            offset += got;
-        }
-        SecureZeroMemory(chunk, sizeof(chunk));
-        CloseHandle(hf);
-        return matches;
-    }
-
-    bool decrypt_and_materialize_runtime_exe(const unsigned char* ciphertext, unsigned long ciphertext_len,
-                                             const unsigned char* key, unsigned long key_len,
-                                             const unsigned char* nonce, unsigned long nonce_len,
-                                             const unsigned char* tag, unsigned long tag_len,
-                                             const std::wstring& out_path,
-                                             const char* label)
-    {
-        const std::string out_path_utf8 = utf8_from_wide(out_path);
-        loader_diag_fmt("runtime_exe_materialize_begin label=%s path=\"%s\" bytes=%lu",
-            label ? label : "?",
-            out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str(),
-            ciphertext_len);
-
-        auto* buf = static_cast<unsigned char*>(
-            VirtualAlloc(nullptr, ciphertext_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-        if (!buf) {
-            set_last_error_fmt("VirtualAlloc failed for %s runtime buffer gle=%lu bytes=%lu",
-                label ? label : "runtime", static_cast<unsigned long>(GetLastError()), ciphertext_len);
-            return false;
-        }
-
-        if (!aes_gcm_decrypt(ciphertext, ciphertext_len,
-                             key, key_len,
-                             nonce, nonce_len,
-                             tag, tag_len,
-                             buf, ciphertext_len)) {
-            SecureZeroMemory(buf, ciphertext_len);
-            VirtualFree(buf, 0, MEM_RELEASE);
-            return false;
-        }
-
-        if (!verify_blob_integrity(buf, ciphertext_len, ciphertext_len)) {
-            SecureZeroMemory(buf, ciphertext_len);
-            VirtualFree(buf, 0, MEM_RELEASE);
-            set_last_error_fmt("Decrypted %s runtime blob failed PE integrity check", label ? label : "runtime");
-            return false;
-        }
-
-        if (existing_file_matches(out_path, buf, ciphertext_len)) {
-            SecureZeroMemory(buf, ciphertext_len);
-            VirtualFree(buf, 0, MEM_RELEASE);
-            loader_diag_fmt("runtime_exe_reuse_ok label=%s path=\"%s\" bytes=%lu",
-                label ? label : "?",
-                out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str(),
-                ciphertext_len);
-            return true;
-        }
-
-        SetFileAttributesW(out_path.c_str(), FILE_ATTRIBUTE_NORMAL);
-        HANDLE hf = CreateFileW(out_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
-                                nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-        if (hf == INVALID_HANDLE_VALUE) {
-            DWORD gle = GetLastError();
-            SecureZeroMemory(buf, ciphertext_len);
-            VirtualFree(buf, 0, MEM_RELEASE);
-            set_last_error_fmt("CreateFileW failed for runtime %s gle=%lu path=\"%s\"",
-                label ? label : "runtime", static_cast<unsigned long>(gle),
-                out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str());
-            return false;
-        }
-
-        DWORD written = 0;
-        BOOL ok = WriteFile(hf, buf, ciphertext_len, &written, nullptr);
-        DWORD write_gle = GetLastError();
-        FlushFileBuffers(hf);
-        CloseHandle(hf);
-        SecureZeroMemory(buf, ciphertext_len);
-        VirtualFree(buf, 0, MEM_RELEASE);
-
-        if (!ok || written != ciphertext_len) {
-            set_last_error_fmt("WriteFile failed for runtime %s ok=%d written=%lu expected=%lu gle=%lu path=\"%s\"",
-                label ? label : "runtime",
-                ok ? 1 : 0,
-                static_cast<unsigned long>(written),
-                ciphertext_len,
-                static_cast<unsigned long>(write_gle),
-                out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str());
-            return false;
-        }
-        loader_diag_fmt("runtime_exe_materialize_ok label=%s path=\"%s\" bytes=%lu",
-            label ? label : "?",
-            out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str(),
-            ciphertext_len);
-        record_materialized_file(label, ciphertext_len);
+            size);
+        record_materialized_file(label, size);
         return true;
     }
 
@@ -765,34 +480,9 @@ namespace
         return ok || !file_exists(path);
     }
 
-    bool secure_delete(const std::wstring& path)
+    bool delete_staged_file(const std::wstring& path)
     {
         SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
-        HANDLE hf = CreateFileW(path.c_str(), GENERIC_WRITE | DELETE,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                nullptr,
-                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hf != INVALID_HANDLE_VALUE) {
-            LARGE_INTEGER size;
-            if (GetFileSizeEx(hf, &size) && size.QuadPart > 0) {
-                unsigned char zeros[65536];
-                SecureZeroMemory(zeros, sizeof(zeros));
-                LARGE_INTEGER pos = {};
-                SetFilePointerEx(hf, pos, nullptr, FILE_BEGIN);
-                LONGLONG remaining = size.QuadPart;
-                while (remaining > 0) {
-                    DWORD chunk = remaining > static_cast<LONGLONG>(sizeof(zeros))
-                        ? static_cast<DWORD>(sizeof(zeros))
-                        : static_cast<DWORD>(remaining);
-                    DWORD written = 0;
-                    if (!WriteFile(hf, zeros, chunk, &written, nullptr) || written == 0)
-                        break;
-                    remaining -= written;
-                }
-                FlushFileBuffers(hf);
-            }
-            CloseHandle(hf);
-        }
         BOOL deleted = DeleteFileW(path.c_str());
         DWORD delete_gle = deleted ? ERROR_SUCCESS : GetLastError();
         if (!deleted && (delete_gle == ERROR_ACCESS_DENIED ||
@@ -824,7 +514,7 @@ namespace
         loader_diag_fmt("stage_delete label=%s path=\"%s\"",
             label ? label : "?",
             path_utf8.empty() ? "<empty>" : path_utf8.c_str());
-        bool ok = secure_delete(path);
+        bool ok = delete_staged_file(path);
         loader_diag_fmt("stage_delete_result label=%s ok=%d exists_after=%d path=\"%s\"",
             label ? label : "?",
             ok ? 1 : 0,
@@ -1078,7 +768,7 @@ namespace
         return loaded && deleted;
     }
 
-    [[maybe_unused]] bool initialize_with_native_services()
+    bool initialize_with_native_services()
     {
         const ULONGLONG started = GetTickCount64();
         loader_diag_fmt("native_load_begin pid=%lu tid=%lu",
@@ -1098,100 +788,61 @@ namespace
         loader_diag_fmt("native_stage_dir=\"%s\" keep_stage=%d",
             utf8_from_wide(stage).c_str(), should_keep_stage() ? 1 : 0);
 
-        std::wstring whoswho_path = make_stage_path(stage, L".sys");
-        std::wstring sentinel_path = make_stage_path(stage, L".sys");
-        if (whoswho_path.empty() || sentinel_path.empty()) {
+        std::wstring whoswho_path = make_named_stage_path(stage, L"AiDAWhosWho.sys");
+        if (whoswho_path.empty()) {
             cleanup_stage_dir(stage);
-            set_last_error("Failed to allocate native driver stage paths");
+            set_last_error("Failed to allocate native driver stage path");
             return false;
         }
-        loader_diag_fmt("native_stage_paths whoswho=\"%s\" sentinel=\"%s\"",
-            utf8_from_wide(whoswho_path).c_str(),
-            utf8_from_wide(sentinel_path).c_str());
+        loader_diag_fmt("native_stage_path whoswho=\"%s\"",
+            utf8_from_wide(whoswho_path).c_str());
 
-        bool whoswho_written = decrypt_and_write(g_whoswho_ciphertext, g_whoswho_ciphertext_len,
-                                                 g_whoswho_key, sizeof(g_whoswho_key),
-                                                 g_whoswho_nonce, sizeof(g_whoswho_nonce),
-                                                 g_whoswho_tag, sizeof(g_whoswho_tag),
-                                                 whoswho_path, "whoswho");
-        bool sentinel_written = false;
-        if (whoswho_written) {
-            sentinel_written = decrypt_and_write(g_sentinel_ciphertext, g_sentinel_ciphertext_len,
-                                                 g_sentinel_key, sizeof(g_sentinel_key),
-                                                 g_sentinel_nonce, sizeof(g_sentinel_nonce),
-                                                 g_sentinel_tag, sizeof(g_sentinel_tag),
-                                                 sentinel_path, "sentinel");
-        }
+        const bool whoswho_written = write_plain_staged_file(
+            aida_driver_embed::kWhosWhoSys,
+            aida_driver_embed::kWhosWhoSysSize,
+            whoswho_path, "whoswho");
 
         NTSTATUS whoswho_status = STATUS_OBJECT_NAME_NOT_FOUND;
-        NTSTATUS sentinel_status = STATUS_OBJECT_NAME_NOT_FOUND;
         bool whoswho_registry_deleted = true;
-        bool sentinel_registry_deleted = true;
         bool whoswho_loaded = false;
-        bool sentinel_loaded = false;
         bool whoswho_deleted = false;
-        bool sentinel_deleted = false;
 
-        if (whoswho_written && sentinel_written) {
+        if (whoswho_written) {
             whoswho_loaded = load_staged_native_driver(whoswho_path, L"AiDAWhosWho",
                 "whoswho", &whoswho_status, &whoswho_registry_deleted);
-            whoswho_deleted = cleanup_stage_file(whoswho_path, "whoswho");
-            if (whoswho_loaded && whoswho_deleted) {
-                sentinel_loaded = load_staged_native_driver(sentinel_path, L"AiDASentinel",
-                    "sentinel", &sentinel_status, &sentinel_registry_deleted);
-            }
-            sentinel_deleted = cleanup_stage_file(sentinel_path, "sentinel");
-        } else {
-            whoswho_deleted = cleanup_stage_file(whoswho_path, "whoswho");
-            sentinel_deleted = cleanup_stage_file(sentinel_path, "sentinel");
         }
+        whoswho_deleted = cleanup_stage_file(whoswho_path, "whoswho");
 
         bool stage_dir_deleted = cleanup_stage_dir(stage);
 
-        loader_diag_fmt("native_load_summary whoswho_written=%d sentinel_written=%d whoswho_loaded=%d sentinel_loaded=%d whoswho_status=0x%08lX whoswho_status_name=%s sentinel_status=0x%08lX sentinel_status_name=%s whoswho_reg_deleted=%d sentinel_reg_deleted=%d whoswho_file_deleted=%d sentinel_file_deleted=%d stage_dir_deleted=%d elapsed_ms=%llu",
+        loader_diag_fmt("native_load_summary whoswho_written=%d whoswho_loaded=%d whoswho_status=0x%08lX whoswho_status_name=%s whoswho_reg_deleted=%d whoswho_file_deleted=%d stage_dir_deleted=%d elapsed_ms=%llu",
             whoswho_written ? 1 : 0,
-            sentinel_written ? 1 : 0,
             whoswho_loaded ? 1 : 0,
-            sentinel_loaded ? 1 : 0,
             static_cast<unsigned long>(whoswho_status),
             nt_status_name(whoswho_status),
-            static_cast<unsigned long>(sentinel_status),
-            nt_status_name(sentinel_status),
             whoswho_registry_deleted ? 1 : 0,
-            sentinel_registry_deleted ? 1 : 0,
             whoswho_deleted ? 1 : 0,
-            sentinel_deleted ? 1 : 0,
             stage_dir_deleted ? 1 : 0,
             static_cast<unsigned long long>(GetTickCount64() - started));
 
-        if (!whoswho_written || !sentinel_written)
+        if (!whoswho_written)
             return false;
-        if (!whoswho_deleted || !sentinel_deleted) {
-            set_last_error_fmt("Native driver load failed closed: staged driver cleanup failed whoswho_deleted=%d sentinel_deleted=%d",
-                whoswho_deleted ? 1 : 0,
-                sentinel_deleted ? 1 : 0);
+        if (!whoswho_deleted) {
+            set_last_error("Native driver load failed: staged driver cleanup failed");
             return false;
         }
         if (!stage_dir_deleted) {
-            set_last_error("Native driver load failed closed: stage directory cleanup failed");
+            set_last_error("Native driver load failed: stage directory cleanup failed");
             return false;
         }
-        if (!whoswho_registry_deleted || !sentinel_registry_deleted) {
-            set_last_error_fmt("Native driver load failed closed: service registry cleanup failed whoswho_reg_deleted=%d sentinel_reg_deleted=%d",
-                whoswho_registry_deleted ? 1 : 0,
-                sentinel_registry_deleted ? 1 : 0);
+        if (!whoswho_registry_deleted) {
+            set_last_error("Native driver load failed: service registry cleanup failed");
             return false;
         }
         if (!whoswho_loaded) {
             set_last_error_fmt("Native WhosWho load failed status=0x%08lX status_name=%s",
                 static_cast<unsigned long>(whoswho_status),
                 nt_status_name(whoswho_status));
-            return false;
-        }
-        if (!sentinel_loaded) {
-            set_last_error_fmt("Native Sentinel load failed status=0x%08lX status_name=%s",
-                static_cast<unsigned long>(sentinel_status),
-                nt_status_name(sentinel_status));
             return false;
         }
 
@@ -1205,10 +856,7 @@ namespace driver_loader
 {
     bool is_driver_loaded()
     {
-        /*
         return g_loaded;
-        */
-        return true;
     }
 
     void mark_already_loaded()
@@ -1229,21 +877,20 @@ namespace driver_loader
 
         s_last_error.clear();
         loader_diag("initialize_and_load_begin");
-        materialization_summary_scope_t materialization_scope("legacy_mapper");
+        materialization_summary_scope_t materialization_scope("mapper");
 
-        loader_diag("native_services_skipped_unsigned_driver_policy");
-
-        if (!legacy_mapper_enabled()) {
-            loader_diag("legacy_mapper_disabled");
-            set_last_error("Legacy WindMapper loader is disabled by environment");
+        std::wstring mapper_path = resolve_mapper_path();
+        if (mapper_path.empty()) {
+            loader_diag("mapper_not_found_trying_native_load");
+            if (initialize_with_native_services()) {
+                g_loaded = true;
+                return true;
+            }
+            std::string native_error = s_last_error;
+            set_last_error("AiDAWindMapper.exe was not found next to the application and the native service load fallback failed: " + native_error);
             return false;
         }
 
-#ifndef AIDA_LEGACY_DRIVER_MAPPER_AVAILABLE
-        set_last_error("Legacy WindMapper loader is required but not embedded in this build");
-        return false;
-#else
-        loader_diag("legacy_mapper_enabled");
         std::wstring stage = get_stage_dir();
         if (stage.empty()) {
             set_last_error("Failed to resolve LocalAppData stage directory");
@@ -1252,51 +899,26 @@ namespace driver_loader
         loader_diag_fmt("stage_dir=\"%s\" keep_stage=%d",
             utf8_from_wide(stage).c_str(), should_keep_stage() ? 1 : 0);
 
-        std::wstring mapper_path = get_mapper_runtime_path();
         std::wstring whoswho_path = make_named_stage_path(stage, L"AiDAWhosWho.sys");
-        std::wstring sentinel_path = make_named_stage_path(stage, L"AiDASentinel.sys");
-        if (mapper_path.empty() || whoswho_path.empty() || sentinel_path.empty()) {
-            set_last_error("Failed to allocate driver stage paths");
+        if (whoswho_path.empty()) {
+            set_last_error("Failed to allocate driver stage path");
             cleanup_stage_dir(stage);
             return false;
         }
-        loader_diag_fmt("stage_paths mapper=\"%s\" whoswho=\"%s\" sentinel=\"%s\"",
+        loader_diag_fmt("stage_paths mapper=\"%s\" whoswho=\"%s\"",
             utf8_from_wide(mapper_path).c_str(),
-            utf8_from_wide(whoswho_path).c_str(),
-            utf8_from_wide(sentinel_path).c_str());
+            utf8_from_wide(whoswho_path).c_str());
 
-        if (!decrypt_and_materialize_runtime_exe(g_windmapper_ciphertext, g_windmapper_ciphertext_len,
-                                                 g_windmapper_key, sizeof(g_windmapper_key),
-                                                 g_windmapper_nonce, sizeof(g_windmapper_nonce),
-                                                 g_windmapper_tag, sizeof(g_windmapper_tag),
-                                                 mapper_path, "windmapper")) {
-            cleanup_stage_dir(stage);
-            return false;
-        }
-
-        if (!decrypt_and_write(g_whoswho_ciphertext, g_whoswho_ciphertext_len,
-                               g_whoswho_key, sizeof(g_whoswho_key),
-                               g_whoswho_nonce, sizeof(g_whoswho_nonce),
-                               g_whoswho_tag, sizeof(g_whoswho_tag),
-                               whoswho_path, "whoswho")) {
+        if (!write_plain_staged_file(aida_driver_embed::kWhosWhoSys,
+                                     aida_driver_embed::kWhosWhoSysSize,
+                                     whoswho_path, "whoswho")) {
             cleanup_stage_file(whoswho_path, "whoswho");
-            cleanup_stage_dir(stage);
-            return false;
-        }
-
-        if (!decrypt_and_write(g_sentinel_ciphertext, g_sentinel_ciphertext_len,
-                               g_sentinel_key, sizeof(g_sentinel_key),
-                               g_sentinel_nonce, sizeof(g_sentinel_nonce),
-                               g_sentinel_tag, sizeof(g_sentinel_tag),
-                               sentinel_path, "sentinel")) {
-            cleanup_stage_file(whoswho_path, "whoswho");
-            cleanup_stage_file(sentinel_path, "sentinel");
             cleanup_stage_dir(stage);
             return false;
         }
 
         std::wstring cmdline = L"\"" + mapper_path + L"\" \"" +
-                               whoswho_path + L"\" \"" + sentinel_path + L"\"";
+                               whoswho_path + L"\"";
         loader_diag_fmt("mapper_cmdline=\"%s\"", utf8_from_wide(cmdline).c_str());
 
         std::wstring mapper_log_path = resolve_mapper_log_path();
@@ -1337,7 +959,6 @@ namespace driver_loader
             DWORD gle = GetLastError();
             s_materialization_summary.mapper_create_gle = gle;
             s_materialization_summary.whoswho_deleted = cleanup_stage_file(whoswho_path, "whoswho") ? 1 : 0;
-            s_materialization_summary.sentinel_deleted = cleanup_stage_file(sentinel_path, "sentinel") ? 1 : 0;
             s_materialization_summary.stage_dir_deleted = cleanup_stage_dir(stage) ? 1 : 0;
             if (gle == ERROR_VIRUS_INFECTED || gle == ERROR_VIRUS_DELETED) {
                 set_last_error_fmt("Security software blocked mapper stage gle=%lu mapper=\"%s\" stage_dir=\"%s\"",
@@ -1347,6 +968,11 @@ namespace driver_loader
             } else {
                 set_last_error_fmt("CreateProcessW failed for mapper stage gle=%lu mapper=\"%s\"",
                     static_cast<unsigned long>(gle), utf8_from_wide(mapper_path).c_str());
+            }
+            loader_diag("mapper_create_failed_trying_native_load");
+            if (initialize_with_native_services()) {
+                g_loaded = true;
+                return true;
             }
             return false;
         }
@@ -1395,16 +1021,13 @@ namespace driver_loader
             CloseHandle(hJob);
 
         bool whoswho_deleted = cleanup_stage_file(whoswho_path, "whoswho");
-        bool sentinel_deleted = cleanup_stage_file(sentinel_path, "sentinel");
-        bool legacy_stage_dir_deleted = cleanup_stage_dir(stage);
+        bool stage_dir_deleted = cleanup_stage_dir(stage);
         s_materialization_summary.whoswho_deleted = whoswho_deleted ? 1 : 0;
-        s_materialization_summary.sentinel_deleted = sentinel_deleted ? 1 : 0;
-        s_materialization_summary.stage_dir_deleted = legacy_stage_dir_deleted ? 1 : 0;
-        if (!whoswho_deleted || !sentinel_deleted || !legacy_stage_dir_deleted) {
-            set_last_error_fmt("Mapper stage cleanup failed whoswho_deleted=%d sentinel_deleted=%d stage_dir_deleted=%d",
+        s_materialization_summary.stage_dir_deleted = stage_dir_deleted ? 1 : 0;
+        if (!whoswho_deleted || !stage_dir_deleted) {
+            set_last_error_fmt("Mapper stage cleanup failed whoswho_deleted=%d stage_dir_deleted=%d",
                 whoswho_deleted ? 1 : 0,
-                sentinel_deleted ? 1 : 0,
-                legacy_stage_dir_deleted ? 1 : 0);
+                stage_dir_deleted ? 1 : 0);
             return false;
         }
 
@@ -1424,6 +1047,11 @@ namespace driver_loader
             set_last_error_fmt("Mapper stage exited with non-zero status exit_code=0x%08lX log=\"%s\"",
                 static_cast<unsigned long>(exit_code),
                 mapper_log_path.empty() ? "<unresolved>" : utf8_from_wide(mapper_log_path).c_str());
+            loader_diag("mapper_exit_nonzero_trying_native_load");
+            if (initialize_with_native_services()) {
+                g_loaded = true;
+                return true;
+            }
             return false;
         }
 
@@ -1431,6 +1059,5 @@ namespace driver_loader
 
         loader_diag("initialize_and_load_success");
         return true;
-#endif
     }
 }

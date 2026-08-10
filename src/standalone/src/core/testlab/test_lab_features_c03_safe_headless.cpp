@@ -254,10 +254,10 @@ bool safe_source_path(std::string_view value) {
 }
 
 bool category_allowed(std::string_view category) noexcept {
-	static constexpr std::array<std::string_view, 19> allowed{{
+	static constexpr std::array<std::string_view, 18> allowed{{
 		"contract", "fixture", "provider", "layout", "store", "scheduler",
 		"reader", "container", "decode", "recovery", "query", "persistence", "decompiler",
-		"worker", "mcp", "workbench", "performance", "surface", "security"
+		"worker", "mcp", "workbench", "performance", "surface"
 	}};
 	return std::find(allowed.begin(), allowed.end(), category) != allowed.end();
 }
@@ -1129,10 +1129,10 @@ manifest_load_result_t load_manifest(const std::filesystem::path& approved_root,
 		categories.emplace(entry.category);
 		result.manifest.entries.push_back(std::move(entry));
 	}
-	static constexpr std::array<std::string_view, 19> required_categories{{
+	static constexpr std::array<std::string_view, 18> required_categories{{
 		"contract", "fixture", "provider", "layout", "store", "scheduler",
 		"reader", "container", "decode", "recovery", "query", "persistence", "decompiler",
-		"worker", "mcp", "workbench", "performance", "surface", "security"
+		"worker", "mcp", "workbench", "performance", "surface"
 	}};
 	for (const auto category : required_categories) {
 		if (categories.find(std::string(category)) == categories.end()) {

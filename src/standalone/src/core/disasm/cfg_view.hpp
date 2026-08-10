@@ -33,7 +33,6 @@
 #include "ui_anim.hpp"
 #include "../analysis/pdb_events.hpp"
 #include "../analysis/symbol_store.hpp"
-#include "../anti-tamper/webhook.hpp"
 #include "../infra/executor.hpp"
 #include "../infra/event_bus.hpp"
 #include "../ui/motion.hpp"
@@ -779,7 +778,7 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 					block_id,
 					static_cast<unsigned long long>(blocks[bi].start_addr),
 					rows.size());
-				anti_tamper::webhook::write_log("cfg_view", log_buf);
+				diag::log_tagged("cfg_view", log_buf);
 				entry_injections.emplace(block_id, std::move(rows));
 			}
 		}
@@ -1284,7 +1283,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			std::snprintf(log_msg, sizeof(log_msg),
 				"node_render font=disasm_code base_size=%.2f zoom=%.3f final_size=%.2f skip_text=%d",
 				log_base, z, log_final, log_skip ? 1 : 0);
-			anti_tamper::webhook::write_log("cfg", log_msg);
+			diag::log_tagged("cfg", log_msg);
 		}
 	}
 
@@ -1555,7 +1554,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						std::snprintf(log_buf, sizeof(log_buf),
 							"[cfg] sel block=%d line=%d y=%.1f",
 							n.id, hovered_line_idx, io.MousePos.y);
-						anti_tamper::webhook::write_log("cfg_view", log_buf);
+						diag::log_tagged("cfg_view", log_buf);
 					}
 				} else {
 					g_state.text_sel_block = -1;

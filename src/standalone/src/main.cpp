@@ -26,20 +26,10 @@
 #include "core/ui/fonts.hpp"
 #include "core/ui/ide_shell.hpp"
 #include "standalone_chat.hpp"
-#include "standalone_license.hpp"
 #include "standalone_settings.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_tools_fwd.hpp"
-#include "core/runtime/arc_loader.hpp"
 #include "core/runtime/diagnostic_exception_scope.hpp"
-#include "core/runtime/manual_map_tls.hpp"
-#include "core/anti-tamper/orchestrator.hpp"
-#include "core/anti-tamper/anti_hook.hpp"
-#include "core/anti-tamper/hv_preflight.hpp"
-#include "core/anti-tamper/mcp_posture.hpp"
-#include "core/anti-tamper/enforcement.hpp"
-#include "core/anti-tamper/re_tool_preflight.hpp"
-#include "core/runtime/reason_ids.hpp"
 #include "core/mcp/mcp_standalone.hpp"
 #include "core/tools/command_sessions.hpp"
 #include "network_view.hpp"
@@ -52,7 +42,6 @@
 #include "agent_picker_view.hpp"
 #include "settings_overlay.hpp"
 #include "core/infra/taskflow_runtime.hpp"
-#include "core/session/session_health.hpp"
 #include "core/testlab/test_all_features.hpp"
 #include "core/network/burp/camoufox_bridge.hpp"
 #include "helpers/stb_image.h"
@@ -60,9 +49,6 @@
 
 #include "embedded_resources.hpp"
 #include "helpers/diag_log.hpp"
-#include "hardware_id/hardware_id_v2.hpp"
-#include "core/anti-tamper/cff.hpp"
-#include "core/anti-tamper/virtualizer.hpp"
 #include "core/disasm/function_index.hpp"
 #include "core/analysis/pdb_parser.hpp"
 #include "core/auth/auth_http.hpp"
@@ -77,9 +63,6 @@
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <dbghelp.h>
-#include <bcrypt.h>
-
-#pragma comment(lib, "bcrypt.lib")
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "dbghelp.lib")
@@ -94,14 +77,12 @@ namespace test_all_features {
 
 #include <thread>
 #include <cstdarg>
-#include <set>
 #include <atomic>
 #include <exception>
 #include <functional>
 #include <cwchar>
 #include <cstring>
 #include <cstdint>
-#include <sstream>
 #include <string>
 #include <mutex>
 #include <deque>
@@ -521,8 +502,8 @@ static HICON g_aidaWindowIcon = nullptr;
 
 helpers helper;
 HWND g_hwnd = nullptr;
-wchar_t g_aidaWindowTitle[128] = L"AiDA Standalone";
-wchar_t g_aidaClassName[128] = L"AiDAStandaloneWindow";
+wchar_t g_aidaWindowTitle[128] = L"AiDA";
+wchar_t g_aidaClassName[128] = L"AiDA";
 static constexpr const wchar_t* kAidaWindowTitle = g_aidaWindowTitle;
 static constexpr int kAidaFullTestHotkeyId = 0xA1DA;
 static constexpr UINT kAidaUiDispatcherWakeMessage = WM_APP + 0x1DB;
@@ -2239,7 +2220,6 @@ bool g_imgui_dx11_initialized = false;
 
 static DWORD compute_acrylic_color_for_theme()
 {
-    aida::manual_map_tls::ensure_current_thread();
     const auto& t = aida::ui::resolved();
     return ((DWORD)t.acrylic_color & 0x00FFFFFFu) | (0xFFu << 24);
 }
@@ -2248,13 +2228,11 @@ void set_acrylic_color(HWND hwnd)
 {
     if (!aida::ui_thread::require_owner("dwm", "set_acrylic_color", "enter"))
         return;
-    aida::manual_map_tls::ensure_current_thread();
     struct ACCENT_POLICY { DWORD AccentState; DWORD AccentFlags; DWORD GradientColor; DWORD AnimationId; };
     struct WINCOMPATTRDATA { DWORD Attribute; PVOID pData; ULONG DataSize; };
 
     auto SetWindowCompositionAttribute = (BOOL(WINAPI*)(HWND, void*))
         GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
-    aida::manual_map_tls::ensure_current_thread();
     if (!SetWindowCompositionAttribute) return;
 
     DWORD color = compute_acrylic_color_for_theme();
@@ -2262,7 +2240,6 @@ void set_acrylic_color(HWND hwnd)
 
     WINCOMPATTRDATA data = { 19, &accent, sizeof(accent) };
     SetWindowCompositionAttribute(hwnd, &data);
-    aida::manual_map_tls::ensure_current_thread();
     diag::log_tagged_fmt("ui", "acrylic_set color=0x%08X alpha=0xFF (forced opaque)", color);
 }
 
@@ -2283,14 +2260,12 @@ static bool os_prefers_dark()
 
 static void apply_initial_theme()
 {
-    aida::manual_map_tls::ensure_current_thread();
     diag::log_tagged_critical_fmt("theme",
         "apply_initial_theme_enter pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
     aida::ui::apply_immediate(aida::ui::detail::make_aida_dark());
-    aida::manual_map_tls::ensure_current_thread();
     diag::log_tagged_critical_fmt("theme",
         "apply_initial_theme_exit pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
@@ -2304,13 +2279,11 @@ static void apply_os_theme_animated()
 
 static void crash_log_write(const char* msg)
 {
-    aida::manual_map_tls::ensure_current_thread();
     diag::log_tagged("main", msg);
 }
 
 static void crash_log_fmt(const char* fmt, ...)
 {
-    aida::manual_map_tls::ensure_current_thread();
     char buf[2048];
     va_list ap;
     va_start(ap, fmt);
@@ -2321,19 +2294,11 @@ static void crash_log_fmt(const char* fmt, ...)
 
 static void startup_log_critical(const char* detail)
 {
-    aida::manual_map_tls::ensure_current_thread();
-    std::string run_id = standalone_license::run_correlation_id();
-    char tagged[2300] = {};
-    _snprintf_s(tagged, sizeof(tagged), _TRUNCATE,
-        "run_id=%s %s",
-        run_id.c_str(),
-        detail ? detail : "<null>");
-    anti_tamper::webhook::write_log_critical("startup", tagged);
+    diag::log_tagged_critical("startup", detail ? detail : "<null>");
 }
 
 static void startup_log_critical_fmt(const char* fmt, ...)
 {
-    aida::manual_map_tls::ensure_current_thread();
     char buf[2048] = {};
     va_list ap;
     va_start(ap, fmt);
@@ -2416,9 +2381,7 @@ static const char* startup_bg_phase_label(int step)
     case 3: return "Arming memory scanner";
     case 4: return "Spinning up MITM proxy";
     case 5: return "Loading script engine";
-    case 6: return "Fingerprinting code surface";
-    case 7: return "Activating tamper guard";
-    case 8: return "Ready";
+    case 6: return "Ready";
     default: return "<out_of_range>";
     }
 }
@@ -2437,19 +2400,6 @@ static void startup_store_bg_step(int step, const char* source, const char* phas
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-}
-
-static uint64_t diag_fnv1a64(const void* data, size_t len)
-{
-    if (!data)
-        return 0;
-    const auto* p = static_cast<const uint8_t*>(data);
-    uint64_t h = 14695981039346656037ULL;
-    for (size_t i = 0; i < len; ++i) {
-        h ^= static_cast<uint64_t>(p[i]);
-        h *= 1099511628211ULL;
-    }
-    return h;
 }
 
 static void format_phase0_utc_timestamp(char* out, size_t cap)
@@ -2550,11 +2500,9 @@ static void phase0_log_startup_invariants(const char* phase, HWND hwnd)
     const uint64_t invariant_mask = phase0_message_pump_invariant_mask();
     const uint64_t invariant_hash = phase0_message_pump_invariant_fingerprint();
     const DWORD current_tid = GetCurrentThreadId();
-    const std::string run_id = standalone_license::run_correlation_id();
     diag::log_tagged_critical_fmt("PHASE0-INVARIANTS",
-        "record=message_pump_invariants phase=%s run_id=%s pid=%lu tid=%lu utc=%s tick_ms=%llu hwnd=0x%llX ui_owner_available=%d ui_owner_tid=%lu ui_owner_pid=%lu ui_owner_gle=%lu ui_owner_matches_current=%d queued_flags=0x%08X send_only_flags=0x%08X non_send_queue_bits=0x%08lX pump_queue_bits=0x%08lX interactive_queue_bits=0x%08lX pm_remove=0x%08X pm_qs_input=0x%08X pm_qs_postmessage=0x%08X pm_qs_paint=0x%08X pm_qs_sendmessage=0x%08X qs_allinput=0x%08lX qs_current=0x%04lX qs_changed=0x%04lX invariant_mask=0x%016llX invariant_fingerprint=0x%016llX queued_includes_send=%d queued_includes_remove=%d send_only_exact=%d non_send_bits_exclude_send=%d pump_bits_include_send=%d pump_bits_include_non_send=%d interactive_bits_exclude_send=%d empty_queue_nonblocking_probe_contract=%d send_only_drain_contract=%d queued_send_codrain_contract=%d",
+        "record=message_pump_invariants phase=%s pid=%lu tid=%lu utc=%s tick_ms=%llu hwnd=0x%llX ui_owner_available=%d ui_owner_tid=%lu ui_owner_pid=%lu ui_owner_gle=%lu ui_owner_matches_current=%d queued_flags=0x%08X send_only_flags=0x%08X non_send_queue_bits=0x%08lX pump_queue_bits=0x%08lX interactive_queue_bits=0x%08lX pm_remove=0x%08X pm_qs_input=0x%08X pm_qs_postmessage=0x%08X pm_qs_paint=0x%08X pm_qs_sendmessage=0x%08X qs_allinput=0x%08lX qs_current=0x%04lX qs_changed=0x%04lX invariant_mask=0x%016llX invariant_fingerprint=0x%016llX queued_includes_send=%d queued_includes_remove=%d send_only_exact=%d non_send_bits_exclude_send=%d pump_bits_include_send=%d pump_bits_include_non_send=%d interactive_bits_exclude_send=%d empty_queue_nonblocking_probe_contract=%d send_only_drain_contract=%d queued_send_codrain_contract=%d",
         phase ? phase : "<null>",
-        run_id.c_str(),
         GetCurrentProcessId(),
         current_tid,
         utc,
@@ -2794,12 +2742,10 @@ static void phase0_log_wer_registry_scope(const char* phase, HKEY root, const ch
     phase0_registry_dword_result_t dump_type = phase0_query_registry_dword(key, L"DumpType", open_gle);
     phase0_registry_dword_result_t dump_count = phase0_query_registry_dword(key, L"DumpCount", open_gle);
     phase0_registry_dword_result_t custom_flags = phase0_query_registry_dword(key, L"CustomDumpFlags", open_gle);
-    const std::string run_id = standalone_license::run_correlation_id();
     char msg[3600] = {};
     _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-        "record=localdumps_registry phase=%s run_id=%s pid=%lu tid=%lu utc=%s tick_ms=%llu app=AiDAStandalone.exe root=%s view=64 scope=%s key=%s open_ok=%d open_gle=%lu dump_folder_present=%d dump_folder_read_ok=%d dump_folder_gle=%lu dump_folder_type=%lu dump_folder_bytes=%lu dump_folder=%s dump_folder_expand_ok=%d dump_folder_expand_gle=%lu dump_folder_expanded=%s dump_type_present=%d dump_type_read_ok=%d dump_type_gle=%lu dump_type_type=%lu dump_type_bytes=%lu dump_type_value=%lu dump_count_present=%d dump_count_read_ok=%d dump_count_gle=%lu dump_count_type=%lu dump_count_bytes=%lu dump_count_value=%lu custom_dump_flags_present=%d custom_dump_flags_read_ok=%d custom_dump_flags_gle=%lu custom_dump_flags_type=%lu custom_dump_flags_bytes=%lu custom_dump_flags_value=%lu",
+        "record=localdumps_registry phase=%s pid=%lu tid=%lu utc=%s tick_ms=%llu app=AiDAStandalone.exe root=%s view=64 scope=%s key=%s open_ok=%d open_gle=%lu dump_folder_present=%d dump_folder_read_ok=%d dump_folder_gle=%lu dump_folder_type=%lu dump_folder_bytes=%lu dump_folder=%s dump_folder_expand_ok=%d dump_folder_expand_gle=%lu dump_folder_expanded=%s dump_type_present=%d dump_type_read_ok=%d dump_type_gle=%lu dump_type_type=%lu dump_type_bytes=%lu dump_type_value=%lu dump_count_present=%d dump_count_read_ok=%d dump_count_gle=%lu dump_count_type=%lu dump_count_bytes=%lu dump_count_value=%lu custom_dump_flags_present=%d custom_dump_flags_read_ok=%d custom_dump_flags_gle=%lu custom_dump_flags_type=%lu custom_dump_flags_bytes=%lu custom_dump_flags_value=%lu",
         phase ? phase : "<null>",
-        run_id.c_str(),
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         utc,
@@ -2844,15 +2790,13 @@ static void phase0_log_wer_registry_scope(const char* phase, HKEY root, const ch
 static void phase0_log_wer_configuration(const char* phase)
 {
     const uint64_t start_ms = static_cast<uint64_t>(GetTickCount64());
-    const std::string run_id = standalone_license::run_correlation_id();
     char utc[48] = {};
     char module[MAX_PATH] = {};
     format_phase0_utc_timestamp(utc, sizeof(utc));
     GetModuleFileNameA(nullptr, module, static_cast<DWORD>(sizeof(module)));
     diag::log_tagged_critical_fmt("WER-CONFIG",
-        "record=localdumps_scan_start phase=%s run_id=%s pid=%lu tid=%lu utc=%s tick_ms=%llu app=AiDAStandalone.exe module=%s",
+        "record=localdumps_scan_start phase=%s pid=%lu tid=%lu utc=%s tick_ms=%llu app=AiDAStandalone.exe module=%s",
         phase ? phase : "<null>",
-        run_id.c_str(),
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         utc,
@@ -2866,9 +2810,8 @@ static void phase0_log_wer_configuration(const char* phase)
     phase0_log_wer_registry_scope(phase, HKEY_LOCAL_MACHINE, "HKLM", default_subkey, "default");
     format_phase0_utc_timestamp(utc, sizeof(utc));
     diag::log_tagged_critical_fmt("WER-CONFIG",
-        "record=localdumps_scan_end phase=%s run_id=%s pid=%lu tid=%lu utc=%s tick_ms=%llu elapsed_ms=%llu app=AiDAStandalone.exe",
+        "record=localdumps_scan_end phase=%s pid=%lu tid=%lu utc=%s tick_ms=%llu elapsed_ms=%llu app=AiDAStandalone.exe",
         phase ? phase : "<null>",
-        run_id.c_str(),
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         utc,
@@ -2897,23 +2840,20 @@ static aida::infra::executor::submit_result_t submit_main_executor_task(
 static void phase0_post_wer_configuration_logging(const char* phase)
 {
     std::string phase_copy = phase && phase[0] ? phase : "startup";
-    const std::string run_id = standalone_license::run_correlation_id();
     const auto submit_result = submit_main_executor_task(
         "startup",
         "phase0.wer_config",
         aida::infra::executor::domain_t::diagnostics,
         "startup_diagnostics",
         [phase_copy]() {
-        aida::manual_map_tls::ensure_current_thread();
-        phase0_log_wer_configuration(phase_copy.c_str());
+            phase0_log_wer_configuration(phase_copy.c_str());
     });
     const bool posted = submit_result.submitted;
     char utc[48] = {};
     format_phase0_utc_timestamp(utc, sizeof(utc));
     diag::log_tagged_critical_fmt("WER-CONFIG",
-        "record=localdumps_scan_post phase=%s run_id=%s posted=%d pid=%lu tid=%lu utc=%s tick_ms=%llu worker=executor_diagnostics",
+        "record=localdumps_scan_post phase=%s posted=%d pid=%lu tid=%lu utc=%s tick_ms=%llu worker=executor_diagnostics",
         phase_copy.c_str(),
-        run_id.c_str(),
         posted ? 1 : 0,
         GetCurrentProcessId(),
         GetCurrentThreadId(),
@@ -2921,45 +2861,14 @@ static void phase0_post_wer_configuration_logging(const char* phase)
         static_cast<unsigned long long>(GetTickCount64()));
     if (!posted) {
         diag::log_tagged_critical_fmt("WER-CONFIG",
-            "record=localdumps_scan_post_failed phase=%s run_id=%s reason=%.180s pid=%lu tid=%lu utc=%s tick_ms=%llu worker=executor_diagnostics",
+            "record=localdumps_scan_post_failed phase=%s reason=%.180s pid=%lu tid=%lu utc=%s tick_ms=%llu worker=executor_diagnostics",
             phase_copy.c_str(),
-            run_id.c_str(),
             submit_result.reject_reason.empty() ? "<none>" : submit_result.reject_reason.c_str(),
             GetCurrentProcessId(),
             GetCurrentThreadId(),
             utc,
             static_cast<unsigned long long>(GetTickCount64()));
     }
-}
-
-static std::string generate_startup_run_correlation_id()
-{
-    LARGE_INTEGER qpc{};
-    QueryPerformanceCounter(&qpc);
-    uint64_t entropy[8] = {};
-    entropy[0] = static_cast<uint64_t>(GetCurrentProcessId());
-    entropy[1] = static_cast<uint64_t>(GetCurrentThreadId());
-    entropy[2] = static_cast<uint64_t>(GetTickCount64());
-    entropy[3] = static_cast<uint64_t>(qpc.QuadPart);
-    entropy[4] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&entropy));
-#if defined(_M_X64)
-    entropy[5] = static_cast<uint64_t>(__rdtsc());
-#else
-    entropy[5] = entropy[2] ^ entropy[3];
-#endif
-    entropy[6] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)));
-    entropy[7] = diag_fnv1a64(entropy, sizeof(entropy) - sizeof(entropy[7]));
-    const uint64_t h1 = diag_fnv1a64(entropy, sizeof(entropy));
-    entropy[0] ^= h1;
-    entropy[4] += h1;
-    const uint64_t h2 = diag_fnv1a64(entropy, sizeof(entropy));
-    char buf[80] = {};
-    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-        "%08lX-%016llX-%016llX",
-        static_cast<unsigned long>(GetCurrentProcessId()),
-        static_cast<unsigned long long>(h1),
-        static_cast<unsigned long long>(h2));
-    return std::string(buf);
 }
 
 static void format_message_pump_stall_context(char* out, size_t cap);
@@ -4073,8 +3982,7 @@ namespace aida_hotkey_monitor {
     }
 
     inline void run(HWND hwnd) {
-        aida::manual_map_tls::ensure_current_thread();
-        const DWORD tid = GetCurrentThreadId();
+            const DWORD tid = GetCurrentThreadId();
         g_thread_id.store(tid, std::memory_order_release);
         startup_log_critical_fmt("hotkey_monitor_worker_enter hwnd=0x%llX pid=%lu tid=%lu tick=%llu",
             static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
@@ -4310,264 +4218,6 @@ namespace aida_shutdown_diag {
         const uint64_t now = static_cast<uint64_t>(GetTickCount64());
         return tick != 0 && now >= tick ? now - tick : 0;
     }
-}
-
-static void run_phase_1_2_self_tests()
-{
-    crash_log_write("phase_1_2_test:start");
-
-    {
-        int visited[4] = {0, 0, 0, 0};
-        int order[8] = {0};
-        int order_pos = 0;
-        CFF_BEGIN(p12_test_a)
-        CFF_STATE(p12_test_a, 0)
-        {
-            visited[0]++;
-            if (order_pos < 8) order[order_pos++] = 0;
-            CFF_GOTO(p12_test_a, 1);
-        }
-        CFF_STATE(p12_test_a, 1)
-        {
-            visited[1]++;
-            if (order_pos < 8) order[order_pos++] = 1;
-            CFF_GOTO(p12_test_a, 2);
-        }
-        CFF_STATE(p12_test_a, 2)
-        {
-            visited[2]++;
-            if (order_pos < 8) order[order_pos++] = 2;
-            CFF_GOTO(p12_test_a, 3);
-        }
-        CFF_STATE(p12_test_a, 3)
-        {
-            visited[3]++;
-            if (order_pos < 8) order[order_pos++] = 3;
-            CFF_EXIT(p12_test_a);
-        }
-        CFF_END(p12_test_a)
-
-        bool ok = visited[0] == 1 && visited[1] == 1 && visited[2] == 1 && visited[3] == 1;
-        crash_log_fmt("phase_1_2_test:cff_exec ok=%d v=[%d,%d,%d,%d] order=[%d,%d,%d,%d]",
-                      ok ? 1 : 0,
-                      visited[0], visited[1], visited[2], visited[3],
-                      order[0], order[1], order[2], order[3]);
-    }
-
-    {
-        anti_tamper::cff::detail::cff_ctx_t ctx =
-            anti_tamper::cff::detail::init_ctx(0xA1B2C3D4E5F60718ULL);
-        const uint64_t fixed_plain = 5;
-        const int sample_count = 10;
-        uint64_t samples[sample_count] = {};
-        for (int i = 0; i < sample_count; ++i)
-            samples[i] = anti_tamper::cff::detail::encrypt_state(ctx, fixed_plain);
-
-        std::set<uint64_t> uniq;
-        for (int i = 0; i < sample_count; ++i)
-            uniq.insert(samples[i]);
-
-        bool all_distinct = uniq.size() == static_cast<size_t>(sample_count);
-        crash_log_fmt(
-            "phase_1_2_test:cff_distinctness all_distinct=%d unique=%zu of %d",
-            all_distinct ? 1 : 0, uniq.size(), sample_count);
-        for (int i = 0; i < sample_count; ++i)
-            crash_log_fmt("phase_1_2_test:cff_sample [%d]=0x%016llX", i,
-                          static_cast<unsigned long long>(samples[i]));
-    }
-
-    {
-        const uint64_t seed = 0xC0DECAFE5EEDB001ULL;
-        const uint8_t plaintext[16] = {
-            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
-            0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x11
-        };
-        uint8_t encrypted[16] = {};
-        uint8_t decrypted[16] = {};
-
-        anti_tamper::virtualizer::detail::cipher_stream_t enc_s;
-        anti_tamper::virtualizer::detail::cipher_stream_init(enc_s, seed);
-        for (int i = 0; i < 16; ++i)
-            encrypted[i] = anti_tamper::virtualizer::detail::cipher_stream_xcrypt(enc_s, plaintext[i], true);
-
-        anti_tamper::virtualizer::detail::cipher_stream_t dec_s;
-        anti_tamper::virtualizer::detail::cipher_stream_init(dec_s, seed);
-        for (int i = 0; i < 16; ++i)
-            decrypted[i] = anti_tamper::virtualizer::detail::cipher_stream_xcrypt(dec_s, encrypted[i], false);
-
-        bool roundtrip_ok = memcmp(plaintext, decrypted, 16) == 0;
-
-        uint64_t old_key = seed;
-        uint8_t old_xor_stream[16] = {};
-        for (int i = 0; i < 16; ++i)
-        {
-            old_xor_stream[i] = static_cast<uint8_t>(old_key & 0xFF);
-            old_key ^= old_key << 13;
-            old_key ^= old_key >> 7;
-            old_key ^= old_key << 17;
-        }
-
-        bool differs_from_old = false;
-        uint8_t new_keystream[16];
-        for (int i = 0; i < 16; ++i)
-            new_keystream[i] = static_cast<uint8_t>(plaintext[i] ^ encrypted[i]);
-        for (int i = 0; i < 16; ++i)
-        {
-            if (new_keystream[i] != old_xor_stream[i])
-            {
-                differs_from_old = true;
-                break;
-            }
-        }
-
-        bool input_dependent = false;
-        {
-            uint8_t alt_plain[16];
-            memcpy(alt_plain, plaintext, 16);
-            alt_plain[0] ^= 0xFF;
-            uint8_t alt_enc[16];
-            anti_tamper::virtualizer::detail::cipher_stream_t alt_s;
-            anti_tamper::virtualizer::detail::cipher_stream_init(alt_s, seed);
-            for (int i = 0; i < 16; ++i)
-                alt_enc[i] = anti_tamper::virtualizer::detail::cipher_stream_xcrypt(alt_s, alt_plain[i], true);
-            uint8_t alt_keystream[16];
-            for (int i = 0; i < 16; ++i)
-                alt_keystream[i] = static_cast<uint8_t>(alt_plain[i] ^ alt_enc[i]);
-
-            for (int i = 1; i < 16; ++i)
-            {
-                if (alt_keystream[i] != new_keystream[i])
-                {
-                    input_dependent = true;
-                    break;
-                }
-            }
-        }
-
-        crash_log_fmt(
-            "phase_1_2_test:vm_stream roundtrip=%d diff_from_old_xor=%d input_dependent=%d",
-            roundtrip_ok ? 1 : 0,
-            differs_from_old ? 1 : 0,
-            input_dependent ? 1 : 0);
-
-        char enc_hex[64] = {};
-        char old_hex[64] = {};
-        char new_hex[64] = {};
-        for (int i = 0; i < 16; ++i)
-        {
-            _snprintf_s(enc_hex + i * 2, sizeof(enc_hex) - i * 2, _TRUNCATE,
-                        "%02X", encrypted[i]);
-            _snprintf_s(old_hex + i * 2, sizeof(old_hex) - i * 2, _TRUNCATE,
-                        "%02X", old_xor_stream[i]);
-            _snprintf_s(new_hex + i * 2, sizeof(new_hex) - i * 2, _TRUNCATE,
-                        "%02X", new_keystream[i]);
-        }
-        crash_log_fmt("phase_1_2_test:vm_stream encrypted=%s", enc_hex);
-        crash_log_fmt("phase_1_2_test:vm_stream old_xor_ks=%s", old_hex);
-        crash_log_fmt("phase_1_2_test:vm_stream new_ks=%s", new_hex);
-    }
-
-    crash_log_write("phase_1_2_test:done");
-}
-
-static std::wstring widen_message_text(const std::string& text)
-{
-    if (text.empty()) return std::wstring();
-    int len = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
-    if (len <= 0) return std::wstring(text.begin(), text.end());
-    std::wstring out;
-    out.resize(static_cast<size_t>(len));
-    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), len);
-    return out;
-}
-
-static void show_ban_refuse_ui_and_exit(const std::string& reason, const std::string& message)
-{
-    std::wstring final_message = widen_message_text(message.empty()
-        ? std::string("AiDA cannot start because this machine or network is banned.")
-        : message);
-    if (!reason.empty()) {
-        final_message += L"\n\nCode: ";
-        final_message += widen_message_text(reason);
-    }
-    MessageBoxW(nullptr, final_message.c_str(), L"AiDA",
-        MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_TOPMOST);
-    ExitProcess(1);
-}
-
-static std::string mcp_posture_refusal_detail(const anti_tamper::mcp_posture::report_t& report)
-{
-    const anti_tamper::mcp_posture::finding_t* denied = nullptr;
-    std::size_t denied_count = 0;
-    for (const auto& finding : report.findings) {
-        if (!finding.deny)
-            continue;
-        if (!denied)
-            denied = &finding;
-        ++denied_count;
-    }
-    if (!denied)
-        return {};
-    std::ostringstream out;
-    out << "Detected MCP entry:";
-    if (!denied->source.empty())
-        out << "\nSource: " << denied->source;
-    if (!denied->config_path.empty())
-        out << "\nConfig: " << denied->config_path;
-    if (!denied->server_name.empty())
-        out << "\nServer: " << denied->server_name;
-    out << "\nTransport: " << anti_tamper::mcp_posture::detail::transport_name(denied->transport);
-    if (!denied->reason.empty())
-        out << "\nReason: " << denied->reason;
-    if (!denied->command.empty())
-        out << "\nCommand: " << denied->command;
-    if (!denied->url.empty())
-        out << "\nURL: " << denied->url;
-    if (!denied->remediation.empty())
-        out << "\n\nAction: " << denied->remediation;
-    if (denied_count > 1)
-        out << "\n\nAdditional denied MCP entries: " << (denied_count - 1);
-    return out.str();
-}
-
-static void show_mcp_posture_refuse_ui_and_exit(const anti_tamper::mcp_posture::report_t& report)
-{
-    char summary[64] = {};
-    _snprintf_s(summary, sizeof(summary), _TRUNCATE, "0x%016llX",
-        static_cast<unsigned long long>(report.summary_hash));
-    startup_log_critical_fmt("mcp_posture_refuse_ui_enter trusted=%d denied=%d latched=%d summary_hash=%s reason_hash=0x%016llX",
-        report.trusted ? 1 : 0,
-        report.denied ? 1 : 0,
-        report.latched ? 1 : 0,
-        summary,
-        static_cast<unsigned long long>(diag_fnv1a64(report.reason.data(), report.reason.size())));
-    crash_log_fmt("mcp_posture_refuse summary_hash=%s", summary);
-    std::wstring final_message = L"AiDA cannot start because untrusted or suspicious MCP tooling is configured on this system.";
-    const std::string detail = mcp_posture_refusal_detail(report);
-    if (!detail.empty()) {
-        const auto denied = std::find_if(report.findings.begin(), report.findings.end(), [](const auto& f) { return f.deny; });
-        if (denied != report.findings.end()) {
-            startup_log_critical_fmt("mcp_posture_refuse_detail source=%s server=%s reason=%s config=%s command=%s url=%s",
-                denied->source.c_str(),
-                denied->server_name.c_str(),
-                denied->reason.c_str(),
-                denied->config_path.c_str(),
-                denied->command.c_str(),
-                denied->url.c_str());
-        }
-        final_message += L"\n\n";
-        final_message += widen_message_text(detail);
-    }
-    final_message += L"\n\nCode: mcp_posture_untrusted";
-    final_message += L"\nSummary: ";
-    final_message += widen_message_text(summary);
-    MessageBoxW(nullptr, final_message.c_str(), L"AiDA",
-        MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_TOPMOST);
-    std::string extra = std::string("mcp_posture_untrusted summary_hash=") + summary;
-    anti_tamper::enforce_violation_id(
-        aida::reason_ids::reason_id_from_string("mcp_posture_untrusted"),
-        extra);
-    ExitProcess(1);
 }
 
 __declspec(noinline) static DWORD cpp_render_title(helpers* h, uint64_t frame_number, ImGuiErrorRecoveryState* imgui_state_backup)
@@ -5425,9 +5075,6 @@ static void emit_window_hung_snapshot(
     test_all_features::current_phase_and_step(nullptr, 0, testlab_step_buf, sizeof(testlab_step_buf), &testlab_step_start);
     const uint64_t testlab_step_elapsed = (testlab_step_start != 0 && now_ms >= testlab_step_start)
         ? (now_ms - testlab_step_start) : 0;
-    const uint64_t arc_completed_at = standalone_license::activation_completed_at();
-    const uint64_t arc_liveness = (arc_completed_at != 0 && now_ms >= arc_completed_at)
-        ? (now_ms - arc_completed_at) : 0;
     const uint64_t input_event_age = (g_last_input_event_tick_ms != 0 && now_ms >= g_last_input_event_tick_ms)
         ? (now_ms - g_last_input_event_tick_ms) : 0;
 
@@ -5487,7 +5134,7 @@ static void emit_window_hung_snapshot(
     hctx.testlab_step = testlab_step_buf;
     hctx.testlab_step_elapsed_ms = testlab_step_elapsed;
     hctx.license_liveness_ms = 0;
-    hctx.arc_liveness_ms = arc_liveness;
+    hctx.arc_liveness_ms = 0;
     hctx.driver_watchdog_ms = driver_bridge::driver_watchdog_age_ms();
     hctx.mcp_snapshot = mcp_snapshot;
     hctx.queue_snapshot = queue_snapshot;
@@ -5935,9 +5582,8 @@ static void format_shutdown_crash_snapshot(char* out, size_t cap)
     const char* render_phase = aida_tracer::g_render_phase_name.load(std::memory_order_acquire);
     const char* dispatch_stage = aida_tracer::g_dispatch_stage.load(std::memory_order_acquire);
     const char* wndproc_stage = aida_tracer::g_wndproc_stage.load(std::memory_order_acquire);
-    std::string latch_source = anti_tamper::runtime_integrity_latch_source_snapshot();
     _snprintf_s(out, cap, _TRUNCATE,
-        "shutdown_phase=%s shutdown_phase_age_ms=%llu tid=%lu thread_desc=%s render_phase=%s dispatch_stage=%s dispatch_msg=%s(0x%04X) wndproc_stage=%s wndproc_msg=%s(0x%04X) queues={%s} latch_source={%.700s}",
+        "shutdown_phase=%s shutdown_phase_age_ms=%llu tid=%lu thread_desc=%s render_phase=%s dispatch_stage=%s dispatch_msg=%s(0x%04X) wndproc_stage=%s wndproc_msg=%s(0x%04X) queues={%s}",
         shutdown_phase ? shutdown_phase : "<null>",
         static_cast<unsigned long long>(aida_shutdown_diag::phase_age_ms()),
         GetCurrentThreadId(),
@@ -5949,8 +5595,7 @@ static void format_shutdown_crash_snapshot(char* out, size_t cap)
         wndproc_stage ? wndproc_stage : "<null>",
         aida_tracer::message_name(aida_tracer::g_wndproc_msg.load(std::memory_order_acquire)),
         aida_tracer::g_wndproc_msg.load(std::memory_order_acquire),
-        queue_snapshot,
-        latch_source.empty() ? "<none>" : latch_source.c_str());
+        queue_snapshot);
 }
 
 __declspec(noinline) static DWORD seh_init_standalone_chat()
@@ -5963,7 +5608,6 @@ __declspec(noinline) static DWORD seh_init_standalone_chat()
     __try {
         init_standalone_chat();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        anti_tamper::init_guard::mark_seh_abort(GetExceptionCode(), "seh_init_standalone_chat");
         aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_init_standalone_chat");
         startup_log_critical_fmt("seh_init_standalone_chat_exception code=0x%08X elapsed_ms=%llu last_err=%lu",
             GetExceptionCode(),
@@ -6076,111 +5720,6 @@ static std::atomic<bool> g_authorized_features_initialized{false};
 static std::atomic<bool> g_authorized_features_posted{false};
 static std::atomic<bool> g_camoufox_prewarm_posted{false};
 static std::atomic<bool> g_script_engine_startup_init_posted{false};
-static std::atomic<int> g_arc_startup_gate_state{0};
-static std::atomic<bool> g_arc_startup_gate_posted{false};
-
-static void post_arc_startup_gate_unseal()
-{
-    int state = g_arc_startup_gate_state.load(std::memory_order_acquire);
-    if (state == 1 || state == 2)
-        return;
-    bool expected = false;
-    if (!g_arc_startup_gate_posted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
-        return;
-    g_arc_startup_gate_state.store(1, std::memory_order_release);
-    globals::ui::arc_unseal_phase.store(1, std::memory_order_release);
-    const uint64_t queued_at = static_cast<uint64_t>(GetTickCount64());
-    bool posted = false;
-    try {
-        const auto submit_result = submit_main_executor_task(
-            "license",
-            "license.arc_startup_gate_unseal",
-            aida::infra::executor::domain_t::security_liveness,
-            "security_liveness",
-            [queued_at]() {
-        uint8_t gate_nonce[32] = {};
-        uint8_t poly_seed[32] = {};
-        uint32_t poly_seed_len = 0;
-        bool unseal_ok = false;
-        size_t bind_token_len = 0;
-        size_t cp = 0;
-        try {
-            std::string sess_tok = standalone_license::get_arc_bind_token();
-            if (sess_tok.empty())
-                sess_tok = standalone_license::get_session_token();
-            bind_token_len = sess_tok.size();
-            cp = sess_tok.size();
-            if (cp > sizeof(gate_nonce))
-                cp = sizeof(gate_nonce);
-            if (cp > 0)
-                memcpy(gate_nonce, sess_tok.data(), cp);
-            const uint64_t gate_nonce_hash = diag_fnv1a64(gate_nonce, sizeof(gate_nonce));
-            diag::log_tagged_critical_fmt("license",
-                "arc_render_gate_nonce_source_async bind_token_len=%zu used_len=%zu nonce_hash=0x%016llX queued_ms=%llu",
-                bind_token_len,
-                cp,
-                static_cast<unsigned long long>(gate_nonce_hash),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at));
-
-            constexpr uint32_t kPolymorphismSeedFeatureId = 1u;
-            unseal_ok = standalone_license::arc_unseal_feature_blocking(
-                kPolymorphismSeedFeatureId,
-                gate_nonce, sizeof(gate_nonce),
-                poly_seed, &poly_seed_len, sizeof(poly_seed));
-        } catch (const std::exception& e) {
-            diag::log_tagged_critical_fmt("license",
-                "arc_render_gate_unseal_exception what=%.180s bind_token_len=%zu used_len=%zu elapsed_ms=%llu",
-                e.what(),
-                bind_token_len,
-                cp,
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at));
-        } catch (...) {
-            aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "arc_render_gate_unseal");
-            diag::log_tagged_critical_fmt("license",
-                "arc_render_gate_unseal_exception what=<unknown> bind_token_len=%zu used_len=%zu elapsed_ms=%llu",
-                bind_token_len,
-                cp,
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at));
-        }
-
-        if (!unseal_ok || poly_seed_len != 32) {
-            diag::log_tagged_critical_fmt("license",
-                "arc_render_gate_unseal_FAIL_ASYNC unseal_ok=%d poly_seed_len=%u bind_token_len=%zu elapsed_ms=%llu",
-                unseal_ok ? 1 : 0,
-                poly_seed_len,
-                bind_token_len,
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at));
-            globals::ui::arc_unseal_phase.store(3, std::memory_order_release);
-            g_arc_startup_gate_state.store(3, std::memory_order_release);
-            SecureZeroMemory(poly_seed, sizeof(poly_seed));
-            SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
-            __fastfail(0xA1DAFA17u);
-        }
-
-        SecureZeroMemory(poly_seed, sizeof(poly_seed));
-        SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
-        g_arc_startup_gate_state.store(2, std::memory_order_release);
-        globals::ui::arc_unseal_phase.store(2, std::memory_order_release);
-        diag::log_tagged_critical_fmt("license",
-            "arc_render_gate_unseal_OK_ASYNC elapsed_ms=%llu bind_token_len=%zu",
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at),
-            bind_token_len);
-        });
-        posted = submit_result.submitted;
-    } catch (const std::exception& e) {
-        diag::log_tagged_critical_fmt("license", "arc_render_gate_unseal_post_exception what=%.180s", e.what());
-    } catch (...) {
-        aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "arc_render_gate_unseal_post");
-        diag::log_tagged_critical("license", "arc_render_gate_unseal_post_exception what=<unknown>");
-    }
-    if (!posted) {
-        g_arc_startup_gate_posted.store(false, std::memory_order_release);
-        g_arc_startup_gate_state.store(3, std::memory_order_release);
-        globals::ui::arc_unseal_phase.store(3, std::memory_order_release);
-        diag::log_tagged_critical("license", "arc_render_gate_unseal_post_failed");
-        __fastfail(0xA1DAFA18u);
-    }
-}
 
 static void post_script_engine_startup_initialize()
 {
@@ -6343,95 +5882,6 @@ static void run_authorized_feature_initializers(const char* source)
         static_cast<unsigned long long>(GetTickCount64()));
     diag::log_tagged_fmt("bg_init", "authorized_feature_initializers_done source=%s ok=%d",
         source ? source : "unknown", ok ? 1 : 0);
-}
-
-__declspec(noinline) static DWORD seh_snapshot_code_hashes()
-{
-    const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-    startup_log_critical_fmt("seh_snapshot_code_hashes_enter pid=%lu tid=%lu tick=%llu",
-        GetCurrentProcessId(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(started));
-    __try {
-        bool ok = standalone_license::snapshot_code_hashes();
-        startup_log_critical_fmt("seh_snapshot_code_hashes_call_post ok=%d elapsed_ms=%llu last_err=%lu",
-            ok ? 1 : 0,
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
-            static_cast<unsigned long>(GetLastError()));
-        if (!ok)
-            return ERROR_GEN_FAILURE;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_snapshot_code_hashes");
-        startup_log_critical_fmt("seh_snapshot_code_hashes_exception code=0x%08X elapsed_ms=%llu last_err=%lu",
-            GetExceptionCode(),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
-            static_cast<unsigned long>(GetLastError()));
-        return GetExceptionCode();
-    }
-    startup_log_critical_fmt("seh_snapshot_code_hashes_exit elapsed_ms=%llu last_err=%lu",
-        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
-        static_cast<unsigned long>(GetLastError()));
-    return 0;
-}
-
-__declspec(noinline) static void cpp_anti_tamper_initialize(bool& out_result)
-{
-    const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-    startup_log_critical_fmt("cpp_anti_tamper_initialize_enter pid=%lu tid=%lu tick=%llu",
-        GetCurrentProcessId(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(started));
-    try
-    {
-        out_result = anti_tamper::initialize();
-        startup_log_critical_fmt("cpp_anti_tamper_initialize_exit result=%d elapsed_ms=%llu last_err=%lu",
-            out_result ? 1 : 0,
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
-            static_cast<unsigned long>(GetLastError()));
-    }
-    catch (const std::exception& e)
-    {
-        startup_log_critical_fmt("cpp_anti_tamper_initialize_exception elapsed_ms=%llu what=%.160s",
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
-            e.what());
-        diag::log_tagged_fmt("bg_init", "anti_tamper_initialize_cpp_exception what=%s", e.what());
-        out_result = false;
-    }
-    catch (...)
-    {
-        aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "cpp_anti_tamper_initialize");
-        startup_log_critical_fmt("cpp_anti_tamper_initialize_exception elapsed_ms=%llu what=<unknown>",
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
-        diag::log_tagged("bg_init", "anti_tamper_initialize_unknown_cpp_exception");
-        out_result = false;
-    }
-}
-
-__declspec(noinline) static DWORD seh_anti_tamper_initialize(bool& out_result)
-{
-    out_result = false;
-    const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-    startup_log_critical_fmt("seh_anti_tamper_initialize_enter pid=%lu tid=%lu tick=%llu",
-        GetCurrentProcessId(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(started));
-    __try {
-        cpp_anti_tamper_initialize(out_result);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        anti_tamper::init_guard::mark_seh_abort(GetExceptionCode(), "seh_anti_tamper_initialize");
-        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_anti_tamper_initialize");
-        startup_log_critical_fmt("seh_anti_tamper_initialize_exception code=0x%08X result=%d elapsed_ms=%llu last_err=%lu",
-            GetExceptionCode(),
-            out_result ? 1 : 0,
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
-            static_cast<unsigned long>(GetLastError()));
-        return GetExceptionCode();
-    }
-    startup_log_critical_fmt("seh_anti_tamper_initialize_exit result=%d elapsed_ms=%llu last_err=%lu",
-        out_result ? 1 : 0,
-        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
-        static_cast<unsigned long>(GetLastError()));
-    return 0;
 }
 
 static void log_driver_bridge_initialize_call_post(bool ok, uint64_t started)
@@ -6673,12 +6123,6 @@ static LONG CALLBACK aida_diagnostic_veh(EXCEPTION_POINTERS* ep)
 {
     if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     DWORD code = ep->ExceptionRecord->ExceptionCode;
-    if (code == STATUS_SINGLE_STEP &&
-        (anti_tamper::anti_dump::read_intercept::consume_pending_single_step(ep, "diagnostic_veh") ||
-            anti_tamper::anti_dump::read_intercept::consume_orphan_single_step(ep, "diagnostic_veh_orphan")))
-    {
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
     if (code == 0x40010006u || code == 0x4001000Au || code == DBG_PRINTEXCEPTION_C ||
         code == DBG_PRINTEXCEPTION_WIDE_C ||
         code == 0x406D1388u ||
@@ -6687,11 +6131,6 @@ static LONG CALLBACK aida_diagnostic_veh(EXCEPTION_POINTERS* ep)
         code == STATUS_GUARD_PAGE_VIOLATION ||
         code == STATUS_SINGLE_STEP ||
         code == EXCEPTION_BREAKPOINT)
-    {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    if (code == EXCEPTION_PRIV_INSTRUCTION &&
-        anti_tamper::anti_emulation::expected_privileged_instruction_probe_active())
     {
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -6806,125 +6245,10 @@ static void log_disk_backed_startup_state(const char* phase)
         static_cast<unsigned long long>(tls_slot51));
 }
 
-static std::string get_customer_id_for_window_gen()
-{
-    std::string id = g_sa_settings.license_key;
-    if (id.empty())
-        id = "aida_default_customer";
-    return id;
-}
-
-namespace aida_preflight {
-
-static void base32_encode(const uint8_t* data, size_t data_len, char* out, size_t out_cap)
-{
-    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    if (!out || out_cap == 0) return;
-    size_t out_idx = 0;
-    size_t bit_buf = 0;
-    int bits_in_buf = 0;
-    for (size_t i = 0; i < data_len && out_idx + 1 < out_cap; ++i) {
-        bit_buf = (bit_buf << 8) | data[i];
-        bits_in_buf += 8;
-        while (bits_in_buf >= 5 && out_idx + 1 < out_cap) {
-            int idx = static_cast<int>((bit_buf >> (bits_in_buf - 5)) & 0x1F);
-            out[out_idx++] = alphabet[idx];
-            bits_in_buf -= 5;
-        }
-    }
-    if (bits_in_buf > 0 && out_idx + 1 < out_cap) {
-        int idx = static_cast<int>((bit_buf << (5 - bits_in_buf)) & 0x1F);
-        out[out_idx++] = alphabet[idx];
-    }
-    out[out_idx] = '\0';
-}
-
-static void sha256_hkdf_extract(const uint8_t* ikm, size_t ikm_len,
-                                const uint8_t* salt, size_t salt_len,
-                                uint8_t out[32])
-{
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0 || !alg)
-        return;
-
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    if (BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) != 0 || !hash) {
-        BCryptCloseAlgorithmProvider(alg, 0);
-        return;
-    }
-
-    if (salt && salt_len > 0)
-        BCryptHashData(hash, const_cast<PUCHAR>(salt), static_cast<ULONG>(salt_len), 0);
-    if (ikm && ikm_len > 0)
-        BCryptHashData(hash, const_cast<PUCHAR>(ikm), static_cast<ULONG>(ikm_len), 0);
-    BCryptFinishHash(hash, out, 32, 0);
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(alg, 0);
-}
-
-static void generate_window_class_name(wchar_t* out, size_t out_cap)
-{
-#ifdef AIDA_DEV_MODE
-    wcsncpy_s(out, out_cap, L"AiDA_DevClass", _TRUNCATE);
-    return;
-#else
-    std::string cid = get_customer_id_for_window_gen();
-    const char class_salt[] = ":aida_class_salt";
-    std::string ikm = cid + class_salt;
-
-    uint8_t hash[32] = {};
-    sha256_hkdf_extract(
-        reinterpret_cast<const uint8_t*>(ikm.data()), ikm.size(),
-        nullptr, 0, hash);
-
-    char class_name[32] = {};
-    base32_encode(hash, 10, class_name, sizeof(class_name));
-
-    wchar_t wname[32] = {};
-    MultiByteToWideChar(CP_ACP, 0, class_name, -1, wname, 32);
-    wcsncpy_s(out, out_cap, wname, _TRUNCATE);
-#endif
-}
-
-static void generate_window_title(wchar_t* out, size_t out_cap)
-{
-#ifdef AIDA_DEV_MODE
-    wcsncpy_s(out, out_cap, L"AiDA [DEV BUILD - NOT FOR DISTRIBUTION]", _TRUNCATE);
-    return;
-#else
-    std::string cid = get_customer_id_for_window_gen();
-    const char title_salt[] = ":aida_title_salt";
-    std::string ikm = cid + title_salt;
-
-    uint8_t hash[32] = {};
-    sha256_hkdf_extract(
-        reinterpret_cast<const uint8_t*>(ikm.data()), ikm.size(),
-        nullptr, 0, hash);
-
-    char title_part[32] = {};
-    base32_encode(hash, 8, title_part, sizeof(title_part));
-
-    char full_title[64] = {};
-    _snprintf_s(full_title, sizeof(full_title), _TRUNCATE, "App_%s", title_part);
-
-    wchar_t wtitle[64] = {};
-    MultiByteToWideChar(CP_ACP, 0, full_title, -1, wtitle, 64);
-    wcsncpy_s(out, out_cap, wtitle, _TRUNCATE);
-#endif
-}
-
-}
-
 int main(int, char**)
 {
     aida_early_startup::install();
     aida_early_startup::mark("main_enter");
-    aida_early_startup::mark("manual_map_tls_pre");
-    aida::manual_map_tls::ensure_current_thread();
-    aida_early_startup::mark("manual_map_tls_current_thread_ok");
-    const std::string startup_run_id = generate_startup_run_correlation_id();
-    standalone_license::set_run_correlation_id(startup_run_id);
-    aida_early_startup::mark("run_correlation_id_set");
     aida_early_startup::mark("diagnostic_exception_scope_initialize_pre");
     bool diagnostic_scope_ready = aida::diagnostic_exception_scope::initialize();
     aida_early_startup::mark(diagnostic_scope_ready ? "diagnostic_exception_scope_initialized" : "diagnostic_exception_scope_failed");
@@ -6938,8 +6262,7 @@ int main(int, char**)
     aida::infra::executor::set_ui_owner_tid(::GetCurrentThreadId());
     aida::infra::taskflow_eval::log_evaluation();
     diag::log_tagged_critical_fmt("startup",
-        "run_correlation_generated run_id=%s pid=%lu tid=%lu tick=%llu",
-        startup_run_id.c_str(),
+        "startup_begin pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
@@ -7010,96 +6333,8 @@ int main(int, char**)
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
 
-    {
-        aida_early_startup::mark("post_gate_hwid_collect_pre");
-        const uint64_t hwid_tick = static_cast<uint64_t>(GetTickCount64());
-        startup_log_critical_fmt("hwid_collect_pre pid=%lu tid=%lu tick=%llu",
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(hwid_tick));
-        aida::hardware_id::v2::collection_t collection{};
-        std::string hwid_err;
-        bool hwid_ok = aida::hardware_id::v2::collect(collection, hwid_err);
-        std::string hwid_hex = hwid_ok
-            ? aida::hardware_id::v2::hash_to_hex(collection.hwid_hash)
-            : std::string("unavailable");
-        uint32_t collected = 0;
-        char factor_log[900] = {};
-        size_t factor_off = 0;
-        for (const auto& factor : collection.factors) {
-            if (factor.collected) ++collected;
-            std::string fh = aida::hardware_id::v2::hash_to_hex(factor.factor_hash);
-            int wrote = _snprintf_s(factor_log + factor_off,
-                sizeof(factor_log) - factor_off,
-                _TRUNCATE,
-                "%s%u:%s:%zu:%s",
-                factor_off == 0 ? "" : ",",
-                static_cast<unsigned>(factor.id),
-                factor.collected ? fh.substr(0, 8).c_str() : "miss",
-                factor.bytes.size(),
-                factor.id == aida::hardware_id::v2::kFactorIdTpmEkSha256 ? "tpm_disabled" : "hw");
-            if (wrote <= 0) break;
-            factor_off += static_cast<size_t>(wrote);
-            if (factor_off >= sizeof(factor_log) - 1) break;
-        }
-        char hwid_log_msg[512];
-        _snprintf_s(hwid_log_msg, sizeof(hwid_log_msg), _TRUNCATE,
-            "hwid_v2_composition ok=%d mask=0x%08X collected=%u tpm=%d tpm_policy=disabled hwid=%.16s err=%.96s",
-            hwid_ok ? 1 : 0,
-            collection.factor_present_mask,
-            collected,
-            collection.tpm_present ? 1 : 0,
-            hwid_hex.c_str(),
-            hwid_ok ? "" : hwid_err.c_str());
-        startup_log_critical_fmt("hwid_collect_post ok=%d mask=0x%08X collected=%u factors=%zu elapsed_ms=%llu err_hash=0x%016llX",
-            hwid_ok ? 1 : 0,
-            collection.factor_present_mask,
-            collected,
-            collection.factors.size(),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - hwid_tick),
-            static_cast<unsigned long long>(diag_fnv1a64(hwid_err.data(), hwid_err.size())));
-        crash_log_write(hwid_log_msg);
-        char hwid_factor_msg[1024];
-        _snprintf_s(hwid_factor_msg, sizeof(hwid_factor_msg), _TRUNCATE,
-            "hwid_v2_factors %s", factor_log);
-        crash_log_write(hwid_factor_msg);
-        SecureZeroMemory(collection.hwid_hash.data(), collection.hwid_hash.size());
-        for (auto& factor : collection.factors) {
-            SecureZeroMemory(factor.factor_hash.data(), factor.factor_hash.size());
-            if (!factor.bytes.empty()) SecureZeroMemory(factor.bytes.data(), factor.bytes.size());
-        }
-    }
-
-    aida_early_startup::mark("post_gate_hwid_collect_done");
-
-    aida_early_startup::mark("post_gate_phase_1_2_self_tests_pre");
-    run_phase_1_2_self_tests();
-    aida_early_startup::mark("post_gate_phase_1_2_self_tests_done");
-
-    aida_early_startup::mark("post_gate_arc_import_cache_prime_pre");
-    startup_log_critical_fmt("arc_import_cache_prime_pre pid=%lu tid=%lu tick=%llu",
-        GetCurrentProcessId(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(GetTickCount64()));
-    arc_loader::prime_import_cache();
-    aida_early_startup::mark("post_gate_arc_import_cache_prime_done");
-    startup_log_critical_fmt("arc_import_cache_prime_post pid=%lu tid=%lu tick=%llu",
-        GetCurrentProcessId(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(GetTickCount64()));
-    crash_log_write("arc_import_cache_primed");
-    aida_early_startup::mark("post_gate_arc_import_cache_primed");
-
     aida_early_startup::mark("post_gate_unhandled_exception_filter_set_pre");
     SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
-        if (ep && ep->ExceptionRecord &&
-            ep->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP &&
-            (anti_tamper::anti_dump::read_intercept::consume_pending_single_step(ep, "unhandled_filter") ||
-                anti_tamper::anti_dump::read_intercept::consume_orphan_single_step(ep, "unhandled_filter_orphan")))
-        {
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-
         if (ep && ep->ExceptionRecord && ep->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP)
         {
             HMODULE single_step_mod = nullptr;
@@ -7133,8 +6368,6 @@ int main(int, char**)
             diag::write_crash_log(single_step_buf, false);
             diag::log_tagged_critical("exception", single_step_buf);
         }
-
-        standalone_anti_dump::handle_strip::clear_critical_flags();
 
         char buf[16384];
         HMODULE crash_mod = nullptr;
@@ -7247,9 +6480,7 @@ int main(int, char**)
             ctx.testlab_phase = testlab_phase_buf;
             ctx.testlab_step = testlab_step_buf;
             ctx.testlab_step_start_ms = testlab_step_start;
-            const uint64_t arc_completed_at = standalone_license::activation_completed_at();
-            ctx.arc_liveness_ms = (arc_completed_at != 0 && crash_now_ms >= arc_completed_at)
-                ? (crash_now_ms - arc_completed_at) : 0;
+            ctx.arc_liveness_ms = 0;
             ctx.driver_watchdog_ms = driver_bridge::driver_watchdog_age_ms();
             ctx.license_liveness_ms = 0;
             char thread_classes_buf[320] = {};
@@ -7290,63 +6521,10 @@ int main(int, char**)
             aida::diagnostics::crash::log_crash_snapshot(ctx);
         }
 
-        anti_tamper::webhook::send_debug_log("crash", buf, true);
-
         return EXCEPTION_CONTINUE_SEARCH;
     });
     crash_log_write("exception_filter_set");
     aida_early_startup::mark("post_gate_exception_filter_set");
-
-    {
-        aida_early_startup::mark("post_gate_re_tool_preflight_pre");
-        const uint64_t re_tool_tick = static_cast<uint64_t>(GetTickCount64());
-        startup_log_critical_fmt("re_tool_preflight_pre pid=%lu tid=%lu tick=%llu",
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(re_tool_tick));
-        auto re_result = re_tool_preflight::check_window_titles();
-        startup_log_critical_fmt("re_tool_preflight_post re_detected=%d ida_detected=%d elapsed_ms=%llu",
-            re_result.re_tool_detected ? 1 : 0,
-            re_result.ida_detected ? 1 : 0,
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - re_tool_tick));
-        crash_log_write("re_tool_preflight_done");
-        aida_early_startup::mark("post_gate_re_tool_preflight_done");
-        if (re_result.re_tool_detected) {
-            startup_log_critical_fmt("re_tool_preflight_refuse sig=%.32ws pid=%lu tid=%lu tick=%llu",
-                re_result.detected_sig ? re_result.detected_sig : L"<null>",
-                GetCurrentProcessId(),
-                GetCurrentThreadId(),
-                static_cast<unsigned long long>(GetTickCount64()));
-            re_tool_preflight::show_refuse_dialog_and_exit(re_result);
-        }
-    }
-
-    {
-        aida_early_startup::mark("post_gate_hv_preflight_pre");
-        const uint64_t hv_tick = static_cast<uint64_t>(GetTickCount64());
-        startup_log_critical_fmt("hv_preflight_run_pre pid=%lu tid=%lu tick=%llu",
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(hv_tick));
-        auto r = anti_tamper::hv_preflight::run();
-        startup_log_critical_fmt("hv_preflight_run_post result=%u ms_hv=%d hvci=%d vbs=%d elapsed_ms=%llu",
-            static_cast<unsigned>(r.result),
-            anti_tamper::hv_preflight::g_ms_hv_approved ? 1 : 0,
-            anti_tamper::hv_preflight::g_hvci_enabled ? 1 : 0,
-            anti_tamper::hv_preflight::g_vbs_enabled ? 1 : 0,
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - hv_tick));
-        crash_log_write("hv_preflight_done");
-        aida_early_startup::mark("post_gate_hv_preflight_done");
-        if (r.result != anti_tamper::hv_preflight::result_t::allow)
-        {
-            startup_log_critical_fmt("hv_preflight_refuse_ui_enter result=%u pid=%lu tid=%lu tick=%llu",
-                static_cast<unsigned>(r.result),
-                GetCurrentProcessId(),
-                GetCurrentThreadId(),
-                static_cast<unsigned long long>(GetTickCount64()));
-            anti_tamper::hv_preflight::show_refuse_ui_and_exit(r);
-        }
-    }
 
     {
         aida_early_startup::mark("post_gate_settings_load_pre");
@@ -7366,156 +6544,9 @@ int main(int, char**)
         g_sa_settings.ghost_text_enabled    = true;
         g_sa_settings.auto_save_enabled     = true;
         crash_log_fmt("startup_settings_loaded=%d", settings_loaded ? 1 : 0);
-        try {
-            aida_early_startup::mark("post_gate_mcp_posture_scan_pre");
-            auto mcp_report = anti_tamper::mcp_posture::scan_startup_posture(g_sa_settings);
-            startup_log_critical_fmt("mcp_posture_scan_post trusted=%d denied=%d latched=%d files=%zu servers=%zu suspicious=%zu summary_hash=0x%016llX elapsed_ms=%llu",
-                mcp_report.trusted ? 1 : 0,
-                mcp_report.denied ? 1 : 0,
-                mcp_report.latched ? 1 : 0,
-                mcp_report.files_seen,
-                mcp_report.servers_seen,
-                mcp_report.suspicious,
-                static_cast<unsigned long long>(mcp_report.summary_hash),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - settings_tick));
-            aida_early_startup::mark("post_gate_mcp_posture_scan_done");
-            if (!mcp_report.trusted)
-                show_mcp_posture_refuse_ui_and_exit(mcp_report);
-        } catch (const std::exception& e) {
-            anti_tamper::mcp_posture::report_t mcp_report;
-            mcp_report.scanned = true;
-            mcp_report.trusted = false;
-            mcp_report.denied = true;
-            mcp_report.reason = "scan_exception";
-            mcp_report.summary_hash = anti_tamper::mcp_posture::sanitized_summary_hash(mcp_report);
-            startup_log_critical_fmt("mcp_posture_scan_exception elapsed_ms=%llu what_hash=0x%016llX",
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - settings_tick),
-                static_cast<unsigned long long>(diag_fnv1a64(e.what(), std::strlen(e.what()))));
-            show_mcp_posture_refuse_ui_and_exit(mcp_report);
-        } catch (...) {
-            aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "mcp_posture_scan");
-            anti_tamper::mcp_posture::report_t mcp_report;
-            mcp_report.scanned = true;
-            mcp_report.trusted = false;
-            mcp_report.denied = true;
-            mcp_report.reason = "scan_exception";
-            mcp_report.summary_hash = anti_tamper::mcp_posture::sanitized_summary_hash(mcp_report);
-            startup_log_critical_fmt("mcp_posture_scan_unknown_exception elapsed_ms=%llu",
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - settings_tick));
-            show_mcp_posture_refuse_ui_and_exit(mcp_report);
-        }
-        std::string ban_reason;
-        std::string ban_message;
-        aida_early_startup::mark("post_gate_startup_ban_check_pre");
-        if (standalone_license::startup_ban_check(g_sa_settings, ban_reason, ban_message)) {
-            startup_log_critical_fmt("startup_ban_refuse reason_hash=0x%016llX reason_len=%zu elapsed_ms=%llu",
-                static_cast<unsigned long long>(diag_fnv1a64(ban_reason.data(), ban_reason.size())),
-                ban_reason.size(),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - settings_tick));
-            crash_log_fmt("startup_ban_refuse reason=%.128s", ban_reason.c_str());
-            show_ban_refuse_ui_and_exit(ban_reason, ban_message);
-        }
         startup_log_critical_fmt("settings_load_post loaded=%d elapsed_ms=%llu",
             settings_loaded ? 1 : 0,
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - settings_tick));
-        crash_log_write("startup_ban_check_passed");
-        aida_early_startup::mark("post_gate_startup_ban_check_done");
-
-        {
-            aida_early_startup::mark("post_gate_re_tool_hash_preflight_pre");
-            const uint64_t hash_tick = static_cast<uint64_t>(GetTickCount64());
-            std::string server_host = "https://aidapro.net";
-            std::string lic_key = g_sa_settings.license_key;
-            std::string sess_token = standalone_license::get_session_token();
-            startup_log_critical_fmt("re_tool_hash_preflight_pre has_key=%d has_token=%d tick=%llu",
-                !lic_key.empty() ? 1 : 0,
-                !sess_token.empty() ? 1 : 0,
-                static_cast<unsigned long long>(hash_tick));
-            if (!lic_key.empty() && !sess_token.empty()) {
-                aida_early_startup::mark("post_gate_re_tool_hash_fetch_pre");
-                auto hashes = re_tool_preflight::fetch_re_tool_hashes(server_host, lic_key, sess_token);
-                aida_early_startup::mark("post_gate_re_tool_hash_fetch_done");
-                startup_log_critical_fmt("re_tool_hash_preflight_post count=%zu elapsed_ms=%llu",
-                    hashes.size(),
-                    static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - hash_tick));
-                if (!hashes.empty()) {
-                    bool hash_match = re_tool_preflight::check_process_hashes(hashes);
-                    if (hash_match) {
-                        startup_log_critical_fmt("re_tool_hash_preflight_refuse pid=%lu tid=%lu tick=%llu",
-                            GetCurrentProcessId(),
-                            GetCurrentThreadId(),
-                            static_cast<unsigned long long>(GetTickCount64()));
-                        re_tool_preflight::preflight_result_t hash_result = {};
-                        hash_result.re_tool_detected = true;
-                        hash_result.detected_sig = L"<hash_match>";
-                        hash_result.detected_title[0] = L'\0';
-                        re_tool_preflight::show_refuse_dialog_and_exit(hash_result);
-                    }
-                    re_tool_preflight::push_hashes_to_kernel(hashes);
-                }
-                aida_early_startup::mark("post_gate_werfault_hash_fetch_pre");
-                auto wf_hashes = re_tool_preflight::fetch_werfault_hashes(server_host, lic_key, sess_token);
-                aida_early_startup::mark("post_gate_werfault_hash_fetch_done");
-                startup_log_critical_fmt("werfault_hash_preflight_post count=%zu elapsed_ms=%llu",
-                    wf_hashes.size(),
-                    static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - hash_tick));
-                if (!wf_hashes.empty()) {
-                    re_tool_preflight::push_werfault_hashes_to_kernel(wf_hashes);
-                }
-                re_tool_preflight::set_refresh_credentials(server_host, lic_key);
-
-                {
-                    const uint64_t ce_hash_tick = static_cast<uint64_t>(GetTickCount64());
-                    startup_log_critical_fmt("ce_driver_hash_refresh_pre tick=%llu",
-                        static_cast<unsigned long long>(ce_hash_tick));
-                    aida_early_startup::mark("post_gate_ce_driver_hash_refresh_pre");
-                    try {
-                        re_tool_preflight::refresh_ce_driver_hashes();
-                    } catch (...) {
-                        startup_log_critical_fmt("ce_driver_hash_refresh_exception pid=%lu tid=%lu",
-                            GetCurrentProcessId(), GetCurrentThreadId());
-                    }
-                    startup_log_critical_fmt("ce_driver_hash_refresh_post elapsed_ms=%llu",
-                        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - ce_hash_tick));
-                    aida_early_startup::mark("post_gate_ce_driver_hash_refresh_done");
-                    crash_log_write("ce_driver_hash_refresh_done");
-                }
-
-                {
-                    const uint64_t wf_hash_tick = static_cast<uint64_t>(GetTickCount64());
-                    startup_log_critical_fmt("werfault_hash_refresh_pre tick=%llu",
-                        static_cast<unsigned long long>(wf_hash_tick));
-                    aida_early_startup::mark("post_gate_werfault_hash_refresh_pre");
-                    try {
-                        re_tool_preflight::refresh_werfault_hashes();
-                    } catch (...) {
-                        startup_log_critical_fmt("werfault_hash_refresh_exception pid=%lu tid=%lu",
-                            GetCurrentProcessId(), GetCurrentThreadId());
-                    }
-                    startup_log_critical_fmt("werfault_hash_refresh_post elapsed_ms=%llu",
-                        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - wf_hash_tick));
-                    aida_early_startup::mark("post_gate_werfault_hash_refresh_done");
-                    crash_log_write("werfault_hash_refresh_done");
-                }
-
-                {
-                    const uint64_t ph_tick = static_cast<uint64_t>(GetTickCount64());
-                    startup_log_critical_fmt("prologue_hash_fetch_pre tick=%llu",
-                        static_cast<unsigned long long>(ph_tick));
-                    aida_early_startup::mark("post_gate_prologue_hash_fetch_pre");
-                    anti_tamper::anti_hook::fetch_server_prologue_hashes(server_host, lic_key, sess_token);
-                    aida_early_startup::mark("post_gate_prologue_hash_fetch_done");
-                    startup_log_critical_fmt("prologue_hash_fetch_post elapsed_ms=%llu",
-                        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - ph_tick));
-                    crash_log_write("prologue_hash_fetch_done");
-                }
-            } else {
-                startup_log_critical_fmt("re_tool_hash_preflight_skip no_credentials elapsed_ms=%llu",
-                    static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - hash_tick));
-            }
-            crash_log_write("re_tool_hash_preflight_done");
-            aida_early_startup::mark("post_gate_re_tool_hash_preflight_done");
-        }
     }
 
     aida_early_startup::mark("post_gate_appusermodelid_pre");
@@ -7537,8 +6568,8 @@ int main(int, char**)
     aida_early_startup::mark("post_gate_dpi_awareness_done");
 
     aida_early_startup::mark("post_gate_window_identity_generate_pre");
-    aida_preflight::generate_window_class_name(g_aidaClassName, 128);
-    aida_preflight::generate_window_title(g_aidaWindowTitle, 128);
+    wcsncpy_s(g_aidaClassName, L"AiDA", _TRUNCATE);
+    wcsncpy_s(g_aidaWindowTitle, L"AiDA", _TRUNCATE);
     startup_log_critical_fmt("window_identity_generated class_len=%zu title_len=%zu pid=%lu tid=%lu",
         wcslen(g_aidaClassName), wcslen(g_aidaWindowTitle),
         GetCurrentProcessId(), GetCurrentThreadId());
@@ -7666,25 +6697,18 @@ int main(int, char**)
         static_cast<unsigned long long>(GetTickCount64()));
     aida_early_startup::mark("post_gate_show_window_pre");
     ::ShowWindow(hwnd, SW_SHOW);
-    aida::manual_map_tls::ensure_current_thread();
     if (!aida::ui_thread::require_owner("dwm", "startup_window_attributes", "show_window"))
         return 1;
     const MARGINS margin = { -1 };
     DwmExtendFrameIntoClientArea(hwnd, &margin);
-    aida::manual_map_tls::ensure_current_thread();
     DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_ROUND;
     DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
-    aida::manual_map_tls::ensure_current_thread();
 
     COLORREF border_color = RGB(33, 35, 39);
     DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border_color, sizeof(border_color));
-    aida::manual_map_tls::ensure_current_thread();
-    aida::manual_map_tls::ensure_current_thread();
 
     set_acrylic_color(hwnd);
-    aida::manual_map_tls::ensure_current_thread();
     ::UpdateWindow(hwnd);
-    aida::manual_map_tls::ensure_current_thread();
     startup_log_critical_fmt("show_window_post hwnd=0x%llX last_err=%lu",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
         static_cast<unsigned long>(GetLastError()));
@@ -7710,7 +6734,6 @@ int main(int, char**)
     }
 
     IMGUI_CHECKVERSION();
-    aida::manual_map_tls::ensure_current_thread();
     aida_early_startup::mark("post_gate_imgui_context_create_pre");
     startup_log_critical_fmt("imgui_context_create_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
@@ -7720,11 +6743,9 @@ int main(int, char**)
         return 1;
     ImGui::CreateContext();
     aida_early_startup::mark("post_gate_imgui_context_create_done");
-    aida::manual_map_tls::ensure_current_thread();
     startup_log_critical_fmt("imgui_context_create_post ctx=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(ImGui::GetCurrentContext())));
     crash_log_write("imgui_context_created");
-    aida::manual_map_tls::ensure_current_thread();
     startup_log_critical_fmt("imgui_getio_pre ctx=0x%llX pid=%lu tid=%lu tick=%llu",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(ImGui::GetCurrentContext())),
         GetCurrentProcessId(),
@@ -7737,7 +6758,6 @@ int main(int, char**)
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(&io)),
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts)),
         static_cast<unsigned>(io.ConfigFlags));
-    aida::manual_map_tls::ensure_current_thread();
     startup_log_critical_fmt("imgui_config_flags_pre flags=0x%08X nav_capture=%d",
         static_cast<unsigned>(io.ConfigFlags),
         io.ConfigNavCaptureKeyboard ? 1 : 0);
@@ -7751,15 +6771,13 @@ int main(int, char**)
 
 
     {
-        aida::manual_map_tls::ensure_current_thread();
-        startup_log_critical_fmt("dpi_scale_query_pre hwnd=0x%llX pid=%lu tid=%lu tick=%llu",
+            startup_log_critical_fmt("dpi_scale_query_pre hwnd=0x%llX pid=%lu tid=%lu tick=%llu",
             static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
             GetCurrentProcessId(),
             GetCurrentThreadId(),
             static_cast<unsigned long long>(GetTickCount64()));
         UINT dpi = GetDpiForWindow(hwnd);
-        aida::manual_map_tls::ensure_current_thread();
-        globals::ui::dpi_scale = (dpi > 0) ? (static_cast<float>(dpi) / 96.0f) : 1.0f;
+            globals::ui::dpi_scale = (dpi > 0) ? (static_cast<float>(dpi) / 96.0f) : 1.0f;
         aida::ui::set_dpi_scale(globals::ui::dpi_scale);
         startup_log_critical_fmt("dpi_scale_query_post dpi=%u scale=%.3f last_err=%lu",
             dpi,
@@ -7767,13 +6785,11 @@ int main(int, char**)
             static_cast<unsigned long>(GetLastError()));
     }
 
-    aida::manual_map_tls::ensure_current_thread();
     startup_log_critical_fmt("apply_initial_theme_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
     apply_initial_theme();
-    aida::manual_map_tls::ensure_current_thread();
     startup_log_critical_fmt("apply_initial_theme_post pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
@@ -7843,7 +6859,7 @@ int main(int, char**)
 
     static std::atomic<bool> bg_init_done{false};
     globals::ui::bg_init_done = &bg_init_done;
-    globals::ui::bg_init_total.store(8, std::memory_order_release);
+    globals::ui::bg_init_total.store(6, std::memory_order_release);
     globals::ui::bg_init_step.store(0, std::memory_order_release);
     startup_log_critical_fmt("bg_init_config total=%d initial_step=%d label=%s pid=%lu tid=%lu tick=%llu",
         globals::ui::bg_init_total.load(std::memory_order_acquire),
@@ -7924,177 +6940,28 @@ int main(int, char**)
         run_step("init_standalone_chat_start", "init_standalone_chat", "standalone_chat_init_ok", 1,
             []() { return seh_init_standalone_chat(); });
 
-        const bool runtime_authorized = license::validated &&
-            standalone_license::is_valid() &&
-            standalone_license::is_arc_loaded();
-        diag::log_tagged_fmt("bg_init", "runtime_authorized_after_chat validated=%d valid=%d arc=%d",
-            license::validated ? 1 : 0,
-            standalone_license::is_valid() ? 1 : 0,
-            standalone_license::is_arc_loaded() ? 1 : 0);
+        run_step("network_view_init_start", "network_view_init", "network_view_init_ok", 2,
+            []() { return seh_network_view_initialize(); });
 
-        if (runtime_authorized)
-        {
-            run_step("network_view_init_start", "network_view_init", "network_view_init_ok", 2,
-                []() { return seh_network_view_initialize(); });
+        run_step("memory_scanner_init_start", "memory_scanner_init", "memory_scanner_init_ok", 3,
+            []() { return seh_memory_scanner_initialize(); });
 
-            run_step("memory_scanner_init_start", "memory_scanner_init", "memory_scanner_init_ok", 3,
-                []() { return seh_memory_scanner_initialize(); });
+        run_step("mitm_proxy_pre_init_start", "mitm_proxy_pre_init", "mitm_proxy_pre_init_ok", 4,
+            []() { return seh_mitm_proxy_pre_initialize(); });
 
-            run_step("mitm_proxy_pre_init_start", "mitm_proxy_pre_init", "mitm_proxy_pre_init_ok", 4,
-                []() { return seh_mitm_proxy_pre_initialize(); });
-
-            startup_log_critical_fmt("bg_init_script_engine_async_pre phase=script_engine_init target_step=5 target_label=%s pid=%lu tid=%lu tick=%llu",
-                startup_bg_phase_label(5),
-                GetCurrentProcessId(),
-                GetCurrentThreadId(),
-                static_cast<unsigned long long>(GetTickCount64()));
-            diag::log_tagged("bg_init", "script_engine_init_async_start");
-            post_script_engine_startup_initialize();
-            startup_store_bg_step(5, "bg_init_worker", "script_engine_init_async_posted");
-            diag::log_tagged("bg_init", "script_engine_init_async_posted");
-            g_authorized_features_initialized.store(true, std::memory_order_release);
-            g_authorized_features_posted.store(true, std::memory_order_release);
-        }
-        else
-        {
-            diag::log_tagged("bg_init", "feature_init_deferred_until_arc_authorized");
-            startup_store_bg_step(5, "bg_init_worker", "feature_init_deferred_until_arc_authorized");
-        }
-
-        if (runtime_authorized)
-        {
-            run_step("code_hashes_snapshot_start", "code_hashes_snapshot", "code_hashes_snapshot_ok", 6,
-                []() { return seh_snapshot_code_hashes(); });
-        }
-        else
-        {
-            diag::log_tagged_fmt("bg_init",
-                "code_hashes_snapshot_waiting_for_arc_authorized validated=%d valid=%d arc=%d",
-                license::validated ? 1 : 0,
-                standalone_license::is_valid() ? 1 : 0,
-                standalone_license::is_arc_loaded() ? 1 : 0);
-        }
-
-        {
-            startup_store_bg_step(7, "bg_init_worker", "pre_activation_anti_tamper_initialize_entering");
-            const uint64_t anti_tamper_tick = static_cast<uint64_t>(GetTickCount64());
-            driver_bridge::dynamic_ioctl_state_t pre_at_dyn{};
-            {
-                pre_at_dyn = driver_bridge::dynamic_ioctl_state();
-                auto& at_rt = anti_tamper::state::get();
-                startup_log_critical_fmt("anti_tamper_pre_activation_state initialized=%d driver_hardening=%d hardening_active=%d violation=%d runtime_authorized=%d validated=%d valid=%d arc=%d dyn_loaded=%d dyn_kernel=%d dyn_connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
-                    at_rt.initialized.load(std::memory_order_acquire) ? 1 : 0,
-                    at_rt.driver_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
-                    at_rt.driver_hardening_active.load(std::memory_order_acquire) ? 1 : 0,
-                    at_rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0,
-                    runtime_authorized ? 1 : 0,
-                    license::validated ? 1 : 0,
-                    standalone_license::is_valid() ? 1 : 0,
-                    standalone_license::is_arc_loaded() ? 1 : 0,
-                    pre_at_dyn.loaded ? 1 : 0,
-                    pre_at_dyn.kernel ? 1 : 0,
-                    pre_at_dyn.connected ? 1 : 0,
-                    pre_at_dyn.ready ? 1 : 0,
-                    pre_at_dyn.instance_server_seed,
-                    pre_at_dyn.instance_ioctl_seed,
-                    pre_at_dyn.global_server_seed,
-                    pre_at_dyn.global_ioctl_seed,
-                    pre_at_dyn.ioctl_seed_hash,
-                    pre_at_dyn.heartbeat_ioctl_seed_hash);
-            }
-            const bool pre_activation_driver_unseeded = pre_at_dyn.loaded && pre_at_dyn.kernel && pre_at_dyn.connected && !pre_at_dyn.ready;
-            if (!runtime_authorized && pre_activation_driver_unseeded)
-            {
-                startup_log_critical_fmt("anti_tamper_initialize_deferred_dynamic_ioctl_not_ready runtime_authorized=0 validated=%d valid=%d arc=%d dyn_loaded=%d dyn_kernel=%d dyn_connected=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
-                    license::validated ? 1 : 0,
-                    standalone_license::is_valid() ? 1 : 0,
-                    standalone_license::is_arc_loaded() ? 1 : 0,
-                    pre_at_dyn.loaded ? 1 : 0,
-                    pre_at_dyn.kernel ? 1 : 0,
-                    pre_at_dyn.connected ? 1 : 0,
-                    pre_at_dyn.instance_server_seed,
-                    pre_at_dyn.instance_ioctl_seed,
-                    pre_at_dyn.global_server_seed,
-                    pre_at_dyn.global_ioctl_seed,
-                    pre_at_dyn.ioctl_seed_hash,
-                    pre_at_dyn.heartbeat_ioctl_seed_hash);
-                diag::log_tagged("bg_init", "pre_activation_anti_tamper_initialize_deferred_dynamic_ioctl_not_ready");
-            }
-            else
-            {
-                startup_log_critical_fmt("anti_tamper_initialize_call_pre pid=%lu tid=%lu tick=%llu runtime_authorized=%d validated=%d valid=%d arc=%d",
-                GetCurrentProcessId(),
-                GetCurrentThreadId(),
-                static_cast<unsigned long long>(anti_tamper_tick),
-                runtime_authorized ? 1 : 0,
-                license::validated ? 1 : 0,
-                standalone_license::is_valid() ? 1 : 0,
-                standalone_license::is_arc_loaded() ? 1 : 0);
-            diag::log_tagged("bg_init", "pre_activation_anti_tamper_initialize_entering");
-            bool at_result = false;
-            DWORD seh_at = 0;
-            try {
-                seh_at = seh_anti_tamper_initialize(at_result);
-            } catch (const std::exception& e) {
-                startup_log_critical_fmt("anti_tamper_initialize_cpp_exception elapsed_ms=%llu what=%.160s",
-                    static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - anti_tamper_tick),
-                    e.what());
-                diag::log_tagged_fmt("bg_init", "anti_tamper_initialize_cpp_exception what=%s", e.what());
-            } catch (...) {
-                aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "bg_init_anti_tamper_initialize");
-                startup_log_critical_fmt("anti_tamper_initialize_cpp_exception elapsed_ms=%llu what=<unknown>",
-                    static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - anti_tamper_tick));
-                diag::log_tagged("bg_init", "anti_tamper_initialize_cpp_exception what=<unknown>");
-            }
-            if (seh_at != 0)
-                diag::log_tagged_fmt("bg_init", "anti_tamper_initialize_seh code=0x%08X last_err=%lu", seh_at, GetLastError());
-            startup_log_critical_fmt("anti_tamper_initialize_call_post result=%d seh=0x%08X violation=%d elapsed_ms=%llu last_err=%lu",
-                at_result ? 1 : 0,
-                seh_at,
-                anti_tamper::state::get().violation_latched.load(std::memory_order_acquire) ? 1 : 0,
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - anti_tamper_tick),
-                static_cast<unsigned long>(GetLastError()));
-            diag::log_tagged_fmt("bg_init", "anti_tamper_initialize_result=%d", at_result ? 1 : 0);
-            if (!at_result) {
-                diag::log_tagged_critical_fmt("bg_init",
-                    "pre_activation_anti_tamper_initialize_failed_fail_closed runtime_authorized=%d validated=%d valid=%d arc=%d seh=0x%08X violation=%d",
-                    runtime_authorized ? 1 : 0,
-                    license::validated ? 1 : 0,
-                    standalone_license::is_valid() ? 1 : 0,
-                    standalone_license::is_arc_loaded() ? 1 : 0,
-                    seh_at,
-                    anti_tamper::state::get().violation_latched.load(std::memory_order_acquire) ? 1 : 0);
-                anti_tamper::enforce_violation_id(
-                    aida::reason_ids::reason_id_from_string("anti_tamper_initialize_failed"),
-                    "anti_tamper_initialize_failed_pre_activation");
-            }
-            }
-        }
-        startup_store_bg_step(8, "bg_init_worker", "bg_init_all_steps_done");
-
-        diag::log_tagged("bg_init", "session_health_init_start");
-        const uint64_t session_tick = static_cast<uint64_t>(GetTickCount64());
-        startup_log_critical_fmt("session_health_initialize_pre pid=%lu tid=%lu tick=%llu",
+        startup_log_critical_fmt("bg_init_script_engine_async_pre phase=script_engine_init target_step=5 target_label=%s pid=%lu tid=%lu tick=%llu",
+            startup_bg_phase_label(5),
             GetCurrentProcessId(),
             GetCurrentThreadId(),
-            static_cast<unsigned long long>(session_tick));
-        try {
-            (void)session_health::initialize();
-            startup_log_critical_fmt("session_health_initialize_post ok=1 elapsed_ms=%llu last_err=%lu",
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - session_tick),
-                static_cast<unsigned long>(GetLastError()));
-            diag::log_tagged("bg_init", "session_health_init_ok");
-        } catch (const std::exception& e) {
-            startup_log_critical_fmt("session_health_initialize_cpp_exception elapsed_ms=%llu what=%.160s",
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - session_tick),
-                e.what());
-            diag::log_tagged_fmt("bg_init", "session_health_init_cpp_exception what=%s", e.what());
-        } catch (...) {
-            aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "bg_init_session_health_initialize");
-            startup_log_critical_fmt("session_health_initialize_cpp_exception elapsed_ms=%llu what=<unknown>",
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - session_tick));
-            diag::log_tagged("bg_init", "session_health_init_cpp_exception what=<unknown>");
-        }
+            static_cast<unsigned long long>(GetTickCount64()));
+        diag::log_tagged("bg_init", "script_engine_init_async_start");
+        post_script_engine_startup_initialize();
+        startup_store_bg_step(5, "bg_init_worker", "script_engine_init_async_posted");
+        diag::log_tagged("bg_init", "script_engine_init_async_posted");
+        g_authorized_features_initialized.store(true, std::memory_order_release);
+        g_authorized_features_posted.store(true, std::memory_order_release);
+
+        startup_store_bg_step(6, "bg_init_worker", "bg_init_all_steps_done");
 
         bg_init_done.store(true, std::memory_order_release);
         startup_log_critical_fmt("bg_init_thread_exit elapsed_ms=%llu final_step=%d pid=%lu tid=%lu tick=%llu",
@@ -8169,50 +7036,6 @@ int main(int, char**)
                 dyn.global_ioctl_seed,
                 dyn.ioctl_seed_hash,
                 dyn.heartbeat_ioctl_seed_hash);
-        }
-        if (seh_dbi == 0 && driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
-        {
-            auto& at_rt = anti_tamper::state::get();
-            if (at_rt.initialized.load(std::memory_order_acquire) &&
-                !at_rt.driver_hardening_done.load(std::memory_order_acquire))
-            {
-                startup_log_critical_fmt("driver_bridge_init_anti_tamper_retry_pre pid=%lu tid=%lu tick=%llu",
-                    GetCurrentProcessId(),
-                    GetCurrentThreadId(),
-                    static_cast<unsigned long long>(GetTickCount64()));
-                bool at_ok = false;
-                DWORD at_seh = seh_anti_tamper_initialize(at_ok);
-                startup_log_critical_fmt("driver_bridge_init_anti_tamper_retry_post seh=0x%08X ok=%d driver_hardening=%d elapsed_anchor_tick=%llu last_err=%lu",
-                    at_seh,
-                    at_ok ? 1 : 0,
-                    at_rt.driver_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
-                    static_cast<unsigned long long>(GetTickCount64()),
-                    static_cast<unsigned long>(GetLastError()));
-                if (at_seh != 0 || !at_ok)
-                {
-                    diag::log_tagged_critical_fmt("drv_init",
-                        "driver_bridge_init_anti_tamper_retry_failed seh=0x%08X ok=%d driver_hardening=%d violation=%d",
-                        at_seh,
-                        at_ok ? 1 : 0,
-                        at_rt.driver_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
-                        at_rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0);
-                    anti_tamper::enforce_violation_id(
-                        aida::reason_ids::reason_id_from_string("driver_bridge_init_anti_tamper_retry_failed"),
-                        "driver_bridge_init_anti_tamper_retry_failed");
-                }
-                else if (!at_rt.driver_hardening_done.load(std::memory_order_acquire))
-                {
-                    auto dyn = driver_bridge::dynamic_ioctl_state();
-                    diag::log_tagged_critical_fmt("drv_init",
-                        "driver_bridge_init_anti_tamper_retry_deferred driver_hardening=0 ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X",
-                        dyn.ready ? 1 : 0,
-                        dyn.instance_server_seed,
-                        dyn.instance_ioctl_seed,
-                        dyn.global_server_seed,
-                        dyn.global_ioctl_seed,
-                        dyn.ioctl_seed_hash);
-                }
-            }
         }
         startup_log_critical_fmt("driver_bridge_init_thread_exit seh=0x%08X loaded=%d kernel=%d status=%.160s elapsed_ms=%llu last_err=%lu",
             seh_dbi,
@@ -8671,21 +7494,12 @@ int main(int, char**)
 
 
         int cur_state = 0;
-        const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
-        const bool license_ready = license::runtime_ready(runtime_locked, test_all_features::is_running());
         if (globals::ui::load_timer >= 3.0f) cur_state = 1;
-        if (globals::ui::welcome_done && !license_ready) cur_state = 2;
-        if (globals::ui::welcome_done && license_ready) cur_state = 3;
+        if (globals::ui::welcome_done) cur_state = 3;
         bool state_changed = (cur_state != prev_state);
         if (state_changed) prev_state = cur_state;
 
-        if (cur_state == 3 && standalone_license::is_arc_loaded())
-            post_arc_startup_gate_unseal();
-        const int arc_startup_gate_state = g_arc_startup_gate_state.load(std::memory_order_acquire);
-        if (arc_startup_gate_state == 3)
-            __fastfail(0xA1DAFA17u);
-        const bool s_arc_startup_gate_passed = arc_startup_gate_state == 2;
-        if (s_arc_startup_gate_passed && license_ready) {
+        if (cur_state == 3) {
             if (!g_authorized_features_initialized.load(std::memory_order_acquire) &&
                 !g_authorized_features_posted.exchange(true, std::memory_order_acq_rel))
             {
@@ -8774,7 +7588,7 @@ int main(int, char**)
                     SetWindowPos(hwnd, nullptr, 0, 0, iw, ih, SWP_NOZORDER | SWP_NOMOVE);
                 }
             }
-            if (cur_state == 3 && ((iw >= 1000 && ih >= 600) || (globals::ui::welcome_done && license::runtime_ready(anti_tamper::state::get().violation_latched.load(std::memory_order_acquire), test_all_features::is_running()))))
+            if (cur_state == 3)
                 ide_resize_applied = true;
 
             ::SetWindowRgn(hwnd, nullptr, TRUE);
@@ -8827,11 +7641,7 @@ int main(int, char**)
         const bool bulk_busy_pre = function_index::static_bulk_in_progress();
         const bool ui_dispatch_pending_pre = aida::ui_thread::pending_count() != 0;
         const bool ai_thinking_pre = g_ai_thinking_active;
-        const bool activation_progress_pre =
-            license::checking ||
-            license::activation_worker_active.load(std::memory_order_acquire) ||
-            standalone_license::is_arc_download_in_progress() ||
-            standalone_license::is_arc_transfer_in_progress();
+        const bool activation_progress_pre = false;
         const bool menu_popup_open_pre = menu_bar::any_open;
         const bool active_modal_or_animation_pre =
             globals::ui::command_palette_open ||
@@ -9796,30 +8606,10 @@ int main(int, char**)
     diag::log_tagged_critical("main", "shutdown_focus_monitor_done");
     aida_shutdown_diag::mark("shutdown_prelude_begin");
     diag::log_tagged_critical("main", "shutdown_prelude_begin");
-    try {
-        aida_shutdown_diag::mark("shutdown_session_health");
-        bool session_health_stopped = session_health::shutdown_and_wait(2500);
-        diag::log_tagged_critical_fmt("main", "shutdown_session_health_done stopped=%d",
-            session_health_stopped ? 1 : 0);
-    } catch (...) {
-        aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "shutdown_session_health");
-        diag::log_tagged_critical("main", "shutdown_session_health_exception");
-    }
-    try {
-        aida_shutdown_diag::mark("shutdown_license_workers");
-        standalone_license::stop_background_workers("main.shutdown_prelude", 2500);
-        diag::log_tagged_critical("main", "shutdown_license_workers_done");
-    } catch (...) {
-        aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "shutdown_license_workers");
-        diag::log_tagged_critical("main", "shutdown_license_workers_exception");
-    }
     aida_shutdown_diag::mark("shutdown_driver_bridge_deferred");
     diag::log_tagged_critical("main", "shutdown_driver_bridge_deferred reason=queue_drain_required");
     aida_shutdown_diag::mark("shutdown_prelude_done");
     diag::log_tagged_critical("main", "shutdown_prelude_done");
-    aida_shutdown_diag::mark("shutdown_anti_tamper");
-    anti_tamper::shutdown();
-    diag::log_tagged_critical("main", "shutdown_anti_tamper_done");
     aida_shutdown_diag::mark("shutdown_terminal");
     globals::terminal_mgr.shutdown();
     diag::log_tagged_critical("main", "shutdown_terminal_done");
@@ -10074,7 +8864,6 @@ static bool g_session_exit_review_owned = false;
 
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    aida::manual_map_tls::ensure_current_thread();
     if (aida::ui_thread::owner_tid() == 0)
         aida::ui_thread::capture_owner_tid(::GetCurrentThreadId(), "win32", "WndProc", "enter");
     if (!aida::ui_thread::require_owner("win32", "WndProc", "enter"))
@@ -10366,8 +9155,6 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 
         if (globals::ui::welcome_done &&
-            license::runtime_ready(anti_tamper::state::get().violation_latched.load(std::memory_order_acquire),
-                test_all_features::is_running()) &&
             !::IsZoomed(hWnd)) {
             if (top    && left)  return finish("nchittest_top_left", HTTOPLEFT);
             if (top    && right) return finish("nchittest_top_right", HTTOPRIGHT);

@@ -39,7 +39,7 @@
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>KMDF</DriverType>
     <DriverTargetPlatform>Universal</DriverTargetPlatform>
-    <IncludePath>ext;src;..\..\encrypt;$(IncludePath)</IncludePath>
+    <IncludePath>ext;src;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <TargetVersion>Windows10</TargetVersion>
@@ -83,7 +83,7 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <IncludePath>ext;src;..\..\encrypt;$(IncludePath)</IncludePath>
+    <IncludePath>ext;src;$(IncludePath)</IncludePath>
     <OutDir>C:\Users\ruar1337\AiDAPrivate\build-ninja\Release\</OutDir>
     <IntDir>$(SolutionDir)artifacts\WhosWho\</IntDir>
     <EnableInf2cat>false</EnableInf2cat>
@@ -123,7 +123,6 @@
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
       <TreatLinkerWarningAsErrors>false</TreatLinkerWarningAsErrors>
       <AdditionalOptions>/guard:cf %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalDependencies>cng.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
@@ -146,8 +145,6 @@
     <ClCompile Include="src\function\impl\Memory.cpp" />
     <ClCompile Include="src\function\impl\RemoteCall.cpp" />
     <ClCompile Include="src\function\impl\Debugger.cpp" />
-    <ClCompile Include="src\function\impl\DllProtect.cpp" />
-    <ClCompile Include="src\function\impl\AntiDumpHandler.cpp" />
     <ClCompile Include="src\function\impl\Network.cpp" />
     <ClCompile Include="src\function\KernelDebugCapture.cpp" />
     <ClCompile Include="src\core\HardwareId.cpp" />
@@ -158,42 +155,21 @@
     multiple drivers due to unsafe memory scanning without MmIsAddressValid checks.
   -->
   <ItemGroup>
-    <ClInclude Include="..\..\encrypt\crypter.h" />
-    <ClInclude Include="src\function\AntiDebug.h" />
     <ClInclude Include="src\function\KernelDebugCapture.h" />
     <ClInclude Include="src\core\HardwareId.h" />
     <ClInclude Include="src\function\CoreSecurity.h" />
     <ClInclude Include="src\function\KernelCrypto.h" />
+    <ClInclude Include="src\function\KernelLayout.h" />
     <ClInclude Include="src\function\Dispatcher.h" />
     <ClInclude Include="src\function\Functions.h" />
     <ClInclude Include="src\function\impl\driver\PML_Walker.h" />
     <ClInclude Include="src\function\impl\driver\Strong.h" />
     <ClInclude Include="src\function\impl\driver\za.h" />
-    <ClInclude Include="src\function\Stealth.h" />
-    <ClInclude Include="src\function\SentinelBridge.h" />
     <ClInclude Include="src\function\Struct.h" />
-    <ClInclude Include="src\function\DmaCanary.h" />
     <ClInclude Include="src\function\DebugEvents.h" />
     <ClInclude Include="src\function\MalwareSafe.h" />
     <ClInclude Include="src\imports\Defs.h" />
     <ClInclude Include="src\imports\Strings.h" />
-    <ClInclude Include="src\hv_detect\includes.h" />
-    <ClInclude Include="src\hv_detect\ia32_defs.h" />
-    <ClInclude Include="src\hv_detect\hv_structs.h" />
-    <ClInclude Include="src\hv_detect\func_defs.h" />
-    <ClInclude Include="src\hv_detect\physmem_structs.h" />
-    <ClInclude Include="src\hv_detect\physmem_decl.h" />
-    <ClInclude Include="src\hv_detect\page_table_helpers.h" />
-    <ClInclude Include="src\hv_detect\win_helpers.h" />
-    <ClInclude Include="src\hv_detect\physmem.h" />
-    <ClInclude Include="src\hv_detect\safety_net.h" />
-    <ClInclude Include="src\hv_detect\idt_detect.h" />
-    <ClInclude Include="src\hv_detect\ve_detect.h" />
-    <ClInclude Include="src\hv_detect\hv_detect.h" />
-  </ItemGroup>
-  <ItemGroup>
-    <MASM Include="src\hv_detect\general_asm.asm" />
-    <MASM Include="src\hv_detect\safety_net_asm.asm" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />

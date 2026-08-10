@@ -34,7 +34,6 @@
 #include "../helpers/globals.h"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
-#include "../anti-tamper/webhook.hpp"
 #endif
 
 #include <algorithm>
@@ -1289,7 +1288,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		static bool s_types_font_logged_dissector = false;
 		if (!s_types_font_logged_dissector) {
 			s_types_font_logged_dissector = true;
-			anti_tamper::webhook::write_log("types_font", "[types_font] scaled struct_dissector_view");
+			diag::log_tagged("types_font", "[types_font] scaled struct_dissector_view");
 		}
 	}
 #endif
@@ -2192,7 +2191,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		static bool s_no_driver_logged_diss = false;
 		if (!s_no_driver_logged_diss) {
 			s_no_driver_logged_diss = true;
-			anti_tamper::webhook::write_log("types_audit",
+			diag::log_tagged("types_audit",
 				"[types_audit] dissector_view_no_driver reason='driver_not_loaded'");
 		}
 #endif

@@ -10,7 +10,6 @@ namespace test_lab {
 
 	enum class driver_e : int {
 		whoswho = 0,
-		sentinel = 1,
 		driverless = 2,
 	};
 
@@ -102,12 +101,9 @@ namespace test_lab {
 			const char* reason;
 		};
 		static constexpr guarded_feature_t guarded[] = {
-			{ "tamper", "ABRT", "kernel tamper abort can bugcheck" },
-			{ "evidence", "RECU", "kernel evidence recovery can bugcheck" },
 			{ "remote-call", "RC", "executes a target-process remote call" },
 			{ "thread", "TSR", "suspends or resumes a target thread" },
-			{ "module", "PINJ", "injects a transport-layer packet" },
-			{ "anti-debug", "DBGA", "debug-attach evidence path may bugcheck on positive detection" }
+			{ "module", "PINJ", "injects a transport-layer packet" }
 		};
 		for (const auto& f : guarded) {
 			if (std::strcmp(category, f.category) == 0 && std::strcmp(name, f.name) == 0)

@@ -40,11 +40,6 @@
 #include "../assets/icons.h"
 #include "../ide_icons.h"
 #include "standalone_chat.hpp"
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-#include "standalone_license.hpp"
-#include "anti-tamper/orchestrator.hpp"
-#include "anti-tamper/webhook.hpp"
-#endif
 #include "standalone_settings.hpp"
 #include "code_editor.hpp"
 #include "disasm_view.hpp"
@@ -68,7 +63,6 @@
 #endif
 #include "spawn_target_dialog.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-#include "../core/session/session_health.hpp"
 #include "run_target.hpp"
 #endif
 #include "pseudocode_view.hpp"
@@ -1349,106 +1343,6 @@ namespace {
 		aida::theme_transfer::acknowledge_import(completion->serial, true);
 	}
 
-	void log_license_screen_breadcrumb(const char* event, float window_w, float window_h, bool runtime_ready, bool runtime_locked)
-	{
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		(void)event;
-		(void)window_w;
-		(void)window_h;
-		(void)runtime_ready;
-		(void)runtime_locked;
-#else
-		const std::string run_id = standalone_license::run_correlation_id();
-		const std::string runtime_snapshot = standalone_license::runtime_state_snapshot();
-		auto dyn = driver_bridge::dynamic_ioctl_state();
-		auto taskflow_snapshot = aida::infra::taskflow_runtime::active_snapshot(64);
-		DWORD qs = ::GetQueueStatus(QS_ALLINPUT);
-		DWORD qs_changed = LOWORD(qs);
-		DWORD qs_current = HIWORD(qs);
-		RECT wr{};
-		BOOL rect_ok = g_hwnd ? ::GetWindowRect(g_hwnd, &wr) : FALSE;
-		DWORD rect_gle = rect_ok ? ERROR_SUCCESS : ::GetLastError();
-		const bool activation_worker_active = license::activation_worker_active.load(std::memory_order_acquire);
-		const bool arc_transfer_active = standalone_license::is_arc_transfer_in_progress();
-		const bool activation_progress_active = license::checking && (activation_worker_active || arc_transfer_active);
-		const bool full_test_running = test_all_features::is_running();
-		std::string driver_status = driver_bridge::status();
-		const char* breadcrumb_event = event ? event : "license_screen_frame_health";
-		diag::log_tagged_critical_fmt("license",
-			"%s run_id=%s frame=%d tick=%llu tid=%lu runtime_ready=%d runtime_locked=%d validated=%d canonical_valid=%d checking=%d check_failed=%d activation_worker=%d activation_progress=%d activation_phase=%d arc_loaded=%d arc_download=%d arc_transfer=%d full_test=%d key_len=%zu window=%.0fx%.0f hwnd=0x%llX visible=%d enabled=%d iconic=%d rect_ok=%d rect=%ld,%ld,%ld,%ld rect_gle=%lu fg=0x%llX active=0x%llX focus=0x%llX capture=0x%llX qs=0x%08lX qs_changed=0x%04lX qs_current=0x%04lX want_text=%d render_section=%s driver_loaded=%d driver_kernel=%d driver_connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X attached_pid=%u driver_status=%.120s runtime={%.520s}",
-			breadcrumb_event,
-			run_id.c_str(),
-			ImGui::GetFrameCount(),
-			static_cast<unsigned long long>(aida::shell_platform::tick_ms()),
-			aida::shell_platform::thread_id(),
-			runtime_ready ? 1 : 0,
-			runtime_locked ? 1 : 0,
-			license::validated ? 1 : 0,
-			standalone_license::is_valid() ? 1 : 0,
-			license::checking ? 1 : 0,
-			license::check_failed ? 1 : 0,
-			activation_worker_active ? 1 : 0,
-			activation_progress_active ? 1 : 0,
-			globals::ui::license_activation_phase.load(std::memory_order_acquire),
-			standalone_license::is_arc_loaded() ? 1 : 0,
-			standalone_license::is_arc_download_in_progress() ? 1 : 0,
-			arc_transfer_active ? 1 : 0,
-			full_test_running ? 1 : 0,
-			std::strlen(license::key_buf),
-			window_w,
-			window_h,
-			static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_hwnd)),
-			(g_hwnd && ::IsWindowVisible(g_hwnd)) ? 1 : 0,
-			(g_hwnd && ::IsWindowEnabled(g_hwnd)) ? 1 : 0,
-			(g_hwnd && ::IsIconic(g_hwnd)) ? 1 : 0,
-			rect_ok ? 1 : 0,
-			rect_ok ? wr.left : 0,
-			rect_ok ? wr.top : 0,
-			rect_ok ? wr.right : 0,
-			rect_ok ? wr.bottom : 0,
-			static_cast<unsigned long>(rect_gle),
-			static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetForegroundWindow())),
-			static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetActiveWindow())),
-			static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetFocus())),
-			static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetCapture())),
-			static_cast<unsigned long>(qs),
-			static_cast<unsigned long>(qs_changed),
-			static_cast<unsigned long>(qs_current),
-			ImGui::GetIO().WantTextInput ? 1 : 0,
-			g_render_section.c_str(),
-			dyn.loaded ? 1 : 0,
-			dyn.kernel ? 1 : 0,
-			dyn.connected ? 1 : 0,
-			dyn.ready ? 1 : 0,
-			dyn.instance_server_seed,
-			dyn.instance_ioctl_seed,
-			dyn.global_server_seed,
-			dyn.global_ioctl_seed,
-			dyn.ioctl_seed_hash,
-			dyn.heartbeat_ioctl_seed_hash,
-			driver_bridge::attached_pid(),
-			driver_status.c_str(),
-			runtime_snapshot.c_str());
-		diag::log_tagged_critical_fmt("license",
-			"%s_taskflow run_id=%s frame=%d accepting=%d shutting_down=%d work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u oldest_ms=%llu total_submitted=%llu total_rejected=%llu labels=%.520s",
-			breadcrumb_event,
-			run_id.c_str(),
-			ImGui::GetFrameCount(),
-			taskflow_snapshot.accepting ? 1 : 0,
-			taskflow_snapshot.shutting_down ? 1 : 0,
-			static_cast<unsigned long long>(taskflow_snapshot.work_queue_pending),
-			static_cast<unsigned>(taskflow_snapshot.work_queue_active),
-			static_cast<unsigned long long>(taskflow_snapshot.service_queue_pending),
-			static_cast<unsigned>(taskflow_snapshot.service_queue_active),
-			static_cast<unsigned long long>(taskflow_snapshot.critical_queue_pending),
-			static_cast<unsigned>(taskflow_snapshot.critical_queue_active),
-			static_cast<unsigned long long>(taskflow_snapshot.oldest_active_ms),
-			static_cast<unsigned long long>(taskflow_snapshot.total_submitted),
-			static_cast<unsigned long long>(taskflow_snapshot.total_rejected),
-			taskflow_snapshot.labels_under_pressure.empty() ? "<none>" : taskflow_snapshot.labels_under_pressure.c_str());
-#endif
-	}
-
 	void request_chrome_shutdown_from_render(const char* source, const char* cleanup_reason)
 	{
 		if (!file_tabs::exit_review_committed) {
@@ -1605,88 +1499,6 @@ namespace {
 		return found == state.documents.end() ? nullptr : &*found;
 	}
 
-	bool text_has_token(const std::string& text, const char* token)
-	{
-		return token && text.find(token) != std::string::npos;
-	}
-
-	bool text_has_positive_field(const std::string& text, const char* field)
-	{
-		if (!field || !*field)
-			return false;
-		std::string needle = field;
-		needle += "=1";
-		return text.find(needle) != std::string::npos;
-	}
-
-	std::string runtime_lock_field_value(const std::string& text, const char* field)
-	{
-		if (!field || !*field)
-			return {};
-		std::string needle = field;
-		needle += "=";
-		size_t pos = text.find(needle);
-		if (pos == std::string::npos)
-			return {};
-		pos += needle.size();
-		size_t end = text.find_first_of(" \t\r\n", pos);
-		if (end == std::string::npos)
-			end = text.size();
-		return text.substr(pos, end - pos);
-	}
-
-	std::string runtime_lock_summary_value(const std::string& detail)
-	{
-		const std::string needle = "summary=";
-		size_t pos = detail.find(needle);
-		if (pos == std::string::npos)
-			return {};
-		pos += needle.size();
-		size_t end = detail.find(" evidence_hash=", pos);
-		if (end == std::string::npos)
-			end = detail.find(" cat=", pos);
-		if (end == std::string::npos)
-			end = detail.size();
-		std::string out = detail.substr(pos, end - pos);
-		if (out.size() > 180)
-			out = out.substr(0, 180);
-		return out;
-	}
-
-	void runtime_lock_append_part(std::string& out, const std::string& part)
-	{
-		if (part.empty())
-			return;
-		if (!out.empty())
-			out += "; ";
-		out += part;
-	}
-
-	std::string runtime_lock_evidence_message(const std::string& reason, const std::string& detail)
-	{
-		const std::string joined = reason + " " + detail;
-		std::string out;
-		const std::string reason_value = runtime_lock_field_value(joined, "reason");
-		if (!reason_value.empty())
-			runtime_lock_append_part(out, "detector=" + reason_value);
-		const std::string summary = runtime_lock_summary_value(detail);
-		if (!summary.empty())
-			runtime_lock_append_part(out, "evidence=" + summary);
-		const std::string owner_pid = runtime_lock_field_value(joined, "first_owner_pid");
-		if (!owner_pid.empty() && owner_pid != "0")
-			runtime_lock_append_part(out, "owner_pid=" + owner_pid);
-		const std::string owner_image = runtime_lock_field_value(joined, "first_owner_image");
-		if (!owner_image.empty() && owner_image != "<empty>")
-			runtime_lock_append_part(out, "owner=" + owner_image);
-		const std::string kernel_status = runtime_lock_field_value(joined, "kernel_status");
-		if (!kernel_status.empty())
-			runtime_lock_append_part(out, "kernel=" + kernel_status);
-		const std::string kernel_confirmed = runtime_lock_field_value(joined, "kernel_confirmed");
-		if (!kernel_confirmed.empty())
-			runtime_lock_append_part(out, "kernel_confirmed=" + kernel_confirmed);
-		return out;
-	}
-
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	bool custom_icon_path_render_safe(const std::string& path, uint64_t& size_out, DWORD& attr_out, DWORD& err_out)
 	{
@@ -1731,44 +1543,6 @@ namespace {
 	}
 #endif
 
-	std::string runtime_lock_user_message(const std::string& reason, const std::string& detail)
-	{
-		const std::string joined = reason + " " + detail;
-		if (text_has_token(joined, "HANDLE_WRITE") || text_has_token(joined, "HANDLE_VMOP") ||
-			text_has_token(joined, "HANDLE_THREAD") || text_has_token(joined, "foreign_handle") ||
-			text_has_token(joined, "foreign_mutating_handle"))
-			return "Suspicious process handle to AiDA detected. Close that process, then restart AiDAStandalone.exe.";
-		if (text_has_token(joined, "TARGET_AIDA") || text_has_token(joined, "targeting_aida"))
-			return "External tooling is targeting AiDA. Close the tool targeting AiDA, then restart AiDAStandalone.exe.";
-        if (text_has_token(joined, "MCP_OFFENSIVE_TOOL") || text_has_token(joined, "offensive_mcp_tool_detected") ||
-			text_has_token(joined, "anti_mcp_offensive"))
-			return "Offensive MCP tooling detected. Close that MCP tool, then restart AiDAStandalone.exe.";
-		if (text_has_token(joined, "DBG_TOOL") || text_has_token(joined, "debugger_tool_detected") ||
-			text_has_token(joined, "debugger_tool_scan") || text_has_token(joined, "kernel_debugger") ||
-			text_has_positive_field(joined, "first_owner_debugger"))
-			return "Debugger activity detected. Close the debugger, then restart AiDAStandalone.exe.";
-		if (text_has_token(joined, "RE_TOOL") || text_has_token(joined, "reverse_engineering") ||
-			text_has_positive_field(joined, "first_owner_re"))
-			return "Reverse-engineering tool activity detected. Close that tool, then restart AiDAStandalone.exe.";
-		if (text_has_token(joined, "DUMP_TOOL") || text_has_token(joined, "dump_tool_detected") ||
-			text_has_token(joined, "dump_tool_scan") || text_has_positive_field(joined, "first_owner_dump"))
-			return "Dumping tool activity detected. Close that tool, then restart AiDAStandalone.exe.";
-		if (text_has_token(joined, "MEM_SCANNER") || text_has_token(joined, "memory_scanner") ||
-			text_has_positive_field(joined, "first_owner_memory"))
-			return "Memory scanner activity detected. Close the scanner, then restart AiDAStandalone.exe.";
-		if (text_has_token(joined, "MCP_PIPE") || text_has_token(joined, "MCP_PROCESS") ||
-			text_has_token(joined, "MCP_PORT") || text_has_token(joined, "MCP_CMD") ||
-			text_has_token(joined, "mcp_bridge"))
-			return "Untrusted MCP bridge activity detected. Close the bridge/tool, then restart AiDAStandalone.exe.";
-		if (text_has_token(joined, "LOCAL_LLM") || text_has_token(joined, "local_llm"))
-			return "Local LLM analysis context detected near AiDA. Close it, then restart AiDAStandalone.exe.";
-		if (text_has_token(joined, "code_integrity") || text_has_token(joined, "page_mac") ||
-			text_has_token(joined, "block_chain"))
-			return "Runtime code integrity changed. Close suspicious tooling, then restart AiDAStandalone.exe.";
-		if (text_has_token(joined, "kernel_debugger"))
-			return "Kernel debugger activity detected. Close it, then restart AiDAStandalone.exe.";
-		return "AiDA stopped this runtime session after an integrity failure. Close suspicious tools, then restart AiDAStandalone.exe.";
-	}
 }
 
 namespace ui_input_gate
@@ -1835,7 +1609,6 @@ static bool trusted_show_open_file(HWND owner,
 	(void)caller_name;
 	return aida::preview::choose_open_file(out_path, out_path_capacity);
 #else
-	anti_tamper::token_chain::trusted_interaction_scope_t trusted_scope;
 	return win32_dialog::show_open_file_dialog(owner, title, filter_pairs,
 		out_path, out_path_capacity, caller_name);
 #endif
@@ -1857,7 +1630,6 @@ static bool trusted_show_save_file(HWND owner,
 	(void)caller_name;
 	return aida::preview::choose_save_file(out_path, out_path_capacity);
 #else
-	anti_tamper::token_chain::trusted_interaction_scope_t trusted_scope;
 	return win32_dialog::show_save_file_dialog(owner, title, filter_pairs, default_ext,
 		out_path, out_path_capacity, caller_name);
 #endif
@@ -1869,7 +1641,6 @@ static bool trusted_show_folder(HWND owner,
 	std::string& out_path,
 	const char* caller_name)
 {
-	anti_tamper::token_chain::trusted_interaction_scope_t trusted_scope;
 	return win32_dialog::show_open_folder_dialog(owner, title, out_path, caller_name);
 }
 #endif
@@ -2131,51 +1902,6 @@ namespace file_menu_deferred
 #endif
 	}
 }
-
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-static bool license_activate_impl(const char* key_str,
-                                  char* err_buf,
-                                  size_t err_buf_size)
-{
-	if (err_buf && err_buf_size) err_buf[0] = '\0';
-	std::string key(key_str ? key_str : "");
-	std::string err;
-	bool ok = false;
-	try {
-		ok = standalone_license::activate(g_sa_settings, key, err);
-	} catch (const std::exception& ex) {
-		err = std::string("Activation worker exception: ") + ex.what();
-		ok = false;
-	} catch (...) {
-		err = "Activation worker threw unknown exception.";
-		ok = false;
-	}
-	if (err_buf && err_buf_size) {
-		size_t copy = err.size();
-		if (copy >= err_buf_size) copy = err_buf_size - 1;
-		memcpy(err_buf, err.data(), copy);
-		err_buf[copy] = '\0';
-	}
-	return ok;
-}
-
-__declspec(noinline) static DWORD seh_license_activate(const char* key_str,
-                                                       BOOL* out_ok,
-                                                       char* err_buf,
-                                                       size_t err_buf_size)
-{
-	*out_ok = FALSE;
-	__try {
-		bool ok = license_activate_impl(key_str, err_buf, err_buf_size);
-		*out_ok = ok ? TRUE : FALSE;
-		return 0;
-	} __except (EXCEPTION_EXECUTE_HANDLER) {
-		return GetExceptionCode();
-	}
-}
-#endif
-
-
 
 ID3D11ShaderResourceView* helpers::theme_rias = nullptr;
 ID3D11ShaderResourceView* helpers::theme_nagi = nullptr;
@@ -3159,7 +2885,7 @@ void helpers::render_title()
 #else
 		std::string fpath = disasm::open_file_dialog(g_hwnd);
 		if (fpath.empty()) {
-			anti_tamper::webhook::write_log("chrome", "load_pe cancelled");
+			diag::log_tagged("chrome", "load_pe cancelled");
 			return;
 		}
 		const std::string fpath_copy = fpath;
@@ -3175,7 +2901,7 @@ void helpers::render_title()
 				_snprintf_s(buf, sizeof(buf), _TRUNCATE, "load_pe failed path=%s err=%s",
 					fpath_copy.c_str(), err ? err : "(none)");
 			}
-			anti_tamper::webhook::write_log("chrome", buf);
+			diag::log_tagged("chrome", buf);
 		}, "analysis_session", "open_session", "load_pe_menu");
 		if (!posted) {
 			diag::log_tagged_critical_fmt("analysis_session",
@@ -3325,7 +3051,7 @@ void helpers::render_title()
 	application_callbacks.new_chat = [] { conversations::new_chat(); };
 	application_callbacks.open_shortcuts = [] {
 		globals::ui::shortcuts_dialog_open = true;
-		anti_tamper::webhook::write_log("chrome", "shortcuts_popup open=true source=action");
+		diag::log_tagged("chrome", "shortcuts_popup open=true source=action");
 	};
 	application_callbacks.open_workspace_save_as = [] {
 		open_workspace_save_as_dialog();
@@ -3352,114 +3078,10 @@ void helpers::render_title()
 	}
 #endif
 
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	g_render_section = "inline_checks";
-	{
-		g_render_section = "inline_checks_cross_validation";
-		static uint64_t s_frame_ctr = 0;
-		standalone_license::cross_validation_sweep(static_cast<int>(s_frame_ctr++));
-	}
-
-	{
-		g_render_section = "inline_checks_anti_tamper_fast";
-		uint64_t tok = anti_tamper::run_inline_check(anti_tamper::CHECK_FAST);
-		standalone_license::fold_integrity_token(tok);
-		static uint64_t s_inline_log_ctr = 0;
-		++s_inline_log_ctr;
-
-		if ((s_inline_log_ctr % 1000) == 0) {
-			auto& rt = anti_tamper::state::get();
-			const bool heavy_integrity_ready =
-				!rt.driver_hardening_active.load(std::memory_order_acquire) &&
-				(!rt.license_pending_activation.load(std::memory_order_acquire) ||
-					rt.activation_hardening_done.load(std::memory_order_acquire)) &&
-				standalone_license::is_arc_loaded() &&
-				!standalone_license::is_arc_download_in_progress();
-			if (heavy_integrity_ready) {
-				(void)submit_helpers_executor_task(
-					"anti_tamper",
-					"anti_tamper.code_integrity_check",
-					aida::infra::executor::domain_t::security_liveness,
-					"security_liveness",
-					[] {
-						try {
-							anti_tamper::run_inline_check(anti_tamper::CHECK_CODE_INTEGRITY);
-						} catch (...) {
-						}
-					});
-			}
-		}
-	}
-
-	{
-		g_render_section = "inline_checks_gate_ui_render_loop";
-		uint64_t gt = standalone_license::inline_gate_check(
-			standalone_license::gate_ui_render_loop);
-		(void)standalone_license::verify_gate_token(
-			standalone_license::gate_ui_render_loop, gt);
-	}
-
-	{
-		g_render_section = "inline_checks_runtime_lock_state";
-		const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
-		const bool full_test_running = test_all_features::is_running();
-		const bool canonical_valid = standalone_license::is_valid();
-		static bool s_runtime_lock_logged = false;
-		static bool s_full_test_validity_bridge_logged = false;
-		if (runtime_locked) {
-			std::string reason;
-			std::string detail;
-			{
-				auto& rt = anti_tamper::state::get();
-				std::lock_guard<std::mutex> lk(rt.mtx);
-				reason = rt.violation_reason;
-				detail = rt.violation_detail;
-			}
-			license::validated = false;
-			license::checking = false;
-			license::activation_worker_active.store(false, std::memory_order_release);
-			license::check_failed = false;
-			license::error_msg = runtime_lock_user_message(reason, detail);
-			s_full_test_validity_bridge_logged = false;
-			if (!s_runtime_lock_logged) {
-				diag::log_tagged_fmt("license",
-					"DIAG_DIALOG_SUPPRESSED_LICENSE_INPUT source=render_title reason=%.160s",
-					reason.c_str());
-				s_runtime_lock_logged = true;
-			}
-		} else if (canonical_valid) {
-			const bool recovered = !license::validated || license::check_failed || license::checking;
-			license::validated = true;
-			license::checking = false;
-			license::activation_worker_active.store(false, std::memory_order_release);
-			license::check_failed = false;
-			license::error_msg.clear();
-			s_runtime_lock_logged = false;
-			s_full_test_validity_bridge_logged = false;
-			if (recovered)
-				diag::log_tagged("license", "DIAG_DIALOG_RECOVERED_RUNTIME_VALIDITY");
-		} else if (license::preserve_valid_state(runtime_locked, full_test_running)) {
-			license::checking = false;
-			license::activation_worker_active.store(false, std::memory_order_release);
-			license::check_failed = false;
-			license::error_msg.clear();
-			s_runtime_lock_logged = false;
-			if (!s_full_test_validity_bridge_logged) {
-				diag::log_tagged_fmt("license",
-					"DIAG_DIALOG_SUPPRESSED_TRANSIENT_INVALID source=render_title full_test=1 arc=%d frame=%d",
-					standalone_license::is_arc_loaded() ? 1 : 0,
-					ImGui::GetFrameCount());
-				s_full_test_validity_bridge_logged = true;
-			}
-		} else {
-			s_full_test_validity_bridge_logged = false;
-		}
-	}
-
-	const bool runtime_locked_for_ready = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
-	const bool runtime_ready = license::runtime_ready(runtime_locked_for_ready, test_all_features::is_running());
-#else
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	const bool runtime_ready = aida::preview::runtime_ready();
+#else
+	const bool runtime_ready = true;
 #endif
 
 	g_render_section = "theme_resolve";
@@ -3646,26 +3268,16 @@ void helpers::render_title()
 		    (!s_loading_wait_logged || (globals::ui::load_timer - s_loading_wait_last_log) >= 5.0f)) {
 			s_loading_wait_logged = true;
 			s_loading_wait_last_log = globals::ui::load_timer;
-			auto& rt = anti_tamper::state::get();
 			bool bg_done_value = globals::ui::bg_init_done &&
 				globals::ui::bg_init_done->load(std::memory_order_acquire);
 			diag::log_tagged_critical_fmt("render",
-				"loading_screen_wait timer=%.2f bg_completed=%d bg_done_ptr=%d bg_done=%d bg_step=%d bg_total=%d license_validated=%d canonical_valid=%d arc_loaded=%d arc_downloading=%d pending_activation=%d at_initialized=%d driver_hardening=%d hardening_active=%d violation=%d",
+				"loading_screen_wait timer=%.2f bg_completed=%d bg_done_ptr=%d bg_done=%d bg_step=%d bg_total=%d",
 				globals::ui::load_timer,
 				bg_completed ? 1 : 0,
 				globals::ui::bg_init_done ? 1 : 0,
 				bg_done_value ? 1 : 0,
 				globals::ui::bg_init_step.load(std::memory_order_acquire),
-				globals::ui::bg_init_total.load(std::memory_order_acquire),
-				license::validated ? 1 : 0,
-				standalone_license::is_valid() ? 1 : 0,
-				standalone_license::is_arc_loaded() ? 1 : 0,
-				standalone_license::is_arc_download_in_progress() ? 1 : 0,
-				rt.license_pending_activation.load(std::memory_order_acquire) ? 1 : 0,
-				rt.initialized.load(std::memory_order_acquire) ? 1 : 0,
-				rt.driver_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
-				rt.driver_hardening_active.load(std::memory_order_acquire) ? 1 : 0,
-				rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0);
+				globals::ui::bg_init_total.load(std::memory_order_acquire));
 		}
 		if (!loading) {
 			s_loading_wait_logged = false;
@@ -3683,8 +3295,6 @@ void helpers::render_title()
 		float tw, th;
 		if (!globals::ui::welcome_done) {
 			tw = 560.f; th = 360.f;
-		} else if (!runtime_ready) {
-			tw = 620.f; th = 540.f;
 		} else {
 			MONITORINFO mi = { sizeof(mi) };
 			GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
@@ -3962,13 +3572,11 @@ void helpers::render_title()
 			"Arming memory scanner",
 			"Spinning up MITM proxy",
 			"Loading script engine",
-			"Fingerprinting code surface",
-			"Activating tamper guard",
 			"Ready"
 		};
 		int phase_idx = cur_step;
 		if (phase_idx < 0) phase_idx = 0;
-		if (phase_idx > 8) phase_idx = 8;
+		if (phase_idx > 6) phase_idx = 6;
 
 		static int last_phase = -1;
 		static aida::ui::transition_t phase_swap;
@@ -4119,783 +3727,13 @@ void helpers::render_title()
 			float msg_a = std::min(std::max(t - 1.4f, 0.f) / 0.5f, 1.f) * fade_out;
 			if (msg_a > 0.01f)
 			{
-				const char* msg = runtime_ready
-					? "Your session is ready."
-					: "Enter your license key to continue.";
+				const char* msg = "Your session is ready.";
 				float msg_sz = aida::ui::fonts::size_or(body, 16.f);
 				ImVec2 ts_m = body->CalcTextSizeA(msg_sz, FLT_MAX, 0.f, msg);
 				dl->AddText(body, msg_sz,
 					ImVec2(cx - ts_m.x * 0.5f, wm_y + 32.f + tag_sz + 28.f),
 					aida::ui::with_alpha(th.text_dim, msg_a), msg);
 			}
-		}
-
-		ImGui::End();
-		return;
-	}
-
-
-	if (!runtime_ready)
-	{
-		const auto& th = aida::ui::resolved();
-		static float license_alpha = 0.f;
-		license_alpha += (1.f - license_alpha) * std::min(6.f * dt, 1.f);
-
-		static aida::ui::transition_t card_intro;
-		static bool card_intro_started = false;
-		if (!card_intro_started) {
-			card_intro.start(0.380f, aida::motion::ease::out_back);
-			card_intro_started = true;
-		}
-		card_intro.tick(dt);
-		float intro_e = card_intro.eased();
-		float intro_scale = 0.94f + 0.06f * intro_e;
-
-		ImVec2 wp   = ImGui::GetWindowPos();
-		float  ww   = globals::ui::window_w;
-		float  wh   = globals::ui::window_h;
-		float  cx   = wp.x + ww * 0.5f;
-		float  cy   = wp.y + wh * 0.5f;
-		ImDrawList* dl = ImGui::GetWindowDrawList();
-		float la  = license_alpha;
-
-		dl->AddRectFilled(wp, ImVec2(wp.x + ww, wp.y + wh), th.bg_base, 14.f);
-
-		if (g_bg_art_srv && g_bg_art_w > 0 && g_bg_art_h > 0) {
-			float aspect_img = (float)g_bg_art_w / (float)g_bg_art_h;
-			float aspect_win = ww / wh;
-			float bg_w, bg_h;
-			if (aspect_img > aspect_win) {
-				bg_h = wh;
-				bg_w = bg_h * aspect_img;
-			} else {
-				bg_w = ww;
-				bg_h = bg_w / aspect_img;
-			}
-			float bg_x = wp.x + (ww - bg_w) * 0.5f;
-			float bg_y = wp.y + (wh - bg_h) * 0.5f;
-			ImU32 bg_tint = aida::ui::with_alpha(IM_COL32_WHITE, 0.36f * la);
-			dl->AddImageRounded((ImTextureID)g_bg_art_srv,
-				ImVec2(bg_x, bg_y), ImVec2(bg_x + bg_w, bg_y + bg_h),
-				ImVec2(0.f, 0.f), ImVec2(1.f, 1.f),
-				bg_tint, 14.f);
-			dl->AddRectFilled(wp, ImVec2(wp.x + ww, wp.y + wh),
-				aida::ui::with_alpha(th.bg_base, 0.55f * la), 14.f);
-		}
-
-		float aura_r = ww * 0.45f;
-		for (int i = 0; i < 5; ++i) {
-			float rr = aura_r + (float)i * 18.f;
-			float fa = (1.f - (float)i / 5.f) * 0.30f * la;
-			dl->AddCircleFilled(ImVec2(cx, cy), rr,
-				aida::ui::with_alpha(th.accent_glow, fa), 64);
-		}
-
-		float card_w = std::min(ww - 80.f, 460.f);
-		float card_h = std::min(wh - 80.f, 380.f);
-		card_w *= intro_scale;
-		card_h *= intro_scale;
-
-		static aida::ui::transition_t shake;
-		float shake_x = 0.f;
-		if (license::check_failed) {
-			static bool shake_started = false;
-			if (!shake_started) {
-				shake.start(0.280f, aida::motion::ease::out_quint);
-				shake_started = true;
-			}
-			shake.tick(dt);
-			if (shake.is_finished()) shake_started = false;
-			float sp = shake.progress;
-			shake_x = sinf(sp * 18.84955f) * 6.f * (1.f - sp);
-		} else {
-			shake.reset();
-		}
-
-		ImVec2 card_a(cx - card_w * 0.5f + shake_x, cy - card_h * 0.5f);
-		ImVec2 card_b(card_a.x + card_w, card_a.y + card_h);
-
-		aida::ui::blur::layer_request_t req;
-		req.pos = card_a;
-		req.size = ImVec2(card_w, card_h);
-		req.radius = 16.f;
-		req.strength = 0.7f;
-		req.alpha = la;
-		aida::ui::blur::schedule(req);
-
-		float pad = 22.f;
-		float inner_w = card_w - pad * 2.f;
-		float content_x = card_a.x + pad;
-		float content_y = card_a.y + pad;
-
-		ImVec2 lock_c(cx + shake_x, content_y + 32.f);
-		aida::ui::brand::render_lock_icon(dl, lock_c, 52.f,
-			th.text_primary, th.accent_u32, la * intro_e);
-
-		ImFont* h1f = aida::ui::fonts::h1();
-		ImFont* body = aida::ui::fonts::body();
-		ImFont* body_em = aida::ui::fonts::body_em();
-		if (!h1f) h1f = ImGui::GetFont();
-		if (!body) body = ImGui::GetFont();
-		if (!body_em) body_em = ImGui::GetFont();
-
-		float gs = ImGui::GetIO().FontGlobalScale;
-		(void)gs;
-
-		const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
-		{
-			static bool s_license_screen_enter_logged = false;
-			static uint64_t s_license_screen_last_health_ms = 0;
-			const uint64_t now_ms = static_cast<uint64_t>(aida::shell_platform::tick_ms());
-			if (!s_license_screen_enter_logged) {
-				log_license_screen_breadcrumb("license_screen_enter", ww, wh, runtime_ready, runtime_locked);
-				s_license_screen_enter_logged = true;
-				s_license_screen_last_health_ms = now_ms;
-			} else if (s_license_screen_last_health_ms == 0 || now_ms - s_license_screen_last_health_ms >= 2000) {
-				log_license_screen_breadcrumb("license_screen_frame_health", ww, wh, runtime_ready, runtime_locked);
-				s_license_screen_last_health_ms = now_ms;
-			}
-		}
-		if (runtime_locked) {
-			dl->AddRectFilled(card_a, card_b, aida::ui::with_alpha(th.panel_bg, 0.82f * la), 16.f);
-			dl->AddRect(card_a, card_b, aida::ui::with_alpha(th.border_subtle, la), 16.f, 0, 1.2f);
-			std::string reason;
-			std::string detail;
-			{
-				auto& rt = anti_tamper::state::get();
-				std::lock_guard<std::mutex> lk(rt.mtx);
-				reason = rt.violation_reason;
-				detail = rt.violation_detail;
-			}
-
-			const char* title = "Runtime integrity lock";
-			float title_size = 25.f;
-			ImVec2 title_ts = h1f->CalcTextSizeA(title_size, FLT_MAX, 0.f, title);
-			dl->AddText(h1f, title_size,
-				ImVec2(cx - title_ts.x * 0.5f + shake_x, content_y + 76.f),
-				aida::ui::with_alpha(th.text_primary, la), title);
-
-			std::string sub = runtime_lock_user_message(reason, detail);
-			float sub_size = aida::ui::fonts::size_or(body, 16.f);
-			ImVec2 sub_ts = body->CalcTextSizeA(sub_size, inner_w, 0.f, sub.c_str());
-			const float sub_y = content_y + 76.f + title_size + 16.f;
-			dl->AddText(body, sub_size,
-				ImVec2(cx - sub_ts.x * 0.5f + shake_x, sub_y),
-				aida::ui::with_alpha(th.text_secondary, la), sub.c_str(), nullptr, inner_w);
-
-			float next_y = sub_y + sub_ts.y + 12.f;
-			if (!reason.empty()) {
-				std::string msg = "Reason: " + reason;
-				ImFont* code = aida::ui::fonts::code();
-				if (!code) code = ImGui::GetFont();
-				float msg_size = 13.f;
-				ImVec2 reason_ts = code->CalcTextSizeA(msg_size, inner_w, 0.f, msg.c_str());
-				dl->AddText(code, msg_size,
-					ImVec2(cx - reason_ts.x * 0.5f + shake_x, next_y),
-					aida::ui::with_alpha(th.text_dim, la), msg.c_str(), nullptr, inner_w);
-				next_y += reason_ts.y + 8.f;
-			}
-
-			std::string evidence = runtime_lock_evidence_message(reason, detail);
-			if (!evidence.empty()) {
-				std::string msg = "Evidence: " + evidence;
-				ImFont* code = aida::ui::fonts::code();
-				if (!code) code = ImGui::GetFont();
-				float msg_size = 12.f;
-				ImVec2 evidence_ts = code->CalcTextSizeA(msg_size, inner_w, 0.f, msg.c_str());
-				dl->AddText(code, msg_size,
-					ImVec2(cx - evidence_ts.x * 0.5f + shake_x, next_y),
-					aida::ui::with_alpha(th.text_dim, la), msg.c_str(), nullptr, inner_w);
-			}
-
-			ImGui::End();
-			return;
-		}
-
-		const char* title = "Welcome to AiDA";
-		float title_size = 26.f;
-		ImVec2 title_ts = h1f->CalcTextSizeA(title_size, FLT_MAX, 0.f, title);
-		dl->AddText(h1f, title_size,
-			ImVec2(cx - title_ts.x * 0.5f + shake_x, content_y + 70.f),
-			aida::ui::with_alpha(th.text_primary, la), title);
-
-		const char* sub = "Enter your license key to continue.";
-		float sub_size = aida::ui::fonts::size_or(body, 16.f);
-		ImVec2 sub_ts = body->CalcTextSizeA(sub_size, FLT_MAX, 0.f, sub);
-		dl->AddText(body, sub_size,
-			ImVec2(cx - sub_ts.x * 0.5f + shake_x, content_y + 70.f + title_size + 12.f),
-			aida::ui::with_alpha(th.text_secondary, la), sub);
-
-		float input_w = inner_w;
-		float input_h = 48.f;
-		float input_x_screen = content_x;
-		float input_y_screen = content_y + 70.f + title_size + 12.f + sub_size + 18.f;
-
-		ImVec2 in_a(input_x_screen, input_y_screen);
-		ImVec2 in_b(input_x_screen + input_w, input_y_screen + input_h);
-
-		static aida::ui::hover_state_t input_focus;
-		static aida::ui::hover_state_t input_hover;
-		static aida::ui::hover_state_t eye_hover;
-		static bool show_license = false;
-		static bool refocus_input_pending = false;
-
-		bool input_active = false;
-		bool enter = false;
-		bool input_hovered = ImGui::IsMouseHoveringRect(in_a, in_b);
-
-		input_hover.tick(input_hovered, dt, aida::motion::spring::balanced);
-
-		ImGui::SetCursorScreenPos(ImVec2(in_a.x + 14.f, in_a.y + (input_h - ImGui::GetFontSize()) * 0.5f));
-		ImGui::PushID("license_input");
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0,0,0,0));
-		ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0,0,0,0));
-		ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0,0,0,0));
-		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.f, 0.f, 0.f, 0.f));
-		ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, 0.45f * la)));
-		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.f, 0.f));
-		ImGui::SetNextItemWidth(input_w - 56.f);
-		if (refocus_input_pending) {
-			ImGui::SetKeyboardFocusHere();
-			refocus_input_pending = false;
-		}
-
-		auto lic_callback = [](ImGuiInputTextCallbackData* data) -> int {
-			if (data->EventFlag == ImGuiInputTextFlags_CallbackCharFilter) {
-				ImWchar c = data->EventChar;
-				if (c >= 'a' && c <= 'z') {
-					data->EventChar = (ImWchar)(c - 'a' + 'A');
-					return 0;
-				}
-				if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-')
-					return 0;
-				return 1;
-			}
-			if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
-				char tmp[256] = {};
-				int j = 0;
-				int alnum = 0;
-				for (int i = 0; i < data->BufTextLen && j < (int)sizeof(tmp) - 1; ++i) {
-					char ch = data->Buf[i];
-					if (ch == '-') continue;
-					if (alnum == 4 && j < (int)sizeof(tmp) - 1) { tmp[j++] = '-'; alnum = 0; }
-					tmp[j++] = ch;
-					alnum++;
-				}
-				tmp[j] = '\0';
-				if (strcmp(tmp, data->Buf) != 0) {
-					data->DeleteChars(0, data->BufTextLen);
-					data->InsertChars(0, tmp);
-				}
-			}
-			return 0;
-		};
-
-		if (ImGui::GetFrameCount() < 5)
-			ImGui::SetKeyboardFocusHere();
-
-		ImGuiInputTextFlags flags = ImGuiInputTextFlags_EnterReturnsTrue |
-			ImGuiInputTextFlags_CallbackCharFilter | ImGuiInputTextFlags_CallbackEdit;
-		if (!show_license)
-			flags |= ImGuiInputTextFlags_Password;
-		enter = ImGui::InputText("##license_key", license::key_buf, sizeof(license::key_buf),
-			flags, lic_callback);
-		input_active = ImGui::IsItemActive();
-
-		ImGui::PopStyleVar();
-		ImGui::PopStyleColor(5);
-		ImGui::PopID();
-
-		float focus_v = input_focus.tick(input_active, dt, aida::motion::spring::balanced);
-		float ring_thick = focus_v * 2.5f + (1.f - focus_v) * 1.2f;
-		float input_radius = 12.f;
-		aida::ui::blur::layer_request_t in_req;
-		in_req.pos = in_a;
-		in_req.size = ImVec2(in_b.x - in_a.x, in_b.y - in_a.y);
-		in_req.radius = input_radius;
-		in_req.strength = 0.55f;
-		in_req.alpha = la;
-		aida::ui::blur::schedule(in_req);
-		ImU32 fill_col = aida::ui::with_alpha(th.bg_base, 0.43f * la);
-		dl->AddRectFilled(in_a, in_b, fill_col, input_radius);
-		ImU32 ring = aida::ui::mix(th.border_subtle, th.border_focus, focus_v);
-		dl->AddRect(in_a, in_b, aida::ui::with_alpha(ring, la), input_radius, 0, ring_thick);
-
-		ImFont* code = aida::ui::fonts::code();
-		if (!code) code = ImGui::GetFont();
-		float key_sz = 18.f;
-		char display_buf[sizeof(license::key_buf)];
-		if (show_license) {
-			memcpy(display_buf, license::key_buf, sizeof(display_buf));
-			display_buf[sizeof(display_buf) - 1] = '\0';
-		} else {
-			size_t di = 0;
-			for (; di < sizeof(display_buf) - 1 && license::key_buf[di] != '\0'; ++di) {
-				char ch = license::key_buf[di];
-				display_buf[di] = (ch == '-') ? '-' : '*';
-			}
-			display_buf[di] = '\0';
-		}
-		if (license::key_buf[0] == '\0' && !input_active) {
-			dl->AddText(code, key_sz,
-				ImVec2(in_a.x + 16.f, in_a.y + (input_h - key_sz) * 0.5f),
-				aida::ui::with_alpha(th.text_dim, la), "AiDA-XXXX-XXXX-XXXX-XXXX");
-		} else {
-			dl->AddText(code, key_sz,
-				ImVec2(in_a.x + 16.f, in_a.y + (input_h - key_sz) * 0.5f),
-				aida::ui::with_alpha(th.text_primary, la), display_buf);
-			if (input_active) {
-				float caret_a = aida::ui::clock::pulse(2.0f, 0.3f, 1.0f);
-				float text_w = code->CalcTextSizeA(key_sz, FLT_MAX, 0.f, display_buf).x;
-				float cax = in_a.x + 16.f + text_w + 1.f;
-				dl->AddLine(ImVec2(cax, in_a.y + 10.f), ImVec2(cax, in_b.y - 10.f),
-					aida::ui::with_alpha(th.text_primary, la * caret_a), 1.7f);
-			}
-		}
-
-		{
-			bool activation_worker_active = license::activation_worker_active.load(std::memory_order_acquire);
-			bool arc_transfer_active = standalone_license::is_arc_transfer_in_progress();
-			bool activation_progress_active = license::checking && (activation_worker_active || arc_transfer_active);
-			if (license::checking && !activation_progress_active) {
-				license::checking = false;
-				globals::ui::license_activation_phase.store(0, std::memory_order_release);
-				diag::log_tagged_fmt("license",
-					"DIAG_DIALOG_STALE_CHECKING_CLEARED worker=%d arc_transfer=%d arc_wait=%d frame=%d",
-					activation_worker_active ? 1 : 0,
-					arc_transfer_active ? 1 : 0,
-					standalone_license::is_arc_download_in_progress() ? 1 : 0,
-					ImGui::GetFrameCount());
-				activation_progress_active = false;
-			}
-
-			float eye_pad_r = 10.f;
-			float eye_w = 28.f;
-			float eye_h = 28.f;
-			ImVec2 eye_a(in_b.x - eye_pad_r - eye_w, in_a.y + (input_h - eye_h) * 0.5f);
-			ImVec2 eye_b(eye_a.x + eye_w, eye_a.y + eye_h);
-			bool eye_hov = !activation_progress_active && ImGui::IsMouseHoveringRect(eye_a, eye_b);
-			float ehv = eye_hover.tick(eye_hov, dt, aida::motion::spring::balanced);
-			if (eye_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-				show_license = !show_license;
-				refocus_input_pending = true;
-			}
-
-			ImU32 eye_glyph = aida::ui::with_alpha(
-				aida::ui::mix(th.text_secondary, th.text_primary, ehv), la);
-
-			ImVec2 ec((eye_a.x + eye_b.x) * 0.5f, (eye_a.y + eye_b.y) * 0.5f);
-			float ew = eye_w * 0.34f;
-			float eh = eye_h * 0.20f;
-			float arc_r = (ew * ew + eh * eh) / (2.f * eh);
-			float sin_arg = ew / arc_r;
-			if (sin_arg > 1.f) sin_arg = 1.f;
-			float span = asinf(sin_arg);
-			float thick = 1.5f;
-
-			ImVec2 top_center(ec.x, ec.y + (arc_r - eh));
-			dl->PathArcTo(top_center, arc_r, -1.5707963f - span, -1.5707963f + span, 20);
-			dl->PathStroke(eye_glyph, 0, thick);
-
-			ImVec2 bot_center(ec.x, ec.y - (arc_r - eh));
-			dl->PathArcTo(bot_center, arc_r, 1.5707963f - span, 1.5707963f + span, 20);
-			dl->PathStroke(eye_glyph, 0, thick);
-
-			float iris_r = eh * 0.78f;
-			if (show_license) {
-				dl->AddCircleFilled(ec, iris_r, eye_glyph, 16);
-			} else {
-				dl->AddCircle(ec, iris_r, eye_glyph, 16, thick);
-				float sx = ew + 2.f;
-				float sy = ew + 2.f;
-				dl->AddLine(ImVec2(ec.x - sx * 0.7f, ec.y - sy * 0.55f),
-					ImVec2(ec.x + sx * 0.7f, ec.y + sy * 0.55f), eye_glyph, thick + 0.4f);
-			}
-
-			if (eye_hov) {
-				ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-			}
-		}
-
-		bool activation_worker_active = license::activation_worker_active.load(std::memory_order_acquire);
-		bool arc_transfer_active = standalone_license::is_arc_transfer_in_progress();
-		bool activation_progress_active = license::checking && (activation_worker_active || arc_transfer_active);
-
-		float btn_h = 48.f;
-		float btn_y_screen = input_y_screen + input_h + 18.f;
-		ImVec2 btn_a(input_x_screen, btn_y_screen);
-		ImVec2 btn_b(input_x_screen + input_w, btn_y_screen + btn_h);
-
-		static aida::ui::hover_state_t btn_hover;
-		static aida::ui::press_state_t btn_press;
-		static aida::ui::flash_t btn_flash;
-		bool btn_hov = !activation_progress_active && ImGui::IsMouseHoveringRect(btn_a, btn_b);
-		bool btn_held = btn_hov && shell_left_mouse_down();
-		float bhov_v = btn_hover.tick(btn_hov, dt, aida::motion::spring::balanced);
-		float bprs_v = btn_press.tick(btn_held, dt);
-		float bf = btn_flash.tick(dt);
-
-		ImGui::SetCursorScreenPos(btn_a);
-		ImGui::InvisibleButton("##activate_btn", ImVec2(input_w, btn_h));
-		bool btn_clicked = ImGui::IsItemDeactivated() && ImGui::IsItemHovered() && !activation_progress_active;
-
-		float lift = bhov_v * 2.5f - bprs_v * 2.f;
-		float scl = 1.f - (1.f - 0.97f) * bprs_v;
-		ImVec2 cb_a(btn_a.x + (1.f - scl) * input_w * 0.5f, btn_a.y + (1.f - scl) * btn_h * 0.5f - lift);
-		ImVec2 cb_b(btn_b.x - (1.f - scl) * input_w * 0.5f, btn_b.y - (1.f - scl) * btn_h * 0.5f - lift);
-		float btn_radius = 10.f;
-
-		aida::ui::blur::render_drop_shadow(dl, cb_a, cb_b, btn_radius, 4,
-			(0.32f + 0.18f * bhov_v) * la, ImVec2(0.f, 4.f + 2.f * bhov_v));
-
-		aida::ui::blur::layer_request_t btn_blur_req;
-		btn_blur_req.pos = cb_a;
-		btn_blur_req.size = ImVec2(cb_b.x - cb_a.x, cb_b.y - cb_a.y);
-		btn_blur_req.radius = btn_radius;
-		btn_blur_req.strength = 0.7f;
-		btn_blur_req.alpha = la;
-		aida::ui::blur::schedule(btn_blur_req);
-
-		ImU32 fill_base = aida::ui::with_alpha(IM_COL32(255, 255, 255, 14), la * (0.6f + 0.4f * bhov_v));
-		dl->AddRectFilled(cb_a, cb_b, fill_base, btn_radius);
-
-		ImU32 fill_top = aida::ui::with_alpha(th.accent_grad_top, (0.45f + 0.30f * bhov_v) * la);
-		ImU32 fill_bot = aida::ui::with_alpha(th.accent_grad_bot, (0.55f + 0.30f * bhov_v) * la);
-		ImU32 fill_avg = aida::ui::mix(fill_top, fill_bot, 0.6f);
-		dl->AddRectFilled(cb_a, cb_b, fill_avg, btn_radius);
-
-		ImU32 sheen_top = aida::ui::with_alpha(IM_COL32(255, 255, 255, 70), la);
-		ImU32 sheen_bot = aida::ui::with_alpha(IM_COL32(255, 255, 255, 0), la);
-		ImU32 sheen_mix = aida::ui::mix(sheen_top, sheen_bot, 0.45f);
-		dl->AddRectFilled(
-			cb_a, ImVec2(cb_b.x, cb_a.y + (cb_b.y - cb_a.y) * 0.5f),
-			sheen_mix, btn_radius, ImDrawFlags_RoundCornersTop);
-
-		dl->AddRect(cb_a, cb_b,
-			aida::ui::with_alpha(IM_COL32(255, 255, 255, 180), (0.55f + 0.40f * bhov_v) * la),
-			btn_radius, 0, 1.2f);
-
-		if (bf > 0.f) {
-			dl->AddRectFilled(cb_a, cb_b,
-				aida::ui::with_alpha(IM_COL32(255,255,255,255), bf * 0.22f), btn_radius);
-		}
-		if (btn_clicked) btn_flash.trigger();
-
-		if (activation_progress_active) {
-			ImVec2 ring_c((cb_a.x + cb_b.x) * 0.5f, (cb_a.y + cb_b.y) * 0.5f);
-			float t_sec = aida::ui::clock::seconds() * 4.f;
-			float arc_len = 1.4f;
-			for (int i = 0; i < 24; ++i) {
-				float a0 = t_sec + (float)i / 24.f * arc_len;
-				float a1 = t_sec + (float)(i + 1) / 24.f * arc_len;
-				float fade = 1.f - (float)i / 24.f;
-				dl->PathArcTo(ring_c, 10.f, a0, a1, 4);
-				dl->PathStroke(aida::ui::with_alpha(IM_COL32(255,255,255,255),
-					la * fade), 0, 2.2f);
-			}
-		} else {
-			ImFont* h2f = aida::ui::fonts::h2();
-			if (!h2f) h2f = ImGui::GetFont();
-			const char* btn_label = "Activate";
-			float lbl_size = 18.f;
-			ImVec2 ts = h2f->CalcTextSizeA(lbl_size, FLT_MAX, 0.f, btn_label);
-			dl->AddText(h2f, lbl_size,
-				ImVec2((cb_a.x + cb_b.x) * 0.5f - ts.x * 0.5f, (cb_a.y + cb_b.y) * 0.5f - ts.y * 0.5f),
-				aida::ui::with_alpha(IM_COL32(255,255,255,255), la), btn_label);
-		}
-
-		if (activation_progress_active) {
-			static const char* k_act_phases[] = {
-				"Activating license...",
-				"Verifying license...",
-				"Preparing protected runtime...",
-				"Downloading runtime...",
-				"Sealing..."
-			};
-			int act_phase = globals::ui::license_activation_phase.load(std::memory_order_acquire);
-			if (arc_transfer_active && act_phase < 3)
-				act_phase = 3;
-			if (act_phase < 0) act_phase = 0;
-			if (act_phase > 4) act_phase = 4;
-
-			float pb_x = input_x_screen;
-			float pb_y = btn_y_screen + btn_h + 16.f;
-			float pb_w = input_w;
-			ImGui::GetWindowDrawList();
-			ImGui::SetCursorScreenPos(ImVec2(pb_x, pb_y));
-			aida::ui::render_progress_bar(ImVec2(pb_x, pb_y), pb_w, 4.f,
-				(float)(act_phase + 1) / 5.f, false, true);
-
-			static int last_act_phase = -1;
-			static aida::ui::transition_t act_swap;
-			static const char* prev_lbl = k_act_phases[0];
-			static const char* cur_lbl  = k_act_phases[0];
-			if (act_phase != last_act_phase) {
-				prev_lbl = cur_lbl;
-				cur_lbl  = k_act_phases[act_phase];
-				act_swap.start(0.120f, aida::motion::ease::out_cubic);
-				last_act_phase = act_phase;
-			}
-			act_swap.tick(dt);
-			float sw = act_swap.eased();
-			ImFont* phase_font = aida::ui::fonts::body();
-			if (!phase_font) phase_font = ImGui::GetFont();
-			float phase_size = aida::ui::fonts::size_or(phase_font, 16.f);
-			float lbl_y = pb_y + 16.f;
-			if (!act_swap.is_finished() && prev_lbl) {
-				ImVec2 ts_p = phase_font->CalcTextSizeA(phase_size, FLT_MAX, 0.f, prev_lbl);
-				dl->AddText(phase_font, phase_size,
-					ImVec2(cx - ts_p.x * 0.5f + shake_x, lbl_y - sw * 6.f),
-					aida::ui::with_alpha(th.text_secondary, (1.f - sw) * la), prev_lbl);
-				ImVec2 ts_c = phase_font->CalcTextSizeA(phase_size, FLT_MAX, 0.f, cur_lbl);
-				dl->AddText(phase_font, phase_size,
-					ImVec2(cx - ts_c.x * 0.5f + shake_x, lbl_y + (1.f - sw) * 6.f),
-					aida::ui::with_alpha(th.text_secondary, sw * la), cur_lbl);
-			} else {
-				ImVec2 ts_c = phase_font->CalcTextSizeA(phase_size, FLT_MAX, 0.f, cur_lbl);
-				dl->AddText(phase_font, phase_size,
-					ImVec2(cx - ts_c.x * 0.5f + shake_x, lbl_y),
-					aida::ui::with_alpha(th.text_secondary, la), cur_lbl);
-			}
-		}
-
-		int arc_phase = globals::ui::arc_unseal_phase.load(std::memory_order_acquire);
-		if (arc_phase == 1) {
-			ImFont* arc_font = aida::ui::fonts::body();
-			if (!arc_font) arc_font = ImGui::GetFont();
-			const char* msg = "Decrypting runtime core...";
-			float arc_size = aida::ui::fonts::size_or(arc_font, 16.f);
-			float pill_y = card_b.y + 18.f;
-			ImVec2 ts = arc_font->CalcTextSizeA(arc_size, FLT_MAX, 0.f, msg);
-			float pill_w = ts.x + 56.f;
-			float pill_h = arc_size + 16.f;
-			ImVec2 pa(cx - pill_w * 0.5f, pill_y);
-			ImVec2 pb(pa.x + pill_w, pa.y + pill_h);
-			dl->AddRectFilled(pa, pb, aida::ui::with_alpha(th.info_soft, la), pill_h * 0.5f);
-			dl->AddRect(pa, pb, aida::ui::with_alpha(th.info, 0.55f * la), pill_h * 0.5f, 0, 1.f);
-			ImVec2 ring_c(pa.x + 20.f, (pa.y + pb.y) * 0.5f);
-			aida::ui::render_progress_ring(ring_c, 9.f, 1.6f, 0.f, true);
-			dl->AddText(arc_font, arc_size,
-				ImVec2(pa.x + 38.f, pa.y + (pill_h - arc_size) * 0.5f),
-				aida::ui::with_alpha(th.info, la), msg);
-		}
-
-		if ((enter || btn_clicked) && !activation_progress_active && strlen(license::key_buf) > 0)
-		{
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			license::saved_key = license::key_buf;
-			license::validated = true;
-			license::checking = false;
-			license::activation_worker_active.store(false, std::memory_order_release);
-			license::check_failed = false;
-			license::error_msg.clear();
-			aida::preview::record(aida::preview::shell_action_t::license_activate, "license_activation_receipt");
-			aida::preview::set_phase(aida::preview::shell_phase_t::ide);
-#else
-			const bool submit_runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
-			if (license::runtime_ready(submit_runtime_locked, test_all_features::is_running())) {
-				license::checking = false;
-				license::activation_worker_active.store(false, std::memory_order_release);
-				license::check_failed = false;
-				license::error_msg.clear();
-				diag::log_tagged_fmt("license",
-					"DIAG_DIALOG_SUBMIT_IGNORED_RUNTIME_READY enter=%d click=%d key_len=%llu frame=%d",
-					enter ? 1 : 0, btn_clicked ? 1 : 0,
-					static_cast<unsigned long long>(strlen(license::key_buf)),
-					ImGui::GetFrameCount());
-				ImGui::End();
-				return;
-			}
-			license::checking    = true;
-			license::activation_worker_active.store(true, std::memory_order_release);
-			license::check_failed = false;
-			license::error_msg.clear();
-			globals::ui::license_activation_phase.store(0, std::memory_order_release);
-
-			diag::log_tagged_fmt("license",
-				"DIAG_DIALOG_SUBMIT enter=%d click=%d key_len=%llu frame=%d",
-				enter ? 1 : 0, btn_clicked ? 1 : 0,
-				static_cast<unsigned long long>(strlen(license::key_buf)),
-				ImGui::GetFrameCount());
-
-			std::string key_copy(license::key_buf);
-			const auto submit_result = submit_helpers_executor_task(
-				"license",
-				"license.activation",
-				aida::infra::executor::domain_t::security_liveness,
-				"security_liveness",
-				[key_copy]() {
-				BOOL activation_ok = FALSE;
-				char err_buf[1024] = {};
-				DWORD seh_code = seh_license_activate(key_copy.c_str(),
-				                                     &activation_ok,
-				                                     err_buf, sizeof(err_buf));
-
-				try {
-					if (seh_code != 0) {
-						char dbg[160];
-						_snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-							"Activation crashed (SEH 0x%08X). Please retry.",
-							static_cast<unsigned int>(seh_code));
-						license::error_msg = dbg;
-						license::check_failed = true;
-					}
-					else if (activation_ok) {
-						license::saved_key = key_copy;
-						license::validated = true;
-						license::error_msg.clear();
-					}
-					else {
-						license::error_msg = (err_buf[0] != '\0')
-						    ? std::string(err_buf)
-						    : std::string("License validation failed.");
-						license::check_failed = true;
-					}
-				} catch (...) {
-					license::check_failed = true;
-				}
-				license::activation_worker_active.store(false, std::memory_order_release);
-				license::checking = false;
-			});
-			if (!submit_result.submitted) {
-				license::activation_worker_active.store(false, std::memory_order_release);
-				license::checking = false;
-				license::check_failed = true;
-				license::error_msg = "License activation could not be scheduled.";
-				diag::log_tagged_fmt("license",
-					"DIAG_DIALOG_SUBMIT_EXECUTOR_REJECT reason=%s frame=%d",
-					submit_result.reject_reason.empty() ? "<none>" : submit_result.reject_reason.c_str(),
-					ImGui::GetFrameCount());
-			}
-#endif
-		}
-
-
-		if (license::check_failed && !license::error_msg.empty())
-		{
-			ImFont* err_font = aida::ui::fonts::body();
-			if (!err_font) err_font = ImGui::GetFont();
-			float err_font_size = aida::ui::fonts::size_or(err_font, 16.f);
-			float err_y = btn_y_screen + btn_h + 24.f;
-
-			float ic_x = card_a.x + pad;
-			float ic_y = err_y + 2.f;
-			ImVec2 ic_c(ic_x + 11.f, ic_y + 11.f);
-			dl->AddCircleFilled(ic_c, 11.f, aida::ui::with_alpha(th.error_soft, la), 16);
-			dl->AddCircle(ic_c, 11.f, aida::ui::with_alpha(th.error, la), 16, 1.3f);
-			ImFont* bang_font = aida::ui::fonts::body_em();
-			if (!bang_font) bang_font = err_font;
-			const float bang_font_size = aida::ui::fonts::size_or(bang_font, err_font_size);
-			dl->AddText(bang_font, bang_font_size,
-				ImVec2(ic_c.x - 3.f, ic_c.y - bang_font_size * 0.5f),
-				aida::ui::with_alpha(th.error, la), "!");
-
-			float btn_w_disc = 124.f;
-			float btn_h_disc = 34.f;
-			float msg_x = ic_x + 30.f;
-			float msg_w = inner_w - 30.f - btn_w_disc - 8.f;
-			std::string mapped = license::error_msg;
-			if (mapped.find("not_found") != std::string::npos) {
-				mapped = "This license/session is no longer present on the server. Activate the current key.";
-			}
-			dl->AddText(err_font, err_font_size, ImVec2(msg_x, err_y),
-				aida::ui::with_alpha(th.error, la),
-				mapped.c_str(), nullptr, msg_w);
-
-			ImVec2 disc_a(card_b.x - pad - btn_w_disc, err_y - 6.f);
-			ImVec2 disc_b(disc_a.x + btn_w_disc, disc_a.y + btn_h_disc);
-			static aida::ui::hover_state_t disc_h;
-			bool disc_hov = ImGui::IsMouseHoveringRect(disc_a, disc_b);
-			float dhv = disc_h.tick(disc_hov, dt, aida::motion::spring::balanced);
-			ImGui::SetCursorScreenPos(disc_a);
-			ImGui::InvisibleButton("##disc_btn", ImVec2(btn_w_disc, btn_h_disc));
-			bool disc_clk = ImGui::IsItemDeactivated() && ImGui::IsItemHovered();
-			float disc_radius = 10.f;
-			aida::ui::blur::layer_request_t disc_req;
-			disc_req.pos = disc_a;
-			disc_req.size = ImVec2(btn_w_disc, btn_h_disc);
-			disc_req.radius = disc_radius;
-			disc_req.strength = 0.55f;
-			disc_req.alpha = la;
-			aida::ui::blur::schedule(disc_req);
-			ImU32 disc_fill = aida::ui::with_alpha(IM_COL32(255, 255, 255, 12), la * (0.6f + 0.6f * dhv));
-			dl->AddRectFilled(disc_a, disc_b, disc_fill, disc_radius);
-			ImU32 disc_border = aida::ui::with_alpha(th.border_subtle, la * (0.7f + 0.5f * dhv));
-			dl->AddRect(disc_a, disc_b, disc_border, disc_radius, 0, 1.2f);
-			ImFont* sm_font = aida::ui::fonts::body_em();
-			if (!sm_font) sm_font = ImGui::GetFont();
-			float disc_lbl = aida::ui::fonts::size_or(sm_font, 16.f);
-			ImVec2 dts = sm_font->CalcTextSizeA(disc_lbl, FLT_MAX, 0.f, "Get a key");
-			dl->AddText(sm_font, disc_lbl,
-				ImVec2((disc_a.x + disc_b.x) * 0.5f - dts.x * 0.5f, (disc_a.y + disc_b.y) * 0.5f - dts.y * 0.5f),
-				aida::ui::with_alpha(th.text_primary, la), "Get a key");
-			if (disc_clk) {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-				aida::preview::record(aida::preview::shell_action_t::license_activate,
-					"open_key_page:https://discord.gg/aida");
-#else
-				const auto submitted = aida::auth::submit_open_url_external("https://discord.gg/aida");
-				if (!submitted.submitted) {
-					toast_notification::push("Camoufox could not queue the key page",
-						toast_notification::toast_type_t::error, 5.0f);
-				}
-#endif
-			}
-		}
-
-		if (license::validated && standalone_license::is_valid()) {
-			static aida::ui::transition_t check_anim;
-			static aida::ui::transition_t burst_anim;
-			static bool started = false;
-			if (!started) {
-				check_anim.start(0.220f, aida::motion::ease::out_quint);
-				burst_anim.start(0.480f, aida::motion::ease::out_quint, 0.220f);
-				started = true;
-			}
-			check_anim.tick(dt);
-			burst_anim.tick(dt);
-			ImVec2 cm_c((cb_a.x + cb_b.x) * 0.5f, (cb_a.y + cb_b.y) * 0.5f);
-			aida::ui::brand::render_check_drawn(dl, cm_c, 24.f,
-				check_anim.eased(), aida::ui::with_alpha(IM_COL32(255,255,255,255), la), 2.5f);
-			aida::ui::brand::render_sparkle_burst(dl, cm_c, burst_anim.progress, 36.f,
-				aida::ui::with_alpha(th.accent_u32, la), 10);
-		}
-
-		{
-			#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			static bool preview_license_dragging = false;
-			bool preview_license_drag = ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.f);
-			if (preview_license_drag && !preview_license_dragging)
-				aida::preview::record(aida::preview::shell_action_t::move_window, "license_surface");
-			preview_license_dragging = preview_license_drag;
-			#else
-			static POINT lic_drag_wnd = {};
-			static POINT lic_drag_mouse = {};
-			static bool  lic_dragging = false;
-			static bool  lic_last_lmb = false;
-			bool lmb = shell_left_mouse_down();
-			if (lmb && !lic_last_lmb) {
-				POINT cp; GetCursorPos(&cp);
-				RECT wr; GetWindowRect(g_hwnd, &wr);
-				int local_y = cp.y - wr.top;
-				bool over_card = cp.x >= (int)card_a.x && cp.x <= (int)card_b.x &&
-				                 cp.y >= (int)card_a.y && cp.y <= (int)card_b.y;
-				if (cp.x >= wr.left && cp.x <= wr.right && cp.y >= wr.top && cp.y <= wr.bottom &&
-					local_y < (wr.bottom - wr.top) / 2 && !over_card) {
-					lic_dragging = true;
-					lic_drag_mouse = cp;
-					lic_drag_wnd = { wr.left, wr.top };
-				}
-			}
-			if (!lmb) lic_dragging = false;
-			if (lic_dragging) {
-				POINT cp; GetCursorPos(&cp);
-				int nx = lic_drag_wnd.x + (cp.x - lic_drag_mouse.x);
-				int ny = lic_drag_wnd.y + (cp.y - lic_drag_mouse.y);
-				shell_move_window(nx, ny);
-			}
-			lic_last_lmb = lmb;
-			#endif
 		}
 
 		ImGui::End();
@@ -7146,52 +5984,6 @@ void helpers::render_title()
 		}
 	}
 
-
-	{
-		g_render_section = "post_bottom_license_check";
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		static int s_lic_check_counter = 0;
-		if (++s_lic_check_counter >= 120) {
-			s_lic_check_counter = 0;
-			if (license::validated && !standalone_license::is_valid()) {
-				g_render_section = "post_bottom_license_invalid";
-				const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
-				if (license::preserve_valid_state(runtime_locked, test_all_features::is_running())) {
-					g_render_section = "post_bottom_license_preserve";
-					license::checking = false;
-					license::activation_worker_active.store(false, std::memory_order_release);
-					license::check_failed = false;
-					license::error_msg.clear();
-					diag::log_tagged_fmt("license",
-						"DIAG_DIALOG_TRIGGER_SUPPRESSED source=periodic_check_120f frame=%d full_test=1 arc=%d",
-						ImGui::GetFrameCount(),
-						standalone_license::is_arc_loaded() ? 1 : 0);
-				} else {
-					g_render_section = "post_bottom_license_fail_closed";
-					license::validated = false;
-					std::string runtime_reason;
-					std::string runtime_detail;
-					if (runtime_locked) {
-						auto& rt = anti_tamper::state::get();
-						std::lock_guard<std::mutex> lk(rt.mtx);
-						runtime_reason = rt.violation_reason;
-						runtime_detail = rt.violation_detail;
-					}
-					license::error_msg = runtime_locked
-						? runtime_lock_user_message(runtime_reason, runtime_detail)
-						: standalone_license::last_error();
-					output_log::push(bottom_tab_t::output, runtime_locked
-						? std::string("[license] Runtime integrity lock, activation screen suppressed")
-						: std::string("[license] Session invalidated: " + license::error_msg));
-					diag::log_tagged_fmt("license",
-						"DIAG_DIALOG_TRIGGER source=periodic_check_120f frame=%d runtime_locked=%d err=%.200s",
-						ImGui::GetFrameCount(), runtime_locked ? 1 : 0, license::error_msg.c_str());
-				}
-			}
-		}
-#endif
-	}
-
 	g_render_section = "post_bottom_tick_ai_chat";
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	tick_ai_chat();
@@ -8006,9 +6798,9 @@ void helpers::render_title()
 			kb_edit_conflicts.clear();
 			kb_edit_status.clear();
 			kb_reset_all_armed = false;
-			anti_tamper::webhook::write_log("chrome", "shortcuts_popup open=true");
+			diag::log_tagged("chrome", "shortcuts_popup open=true");
 		} else if (!now_open && kb_was_open) {
-			anti_tamper::webhook::write_log("chrome", "shortcuts_popup open=false");
+			diag::log_tagged("chrome", "shortcuts_popup open=false");
 		}
 		kb_was_open = now_open;
 

@@ -32,7 +32,6 @@
 #include "../session/analysis_session.hpp"
 
 #include "../../helpers/diag_log.hpp"
-#include "../anti-tamper/webhook.hpp"
 #include "../infra/executor.hpp"
 #include "../infra/fast_containers.hpp"
 
@@ -3565,7 +3564,7 @@ namespace function_index {
 						func_count,
 						name.c_str());
 					diag::log_tagged("function_index", log_buf);
-					anti_tamper::webhook::write_log("function_index", log_buf);
+					diag::log_tagged("function_index", log_buf);
 				}
 				{
 					std::unique_lock<std::shared_mutex> lk(c2.mutex);

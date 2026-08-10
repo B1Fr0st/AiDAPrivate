@@ -3,7 +3,6 @@
 #include "graphrag.hpp"
 #include "analysis_db.hpp"
 #include "multibinary_project.hpp"
-#include "anti_re.hpp"
 #include "aida_ipc.hpp"
 #include "vuln/vuln_tools.hpp"
 #include "vuln/verification_tools.hpp"
@@ -596,17 +595,6 @@ std::string ToolRegistry::generate_tools_description() const
 tool_result_t ToolRegistry::execute_tool(const std::string& name, const json& params)
 {
     aida_ipc::trace_breadcrumb("agent_tools: execute_tool ENTRY name=%s", name.c_str());
-    /*
-    if (ida_utils::is_self_target_database())
-        return tool_result_t::error(OBFSTR("Operation blocked."));
-
-    if (ida_utils::idb_is_aida_binary())
-    {
-        msg(OBFSTR_C("AiDA: self-analysis guard triggered for tool=%s — terminating.\n"), name.c_str());
-        constexpr uint32_t kSelfAnalysisBsodCode = 0xA1DA0001u;
-        __fastfail(static_cast<unsigned int>(kSelfAnalysisBsodCode));
-    }
-    */
 
     const auto* tool = get_tool(name);
     if (!tool)

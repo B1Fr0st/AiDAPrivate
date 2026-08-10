@@ -167,7 +167,7 @@ std::string last_error()
 #include "auth_claude_code.hpp"
 
 #include "auth_store.hpp"
-#include "anti-tamper/webhook.hpp"
+#include "../../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
 
 #include <winsock2.h>
@@ -221,7 +221,7 @@ namespace claude_code {
 			last_error_ref() = text;
 			if (!text.empty()) {
 				const std::string line = std::string("[aida.auth.claude_code] ") + text;
-				anti_tamper::webhook::write_log("auth.claude_code", line.c_str());
+				diag::log_tagged("auth.claude_code", line.c_str());
 			}
 		}
 
@@ -1028,7 +1028,7 @@ namespace claude_code {
 			}
 			dispatch_listener_cancel(ctx);
 			if (!ctx->worker_done.load(std::memory_order_acquire))
-				anti_tamper::webhook::write_log("auth.claude_code",
+				diag::log_tagged("auth.claude_code",
 					"[aida.auth.claude_code] listener task retained until socket-close cancellation completes");
 		}
 
@@ -1340,7 +1340,7 @@ namespace claude_code {
 			if (err.empty())
 				return;
 			const std::string line = std::string("[aida.auth.claude_code] ") + err;
-			anti_tamper::webhook::write_log("auth.claude_code", line.c_str());
+			diag::log_tagged("auth.claude_code", line.c_str());
 		}
 
 		bool exchange_code(claude_code_login_state_t& state, std::string& failure)

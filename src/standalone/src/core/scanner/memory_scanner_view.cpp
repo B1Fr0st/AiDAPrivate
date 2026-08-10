@@ -8,7 +8,6 @@
 #include "../../preview/scan_preview_runtime.hpp"
 #else
 #include "standalone_driver.hpp"
-#include "../anti-tamper/webhook.hpp"
 #include "../disasm/zydis_disasm.hpp"
 #include "../disasm/function_index.hpp"
 #include "../helpers/diag_log.hpp"
@@ -3599,7 +3598,7 @@ void process_add_dialog() {
 				ui.desc_edit.pending_add_address, desc,
 				static_cast<memory_scanner::value_type_t>(
 					ui.desc_edit.pending_add_value_type));
-			anti_tamper::webhook::write_log("scan_audit",
+			diag::log_tagged("scan_audit",
 				"[scan_audit] memory_scanner add_address invoked");
 			toast_notification::push("Added to address list.",
 				toast_notification::toast_type_t::success, 2.5f);
@@ -3697,7 +3696,7 @@ void process_edit_description_dialog() {
 			}
 			diag_logf("dialog edit_desc_save idx=%d desc='%s'",
 				ui.desc_edit.address_index, val.c_str());
-			anti_tamper::webhook::write_log("scan_audit",
+			diag::log_tagged("scan_audit",
 				"[scan_audit] memory_scanner edit_description");
 			ImGui::CloseCurrentPopup();
 			ui.desc_edit.active = false;
@@ -3835,7 +3834,7 @@ void process_edit_value_dialog() {
 							static_cast<unsigned long long>(addr_v), context.target_pid,
 							static_cast<unsigned long long>(context.scan_revision));
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-						anti_tamper::webhook::write_log("scan_audit",
+						diag::log_tagged("scan_audit",
 							"[scan_audit] memory_scanner write_value queued_for_worker_readback");
 #endif
 					}
@@ -3979,7 +3978,7 @@ void process_result_context_menu() {
 				toast_notification::push(msg,
 					toast_notification::toast_type_t::success, 2.5f);
 			}
-			anti_tamper::webhook::write_log("scan_audit",
+			diag::log_tagged("scan_audit",
 				"[scan_audit] memory_scanner ctx add_to_list");
 		}
 		if (context_item("Open in Hex view", memory_interaction::capability_t::open_hex,
@@ -3990,7 +3989,7 @@ void process_result_context_menu() {
 				const auto context = disasm_view::capture_selected_workspace();
 				if (hex_view::request_live_memory(context, ctx_addr, 256))
 					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
-				anti_tamper::webhook::write_log("scan_audit",
+				diag::log_tagged("scan_audit",
 					"[scan_audit] memory_scanner ctx open_hex");
 			}
 		}
@@ -4002,14 +4001,14 @@ void process_result_context_menu() {
 				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 				disasm_view::goto_address(ctx_addr,
 					disasm_view::capture_selected_workspace());
-				anti_tamper::webhook::write_log("scan_audit",
+				diag::log_tagged("scan_audit",
 					"[scan_audit] memory_scanner ctx open_disasm");
 			}
 		}
 		if (s_consumed_memory_action == "memory.entity.copy_address") {
 			copy_memory_addresses(action_contexts);
 			diag_log("ctx_result copy_address");
-			anti_tamper::webhook::write_log("scan_audit",
+			diag::log_tagged("scan_audit",
 				"[scan_audit] memory_scanner ctx copy_address");
 		}
 		if (s_consumed_memory_action == "memory.entity.copy_value")
@@ -4115,7 +4114,7 @@ void process_address_context_menu() {
 				const auto context = disasm_view::capture_selected_workspace();
 				if (hex_view::request_live_memory(context, ctx_addr, 256))
 					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
-				anti_tamper::webhook::write_log("scan_audit",
+				diag::log_tagged("scan_audit",
 					"[scan_audit] address_list ctx open_hex");
 			}
 		}
@@ -4127,7 +4126,7 @@ void process_address_context_menu() {
 				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 				disasm_view::goto_address(ctx_addr,
 					disasm_view::capture_selected_workspace());
-				anti_tamper::webhook::write_log("scan_audit",
+				diag::log_tagged("scan_audit",
 					"[scan_audit] address_list ctx open_disasm");
 			}
 		}
@@ -4169,7 +4168,7 @@ void process_address_context_menu() {
 				memory_scanner::remove_address(static_cast<size_t>(idx));
 			ui.address_multi_sel.clear();
 			ui.selected_address = -1;
-			anti_tamper::webhook::write_log("scan_audit",
+			diag::log_tagged("scan_audit",
 				"[scan_audit] address_list ctx remove");
 		}
 	}
@@ -4327,7 +4326,7 @@ scan_command_result_t execute_scan_command(scan_command_t command) {
 			ui.value_buf, ui.value_buf2,
 			memory_scanner::value_type_name(state.config.value_type),
 			memory_scanner::scan_mode_name(state.config.scan_mode));
-		anti_tamper::webhook::write_log("scan_audit",
+		diag::log_tagged("scan_audit",
 			"[scan_audit] memory_scanner first_scan invoked");
 		state.config.value_text = ui.value_buf;
 		state.config.value_text2 = ui.value_buf2;
@@ -4367,7 +4366,7 @@ scan_command_result_t execute_scan_command(scan_command_t command) {
 		diag_logf("action next_scan mode=%s val='%s' val2='%s'",
 			memory_scanner::scan_mode_name(state.config.scan_mode),
 			ui.value_buf, ui.value_buf2);
-		anti_tamper::webhook::write_log("scan_audit",
+		diag::log_tagged("scan_audit",
 			"[scan_audit] memory_scanner next_scan invoked");
 		if (!memory_scanner::next_scan(state.config.scan_mode,
 			std::string(ui.value_buf), std::string(ui.value_buf2)))

@@ -21,7 +21,7 @@
 #include <utility>
 #include <vector>
 
-#include "anti-tamper/webhook.hpp"
+#include "../../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
 #include "../network/burp/camoufox_bridge.hpp"
 
@@ -100,7 +100,7 @@ inline const char* browser_result_name(browser_open_result_t result) noexcept
 inline void default_browser_log(const std::string& message)
 {
     const std::string line = std::string("[aida.auth.browser] ") + message;
-    anti_tamper::webhook::write_log("auth.browser", line.c_str());
+    diag::log_tagged("auth.browser", line.c_str());
 }
 
 struct browser_operation_adapter_t {

@@ -5,11 +5,10 @@
 
 #include "../mcp/mcp_standalone.hpp"
 #include "../session/analysis_session.hpp"
-#include "../session/session_health.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../runtime/run_target.hpp"
 #include "../runtime/vm_guest_bridge.hpp"
-#include "../anti-tamper/self_guard.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -43,7 +42,8 @@ json summary_to_json(const analysis_session::session_summary_t& s)
 	o["process_name"] = s.process_name;
 	o["is_active"] = s.is_active;
 	if (s.pid != 0) {
-		o["is_alive"] = session_health::is_alive(s.pid);
+		const auto ws = aida::analysis::workspace_registry().find_by_pid(s.pid);
+		o["is_alive"] = ws && !ws->closing() && !ws->closed();
 	} else {
 		o["is_alive"] = true;
 	}
@@ -251,15 +251,6 @@ static tool_result_t sessions_open_file(const json& params)
 	const std::string path = params["path"].get<std::string>();
 	if (path.empty())
 		return tool_result_t::error("path must be non-empty");
-	{
-		self_guard::self_guard_context_t sg_ctx;
-		sg_ctx.tool_name = "sessions_open_file";
-		sg_ctx.has_binary_path = true;
-		sg_ctx.target_binary_path = path;
-		auto guard_result = self_guard::invoke_self_guard(sg_ctx);
-		if (guard_result != self_guard::self_guard_result_t::allow)
-			self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
-	}
 	size_t existing_index = 0;
 	const bool already_open = analysis_session::find_session_by_path(path, &existing_index);
 	if (!analysis_session::open_session(path)) {
@@ -291,15 +282,6 @@ static tool_result_t sessions_attach_pid(const json& params)
 		return tool_result_t::error(pid_message.empty() ? std::string("invalid pid") : pid_message,
 			pid_code.empty() ? std::string("INVALID_ARGUMENT") : pid_code,
 			pid_details.is_object() ? pid_details : json::object());
-	{
-		self_guard::self_guard_context_t sg_ctx;
-		sg_ctx.tool_name = "sessions_attach_pid";
-		sg_ctx.has_pid = true;
-		sg_ctx.target_pid = pid;
-		auto guard_result = self_guard::invoke_self_guard(sg_ctx);
-		if (guard_result != self_guard::self_guard_result_t::allow)
-			self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
-	}
 	size_t index = 0;
 	const bool already_attached = analysis_session::find_session_by_pid(pid, &index);
 	if (!already_attached) {
@@ -401,18 +383,6 @@ static tool_result_t sessions_run_binary(const json& params)
 			? params["path"].get<std::string>().c_str() : "");
 	if (!params.contains("path") || !params["path"].is_string()) {
 		return tool_result_t::error("path (string) is required");
-	}
-	{
-		const std::string run_path = params["path"].get<std::string>();
-		if (!run_path.empty()) {
-			self_guard::self_guard_context_t sg_ctx;
-			sg_ctx.tool_name = "sessions_run_binary";
-			sg_ctx.has_binary_path = true;
-			sg_ctx.target_binary_path = run_path;
-			auto guard_result = self_guard::invoke_self_guard(sg_ctx);
-			if (guard_result != self_guard::self_guard_result_t::allow)
-				self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
-		}
 	}
 	run_target::launch_options_t opts;
 	opts.exe_path = widen(params["path"].get<std::string>());

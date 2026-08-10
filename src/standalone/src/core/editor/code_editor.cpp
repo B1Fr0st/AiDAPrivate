@@ -11,7 +11,6 @@
 #else
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
-#include "standalone_license.hpp"
 #endif
 
 #include "imgui/imgui.h"
@@ -4707,12 +4706,6 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                     aida::preview::editor::record("ghost_completion", context);
 #else
                     if (g_sa_ai_client) {
-                    uint64_t gt = standalone_license::inline_gate_check(
-                        standalone_license::gate_editor_ghost);
-                    if (standalone_license::verify_gate_token(
-                            standalone_license::gate_editor_ghost, gt) < 0.5) {
-                        s_ghost_debounce = 0.f;
-                    } else {
                     s_ghost_requesting = true;
                     aida::infra::executor::submission_t sub;
                     sub.owner_subsystem = "code_editor";
@@ -4754,7 +4747,6 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                     };
                     if (!aida::infra::executor::submit(std::move(sub)).submitted)
                         s_ghost_requesting = false;
-                    }
                     }
 #endif
                 }

@@ -126,7 +126,7 @@ namespace strong {
         readable.PhysicalAddress.QuadPart = (LONGLONG)Address;
 
         SIZE_T copied = 0;
-        NTSTATUS status = stack_spoof::spoofed_MmCopyMemory(buffer, readable, size, MM_COPY_MEMORY_PHYSICAL, &copied);
+        NTSTATUS status = _MmCopyMemory(buffer, readable, size, MM_COPY_MEMORY_PHYSICAL, &copied);
 
         if (bytes_read) {
             *bytes_read = copied;
@@ -161,7 +161,7 @@ namespace strong {
             return STATUS_INVALID_ADDRESS;
         }
 
-        PVOID mapped_memory = stack_spoof::spoofed_MmMapIoSpaceEx(writable, size, PAGE_NOCACHE | PAGE_READWRITE);
+        PVOID mapped_memory = _MmMapIoSpaceEx(writable, size, PAGE_NOCACHE | PAGE_READWRITE);
         if (!mapped_memory) {
             if (bytes_written) *bytes_written = 0;
             return STATUS_INSUFFICIENT_RESOURCES;
@@ -174,12 +174,12 @@ namespace strong {
             if (bytes_written) *bytes_written = size;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            stack_spoof::spoofed_MmUnmapIoSpace(mapped_memory, size);
+            _MmUnmapIoSpace(mapped_memory, size);
             if (bytes_written) *bytes_written = 0;
             return STATUS_ACCESS_VIOLATION;
         }
 
-        stack_spoof::spoofed_MmUnmapIoSpace(mapped_memory, size);
+        _MmUnmapIoSpace(mapped_memory, size);
 
         return STATUS_SUCCESS;
     }

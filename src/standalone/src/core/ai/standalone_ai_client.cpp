@@ -5,7 +5,6 @@
 #endif
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
-#include "standalone_license.hpp"
 #include "standalone_context.hpp"
 #include "standalone_chat.hpp"
 #include "mcp_standalone.hpp"
@@ -590,29 +589,6 @@ void standalone_ai_client_t::chat_async(
         return;
     }
 
-
-#if !defined(AIDA_C03_STANDALONE_AI_CANCEL_FIXTURE)
-    if (!standalone_license::is_valid()) {
-        if (on_complete)
-            on_complete("Error: Service unavailable. Please restart the application.");
-        return;
-    }
-#endif
-
-#if !defined(AIDA_C03_STANDALONE_AI_CANCEL_FIXTURE)
-    {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_ai_chat_async);
-        if (standalone_license::verify_gate_token(
-                standalone_license::gate_ai_chat_async, gt) < 0.5) {
-            if (on_complete)
-                on_complete(standalone_license::decode_status_string(
-                    standalone_license::str_internal_error));
-            return;
-        }
-    }
-#endif
-
     auto prompt = build_chat_prompt(user_message, history);
     std::string acquire_error;
     auto operation = _control->acquire(
@@ -696,27 +672,6 @@ std::string standalone_ai_client_t::chat_blocking(
 
     if (!is_available(settings))
         return "Error: AI client not configured.";
-
-
-#if !defined(AIDA_C03_STANDALONE_AI_CANCEL_FIXTURE)
-    if (standalone_license::inline_proof_check_b() == 0) {
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(800 + (GetTickCount64() % 400)));
-        return "Error: Internal model routing failure. Please retry.";
-    }
-#endif
-
-#if !defined(AIDA_C03_STANDALONE_AI_CANCEL_FIXTURE)
-    {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_ai_stream_cb);
-        if (standalone_license::verify_gate_token(
-                standalone_license::gate_ai_stream_cb, gt) < 0.5) {
-            return standalone_license::decode_status_string(
-                standalone_license::str_model_routing);
-        }
-    }
-#endif
 
     std::string acquire_error;
     auto operation = _control->acquire(
@@ -865,11 +820,6 @@ std::string standalone_ai_client_t::do_generate(
 {
     if (const auto error = operation_stop_error(operation); !error.empty())
         return error;
-#if !defined(AIDA_C03_STANDALONE_AI_CANCEL_FIXTURE)
-    if (!standalone_license::inline_proof_check_c()) {
-        return "Error: API endpoint unreachable. Check your network connection.";
-    }
-#endif
 
     const auto provider = settings.get_active_profile_kind();
     diag::log_tagged_fmt("chat",
@@ -1356,17 +1306,6 @@ std::string standalone_ai_client_t::generate_anthropic(
     ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check,
     usage_record_t& usage)
 {
-
-    {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_ai_generate);
-        if (standalone_license::verify_gate_token(
-                standalone_license::gate_ai_generate, gt) < 0.5) {
-            return standalone_license::decode_status_string(
-                standalone_license::str_model_routing);
-        }
-    }
-
     std::string base_url = settings.resolve_active_base_url();
     std::string model = settings.get_active_model();
 
@@ -2081,22 +2020,6 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools(
         return result;
     }
 
-    {
-        const uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_ai_generate);
-        const double v = standalone_license::verify_gate_token(
-            standalone_license::gate_ai_generate, gt);
-        standalone_license::fold_integrity_token(gt);
-        if (v < 0.5) {
-            diag::log_tagged_fmt("chat",
-                "generate_with_tools_gate_blocked gt=0x%016llX v=%.3f",
-                static_cast<unsigned long long>(gt), v);
-            result.is_error = true;
-            result.text = "Error: License gate blocked native tool use.";
-            return result;
-        }
-    }
-
     std::string acquire_error;
     auto operation = _control->acquire(
         std::chrono::steady_clock::now() + std::chrono::seconds(k_ai_chat_stream_timeout_sec),
@@ -2168,23 +2091,6 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
 {
     using json = nlohmann::json;
     ai_generation_result_t result;
-
-
-    {
-        const uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_ai_generate);
-        const double v = standalone_license::verify_gate_token(
-            standalone_license::gate_ai_generate, gt);
-        standalone_license::fold_integrity_token(gt);
-        if (v < 0.5) {
-            diag::log_tagged_fmt("chat",
-                "anthropic_gate_blocked gt=0x%016llX v=%.3f",
-                static_cast<unsigned long long>(gt), v);
-            result.is_error = true;
-            result.text = "Error: License gate blocked native tool use.";
-            return result;
-        }
-    }
 
     std::string base_url = settings.resolve_active_base_url();
     std::string model    = settings.get_active_model();

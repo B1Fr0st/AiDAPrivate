@@ -17,9 +17,6 @@
 #include "../ai/standalone_chat.hpp"
 #include "standalone_driver.hpp"
 
-#ifndef AIDA_IMGUI_STUDIO_PREVIEW
-#include "../runtime/standalone_license.hpp"
-#endif
 #include "protocol_parser.hpp"
 #include "mitm_proxy.hpp"
 #include "flow_serializer.hpp"
@@ -61,7 +58,6 @@
 #include "../helpers/diag_log.hpp"
 #include "../helpers/win32_dialog.hpp"
 #include "../session/analysis_session.hpp"
-#include "../anti-tamper/webhook.hpp"
 #endif
 
 #include "burp/burp_module.hpp"
@@ -908,13 +904,11 @@ static bool post_network_task(const char* name,
         sub.domain = domain;
         sub.priority = 3;
         sub.body = [task_name, task = std::move(task), domain]() mutable {
-            const bool tls_ready = aida::manual_map_tls::ensure_current_thread();
             diag::log_tagged_fmt("network",
-                "executor_task_enter name=%s domain=%s tid=%lu tls_ready=%d",
+                "executor_task_enter name=%s domain=%s tid=%lu",
                 task_name.c_str(),
                 aida::infra::executor::domain_name(domain),
-                static_cast<unsigned long>(GetCurrentThreadId()),
-                tls_ready ? 1 : 0);
+                static_cast<unsigned long>(GetCurrentThreadId()));
             task();
             diag::log_tagged_fmt("network",
                 "executor_task_exit name=%s domain=%s tid=%lu",
@@ -1285,15 +1279,13 @@ static capture_table_snapshot_t& snapshot_capture_table(state_t& state, const ch
 
 static bool driver_feature_ready(const char* feature, int iter = -1) {
     bool drv_ok = driver_bridge::using_kernel_driver();
-    bool auth_ok = drv_ok && standalone_license::is_valid();
-    if (!auth_ok && (iter < 0 || iter <= 3 || (iter % 60) == 0)) {
-        diag::log_tagged_fmt("network", "%s_driver_gate drv_ok=%d auth_ok=%d iter=%d",
+    if (!drv_ok && (iter < 0 || iter <= 3 || (iter % 60) == 0)) {
+        diag::log_tagged_fmt("network", "%s_driver_gate drv_ok=%d iter=%d",
             feature ? feature : "network",
             drv_ok ? 1 : 0,
-            auth_ok ? 1 : 0,
             iter);
     }
-    if (!auth_ok)
+    if (!drv_ok)
         return false;
 
     static std::atomic<uint64_t> s_bridge_cooldown_until_ms{0};
@@ -1825,7 +1817,7 @@ void initialize() {
     g_state.active = true;
     publish_initial_snapshots(g_state);
     diag::log_tagged("network", "initialize_begin");
-    anti_tamper::webhook::write_log("net_audit", "[net_audit] network_view initialize begin");
+    diag::log_tagged("net_audit", "[net_audit] network_view initialize begin");
 
     bool executor_ready = initialize_executor_for_network();
 
@@ -1864,7 +1856,7 @@ void initialize() {
                 g_state.ws_frames.pop_front();
         }
     });
-    anti_tamper::webhook::write_log("net_audit", "[net_audit] websocket ws_frame_callback installed");
+    diag::log_tagged("net_audit", "[net_audit] websocket ws_frame_callback installed");
 
     if (executor_ready) {
         start_connection_worker(g_state);
@@ -1912,7 +1904,7 @@ void shutdown() {
     return;
 #else
     diag::log_tagged("network", "shutdown_begin");
-    anti_tamper::webhook::write_log("net_audit", "[net_audit] network_view shutdown begin");
+    diag::log_tagged("net_audit", "[net_audit] network_view shutdown begin");
     mitm_proxy::set_ws_frame_callback(nullptr);
     g_state.conn_polling.store(false);
     g_state.conn_cv.notify_all();
@@ -2826,10 +2818,9 @@ static void request_capture_start(state_t& state) {
     uint32_t filter_pid = state.cap_filter_pid;
     uint32_t filter_port = static_cast<uint32_t>(state.cap_filter_port);
     uint32_t filter_protocol = state.cap_filter_protocol;
-    const bool driver_ok = s_driver_available_snapshot.load(std::memory_order_acquire) &&
-        standalone_license::is_valid();
+    const bool driver_ok = s_driver_available_snapshot.load(std::memory_order_acquire);
     if (!driver_ok) {
-        set_capture_control_status("Capture unavailable until AiDA is authorized");
+        set_capture_control_status("Capture unavailable until the kernel driver is ready");
         state.cap_start_pending.store(false, std::memory_order_release);
         return;
     }
@@ -2867,14 +2858,14 @@ static void request_capture_start(state_t& state) {
                 diag::log_tagged_fmt("network", "start_capture_ok async elapsed_ms=%llu poll_thread_signaled=%d",
                     static_cast<unsigned long long>(elapsed),
                     g_state.cap_thread_alive.load(std::memory_order_acquire) ? 1 : 0);
-                anti_tamper::webhook::write_log("net_audit",
+                diag::log_tagged("net_audit",
                     "[net_audit] capture started ok");
             } else {
                 set_capture_control_status("Capture start failed");
                 diag::log_tagged_fmt("network", "start_capture_failed async elapsed_ms=%llu kernel_mode=%d",
                     static_cast<unsigned long long>(elapsed),
                     driver_bridge::using_kernel_driver() ? 1 : 0);
-                anti_tamper::webhook::write_log("net_audit",
+                diag::log_tagged("net_audit",
                     "[net_audit] capture start FAILED driver call returned false");
             }
             g_state.cap_start_pending.store(false, std::memory_order_release);
@@ -2909,7 +2900,7 @@ static void request_capture_stop(state_t& state) {
             diag::log_tagged_fmt("network", "stop_capture_complete ok=%d elapsed_ms=%llu",
                 ok ? 1 : 0,
                 static_cast<unsigned long long>(elapsed));
-            anti_tamper::webhook::write_log("net_audit",
+            diag::log_tagged("net_audit",
                 ok ? "[net_audit] capture stopped by user" : "[net_audit] capture stop FAILED driver call returned false");
             g_state.cap_stop_pending.store(false, std::memory_order_release);
         })) {
@@ -2930,8 +2921,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
     ImGui::SetScrollY(0.f);
 
     request_driver_available_snapshot();
-    const bool driver_ok = s_driver_available_snapshot.load(std::memory_order_acquire) &&
-        standalone_license::is_valid();
+    const bool driver_ok = s_driver_available_snapshot.load(std::memory_order_acquire);
     bool cap_running = state.cap_running.load(std::memory_order_acquire);
     bool cap_start_pending = state.cap_start_pending.load(std::memory_order_acquire);
     bool cap_stop_pending = state.cap_stop_pending.load(std::memory_order_acquire);
@@ -3138,8 +3128,6 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             action.tooltip = "Capture state is already changing.";
         else if (!s_driver_available_snapshot.load(std::memory_order_acquire))
             action.tooltip = "The driver is unavailable.";
-        else if (!standalone_license::is_valid())
-            action.tooltip = "A valid license is required for driver-backed capture.";
         cfg.actions.push_back(std::move(action));
         const auto result = aida::ui::empty_state::render(
             ImVec2(list_org.x, list_org.y), ImVec2(list_sz.x, list_h), cfg);
@@ -5596,7 +5584,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                     diag::log_tagged_fmt("network", "repeater_send_clicked host=%s:%u tls=%d req_size=%zu",
                         entry->host.c_str(), entry->port, entry->use_tls ? 1 : 0,
                         entry->raw_request.size());
-                    anti_tamper::webhook::write_log("net_audit",
+                    diag::log_tagged("net_audit",
                         (std::string("[net_audit] repeater send host=") + entry->host + ":" +
                          std::to_string(entry->port) + " tls=" + (entry->use_tls ? "1" : "0")).c_str());
                     const bool posted = post_network_task("repeater_send", aida::infra::executor::domain_t::external_tool, "bounded_task", [entry]() {
@@ -5623,7 +5611,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                             diag::log_tagged_fmt("network", "repeater_send_failed host=%s:%u err='%s' wall_ms=%llu",
                                 entry->host.c_str(), entry->port, result.error.c_str(),
                                 static_cast<unsigned long long>(elapsed));
-                            anti_tamper::webhook::write_log("net_audit",
+                            diag::log_tagged("net_audit",
                                 (std::string("[net_audit] repeater send FAILED err='") + result.error + "'").c_str());
                         }
                         entry->in_progress.store(false);
@@ -7072,8 +7060,8 @@ operational_command_capability_t operational_command_capability(
         request_driver_available_snapshot();
         if (capture_pending) capability.disabled_reason = "A capture state change is already in progress";
         else if (capture_running) capability.disabled_reason = "Packet capture is already running";
-        else if (!s_driver_available_snapshot.load(std::memory_order_acquire) || !standalone_license::is_valid())
-            capability.disabled_reason = "Authorized driver-backed packet capture is unavailable";
+        else if (!s_driver_available_snapshot.load(std::memory_order_acquire))
+            capability.disabled_reason = "Driver-backed packet capture is unavailable";
         else capability.enabled = true;
         capability.target_summary = "PID " + std::to_string(g_state.cap_filter_pid) +
             ", port " + std::to_string(g_state.cap_filter_port) +
@@ -7123,8 +7111,8 @@ operational_command_capability_t operational_command_capability(
         request_driver_available_snapshot();
         const std::string validation = filter_draft_error(g_state);
         if (filter_pending) capability.disabled_reason = "A network filter mutation is already in progress";
-        else if (!s_driver_available_snapshot.load(std::memory_order_acquire) || !standalone_license::is_valid())
-            capability.disabled_reason = "Authorized driver-backed filter control is unavailable";
+        else if (!s_driver_available_snapshot.load(std::memory_order_acquire))
+            capability.disabled_reason = "Driver-backed filter control is unavailable";
         else if (!validation.empty()) capability.disabled_reason = validation;
         else capability.enabled = true;
         capability.target_summary = std::string(g_state.nf_action == 0 ? "BLOCK" : "ALLOW") + " " +
@@ -7138,8 +7126,8 @@ operational_command_capability_t operational_command_capability(
     case operational_command_t::filter_remove_selected:
         request_driver_available_snapshot();
         if (filter_pending) capability.disabled_reason = "A network filter mutation is already in progress";
-        else if (!s_driver_available_snapshot.load(std::memory_order_acquire) || !standalone_license::is_valid())
-            capability.disabled_reason = "Authorized driver-backed filter control is unavailable";
+        else if (!s_driver_available_snapshot.load(std::memory_order_acquire))
+            capability.disabled_reason = "Driver-backed filter control is unavailable";
         else if (g_state.filter_selected < 0 ||
                  g_state.filter_selected >= static_cast<int>(g_state.filters.size()))
             capability.disabled_reason = "Select a retained network filter rule first";
@@ -7151,8 +7139,8 @@ operational_command_capability_t operational_command_capability(
     case operational_command_t::filter_clear:
         request_driver_available_snapshot();
         if (filter_pending) capability.disabled_reason = "A network filter mutation is already in progress";
-        else if (!s_driver_available_snapshot.load(std::memory_order_acquire) || !standalone_license::is_valid())
-            capability.disabled_reason = "Authorized driver-backed filter control is unavailable";
+        else if (!s_driver_available_snapshot.load(std::memory_order_acquire))
+            capability.disabled_reason = "Driver-backed filter control is unavailable";
         else if (g_state.filters.empty()) capability.disabled_reason = "There are no retained network filter rules to clear";
         else capability.enabled = true;
         capability.target_summary = std::to_string(g_state.filters.size()) + " retained live kernel traffic rules";
@@ -7439,7 +7427,7 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
                 "network_view::keylog_exe")) {
             snprintf(state.kl_exe_path, sizeof(state.kl_exe_path), "%s", path_buf);
             diag::log_tagged_fmt("network", "keylog_exe_picked path='%s'", path_buf);
-            anti_tamper::webhook::write_log("net_audit",
+            diag::log_tagged("net_audit",
                 (std::string("[net_audit] keylog exe picked path='") + path_buf + "'").c_str());
         }
     }
@@ -7475,7 +7463,7 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
                     "network_view::keylog_watch")) {
                 snprintf(state.kl_watch_path, sizeof(state.kl_watch_path), "%s", path_buf);
                 diag::log_tagged_fmt("network", "keylog_watch_dialog_pick path='%s'", path_buf);
-                anti_tamper::webhook::write_log("net_audit",
+                diag::log_tagged("net_audit",
                     (std::string("[net_audit] keylog watch dialog path='") + path_buf + "'").c_str());
                 invoke_global_network_action("network.keylog.watch");
             } else {
@@ -7490,7 +7478,7 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
         if (aida::ui::button("Watch", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm,
                               ImVec2(0.f, 0.f), keylog_pending || !can_use_typed) && can_use_typed) {
             diag::log_tagged_fmt("network", "keylog_watch_typed path='%s'", state.kl_watch_path);
-            anti_tamper::webhook::write_log("net_audit",
+            diag::log_tagged("net_audit",
                 (std::string("[net_audit] keylog watch typed path='") + state.kl_watch_path + "'").c_str());
             invoke_global_network_action("network.keylog.watch");
         }
@@ -7890,7 +7878,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
 #endif
             snprintf(state.pcap_path, sizeof(state.pcap_path), "%s", path_buf);
             diag::log_tagged_fmt("network", "pcap_path_picked path='%s'", path_buf);
-            anti_tamper::webhook::write_log("net_audit",
+            diag::log_tagged("net_audit",
                 (std::string("[net_audit] pcap path picked path='") + path_buf + "'").c_str());
         }
     }
@@ -7956,7 +7944,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
 
             diag::log_tagged_fmt("network", "pcap_export_clicked path='%s' filter_pid=%u filter_proto=%u source_packets=%zu",
                 path.c_str(), filter_pid, filter_proto, export_packets ? export_packets->size() : 0);
-            anti_tamper::webhook::write_log("net_audit",
+            diag::log_tagged("net_audit",
                 ("[net_audit] pcap export start path='" + path + "'").c_str());
 
             const bool posted = post_network_task("pcap_export", aida::infra::executor::domain_t::diagnostics, "bounded_task",
@@ -8068,7 +8056,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
                 har_buf, sizeof(har_buf),
                 "network_view::har_save")) {
             diag::log_tagged("network", "har_export_dialog_cancelled");
-            anti_tamper::webhook::write_log("net_audit",
+            diag::log_tagged("net_audit",
                 "[net_audit] HAR export dialog cancelled");
         } else {
         const std::string har_path(har_buf);
@@ -8086,7 +8074,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
             "network.har.export", "Export proxy history as HAR", "view.network.proxy", har_path);
         diag::log_tagged_fmt("network", "har_export_clicked path='%s' history_count=%zu",
             har_path.c_str(), proxy_count);
-        anti_tamper::webhook::write_log("net_audit",
+        diag::log_tagged("net_audit",
             (std::string("[net_audit] HAR export path='") + har_path + "' count=" +
              std::to_string(proxy_count)).c_str());
         const bool posted = post_network_task(
@@ -9239,7 +9227,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
                     "[net_audit] fuzzer start host=%s:%u tls=%d mode=%d threads=%d sets=%zu",
                     cfg.host.c_str(), static_cast<unsigned>(cfg.port), cfg.use_tls ? 1 : 0,
                     static_cast<int>(cfg.attack_mode), cfg.thread_count, cfg.payload_sets.size());
-                anti_tamper::webhook::write_log("net_audit", buf);
+                diag::log_tagged("net_audit", buf);
             }
             if (registered) {
                 state.fuzz_running.store(true, std::memory_order_release);

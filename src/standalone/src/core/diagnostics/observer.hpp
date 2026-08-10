@@ -16,7 +16,6 @@
 
 #include "../../helpers/diag_log.hpp"
 #include "../infra/win_thread.hpp"
-#include "../runtime/manual_map_tls.hpp"
 #include "metadata_ring.hpp"
 #include "wer_correlation.hpp"
 
@@ -218,8 +217,6 @@ inline void log_observer_stop() {
 }
 
 inline void observer_loop(DWORD pid, HWND hwnd) {
-    aida::manual_map_tls::ensure_current_thread();
-
     auto& s = state();
     s.observed_pid.store(pid, std::memory_order_release);
     s.observed_hwnd.store(hwnd, std::memory_order_release);

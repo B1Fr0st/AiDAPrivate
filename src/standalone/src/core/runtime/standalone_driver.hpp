@@ -306,12 +306,6 @@ namespace driver_bridge
 
     bool initialize();
     bool load_kernel_driver();
-    void invalidate_kernel_session(const char* reason);
-    void notify_send_request_success();
-
-    void notify_kernel_demote_detected(const char* reason);
-    using kernel_demote_kick_callback_t = void(*)(const char*);
-    void install_kernel_demote_kick_callback(kernel_demote_kick_callback_t cb);
     void shutdown(const char* reason = nullptr);
     bool is_loaded();
     bool using_kernel_driver();
@@ -359,10 +353,6 @@ namespace driver_bridge
     bool read_kernel_memory(uint64_t address, size_t size, std::vector<uint8_t>& out);
     bool write_kernel_memory(uint64_t address, const std::vector<uint8_t>& data);
 
-    bool kernel_read_user_memory(uint64_t addr, void* out, size_t len);
-
-    bool verify_cross_ring_evidence(const uint8_t* evidence_data, uint32_t evidence_size);
-
     uint64_t allocate_memory(size_t size);
     bool free_memory(uint64_t address);
     bool protect_memory(uint64_t address, uint64_t size, uint32_t new_protect, uint32_t* old_protect = nullptr);
@@ -403,13 +393,6 @@ namespace driver_bridge
     bool fingerprint_op(uint32_t operation);
     std::vector<fingerprint_info_t> get_fingerprints();
     bool export_pcap(uint32_t filter_pid = 0, uint32_t filter_protocol = 0, uint32_t max_packets = 64, pcap_export_result_t* out = nullptr);
-
-    struct dll_protect_status_t {
-        uint32_t status = 0;
-        uint64_t current_hash = 0;
-        uint64_t expected_hash = 0;
-        uint64_t last_check_tsc = 0;
-    };
 
     uint64_t call_function(uint64_t function_address, uint64_t arg1 = 0, uint64_t arg2 = 0, uint64_t arg3 = 0, uint64_t arg4 = 0);
     uint64_t find_gadget(const char* pattern, size_t pattern_size);
@@ -513,159 +496,7 @@ namespace driver_bridge
     bool clear_hardware_breakpoint(uint32_t tid, int index);
 
     bool spoof_debug_flags(uint32_t* result_flags = nullptr);
-    bool refresh_heartbeat();
-    bool sentinel_bridge_ready();
-    uint64_t sentinel_ready_since_tsc();
     uint64_t driver_watchdog_age_ms();
-
-    struct dynamic_ioctl_state_t {
-        bool loaded = false;
-        bool kernel = false;
-        bool connected = false;
-        bool ready = false;
-        uint32_t instance_server_seed = 0;
-        uint32_t instance_ioctl_seed = 0;
-        uint32_t global_server_seed = 0;
-        uint32_t global_ioctl_seed = 0;
-        uint32_t ioctl_seed_hash = 0;
-        uint32_t heartbeat_ioctl_seed_hash = 0;
-    };
-
-    dynamic_ioctl_state_t dynamic_ioctl_state();
-    bool dynamic_ioctls_ready();
-    bool require_dynamic_session_ready(uint32_t timeout_ms);
-
-    bool register_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size, uint64_t expected_hash, uint32_t check_interval_ms = 2000);
-    bool register_self_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size, uint64_t expected_hash, uint32_t check_interval_ms = 2000);
-    bool query_dll_protection(dll_protect_status_t& out);
-    bool unregister_dll_protection();
-    bool unregister_self_dll_protection(uint64_t module_base = 0);
-
-
-    bool trigger_kernel_bsod(uint32_t reason_code, uint64_t evidence_hash);
-    bool latch_targeting_from_usermode(uint32_t reason);
-
-    struct re_evidence_blob_t {
-        uint64_t magic;
-        uint32_t version;
-        uint32_t signal_family;
-        uint32_t signal_id;
-        uint32_t score;
-        uint32_t pid;
-        uint32_t reserved0;
-        uint64_t caller_image_hash;
-        uint64_t signals_bitmap_hash;
-        uint64_t timestamp;
-    };
-
-    bool tier_a_driver_present_query(bool* out_present = nullptr,
-                                     uint32_t* out_mask = nullptr,
-                                     uint64_t* out_first_base = nullptr);
-    bool tier_a_driver_present();
-    bool canary_register(void* va, size_t size);
-    bool re_confirmed_usermode_bsod(const re_evidence_blob_t& evidence);
-
-    struct iommu_status_t {
-        uint8_t  dmar_present = 0;
-        uint8_t  ivrs_present = 0;
-        uint8_t  vtd_enabled = 0;
-        uint8_t  amd_vi_enabled = 0;
-        uint8_t  iommu_present = 0;
-        uint8_t  remapping_bypassed = 0;
-        uint8_t  pad[2] = {};
-        uint64_t dmar_table_pa = 0;
-        uint64_t ivrs_table_pa = 0;
-        uint32_t remapping_units = 0;
-        uint32_t risk_level = 0;
-        uint64_t detection_timestamp = 0;
-    };
-
-    struct pcie_device_entry_t {
-        uint16_t vendor_id = 0;
-        uint16_t device_id = 0;
-        uint32_t class_code = 0;
-        uint8_t  bus = 0;
-        uint8_t  device = 0;
-        uint8_t  function = 0;
-        uint8_t  header_type = 0;
-        uint64_t bar_pa[6] = {};
-        uint64_t bar_size = 0;
-        uint32_t flags = 0;
-        uint32_t whitelist_status = 0;
-    };
-
-    static constexpr size_t MAX_PCIE_DEVICES = 256;
-
-    struct pcie_enum_result_t {
-        uint32_t device_count = 0;
-        uint32_t unknown_count = 0;
-        pcie_device_entry_t entries[MAX_PCIE_DEVICES];
-    };
-
-    struct ept_check_result_t {
-        uint8_t  ept_present = 0;
-        uint8_t  npte_present = 0;
-        uint8_t  ept_hook_detected = 0;
-        uint8_t  vmm_present = 0;
-        uint8_t  pad[4] = {};
-        uint64_t ept_pointer_msr = 0;
-        uint32_t npte_anomaly_count = 0;
-        uint32_t risk_level = 0;
-        uint64_t detection_timestamp = 0;
-    };
-
-    struct dma_protection_state_t {
-        iommu_status_t iommu;
-        uint32_t canary_count = 0;
-        uint32_t canary_hits = 0;
-        uint32_t pcie_unknown_count = 0;
-        uint32_t ept_anomaly_count = 0;
-        uint32_t tier1_refused = 0;
-        uint32_t tier2_bsod_armed = 0;
-        uint64_t timestamp = 0;
-    };
-
-    bool query_dma_protection_state(dma_protection_state_t& out);
-    bool query_iommu_status(iommu_status_t& out);
-    bool enumerate_pcie_devices(pcie_enum_result_t& out);
-    bool add_pcie_whitelist(uint16_t vendor_id, uint16_t device_id);
-    bool register_canary_poison(uint64_t va, uint64_t poison_signature);
-    bool protect_page_pte(uint64_t va);
-    bool unprotect_page_pte(uint64_t va);
-    bool check_ept_state(ept_check_result_t& out);
-    bool trigger_dma_countermeasure(uint32_t action, uint32_t reason);
-
-    bool update_re_tool_hashes(const uint8_t* hashes, uint32_t count);
-    bool update_werfault_hashes(const uint8_t* hashes, uint32_t count);
-    bool update_ce_driver_hashes(const uint8_t* hashes, uint32_t count);
-
-    struct anti_debug_result_t {
-        uint32_t result_flags;
-        uint64_t detected_debugger_pid;
-        uint64_t dr_clear_count;
-    };
-    bool kernel_anti_debug_query(anti_debug_result_t& out);
-    bool kernel_anti_debug_clear_dr(uint64_t* out_clear_count = nullptr);
-    bool kernel_anti_debug_clear_process_dr(uint32_t pid, uint64_t* out_clear_count = nullptr);
-    bool kernel_anti_debug_scan_debuggers(uint64_t* out_debugger_pid = nullptr);
-    bool kernel_anti_debug_scan_text(uint64_t module_base, uint64_t exception_dir_va, uint32_t exception_dir_size, uint64_t* hit_rva);
-    bool kernel_anti_debug_hide_thread(uint32_t pid, uint32_t tid);
-    bool kernel_anti_debug_hide_all_threads(uint32_t pid);
-    bool kernel_anti_debug_install_instrumentation(uint32_t pid, void* callback);
-    bool kernel_anti_debug_remove_instrumentation(uint32_t pid);
-
-    bool kernel_anti_dump_full(uint32_t pid);
-    bool kernel_anti_dump_register_filter(uint32_t pid);
-    bool kernel_anti_dump_hide_threads(uint32_t pid);
-    bool kernel_anti_dump_erase_headers(uint32_t pid);
-    struct anti_dump_result_t {
-        uint64_t blocks_count;
-    };
-    bool kernel_anti_dump_query(anti_dump_result_t& out);
-    bool kernel_anti_dump_permit_pid(uint32_t pid);
-    bool kernel_anti_dump_unpermit_pid(uint32_t pid);
-    bool kernel_anti_dump_stop_continuous();
-    bool kernel_anti_dump_start_continuous(uint32_t pid);
 
     bool malware_safe_protect_pid(uint32_t pid, uint32_t flags = 0, uint64_t* out_denials = nullptr);
     bool malware_safe_unprotect_pid(uint32_t pid, uint64_t* out_denials = nullptr);
@@ -690,39 +521,6 @@ namespace driver_bridge
     bool malware_safe_pull_packets(uint32_t pid, uint32_t max_records,
                                    std::vector<packet_record_t>& out,
                                    uint64_t* out_dropped = nullptr);
-
-    bool relay_server_token(uint32_t token_hash, uint64_t server_nonce);
-    bool relay_server_token_v2(uint32_t token_hash, uint64_t server_nonce, uint64_t* out_driver_proof = nullptr);
-
-    bool initiate_driver_handshake(uint8_t out_driver_challenge[32] = nullptr);
-    bool complete_driver_challenge(const uint8_t driver_challenge[32]);
-
-    struct reloc_mask_entry_t {
-        uint32_t offset;
-        uint32_t size;
-        uint32_t reloc_type;
-        uint32_t _pad;
-        uint8_t  original_value[8];
-    };
-
-    struct cross_ring_evidence_t {
-        uint32_t detecting_checker_id;
-        uint32_t target_checker_id;
-        uint64_t region_base;
-        uint64_t region_size;
-        uint8_t  expected_hash[32];
-        uint8_t  actual_hash[32];
-        uint8_t  modified_bytes[256];
-        uint32_t modified_bytes_len;
-        uint32_t _pad;
-    };
-
-    bool register_usermode_hash(uint64_t text_base, uint32_t text_size,
-                                uint64_t reloc_delta,
-                                const uint8_t sha256[32],
-                                const reloc_mask_entry_t* mask_entries,
-                                uint32_t mask_count);
-    bool verify_cross_ring_evidence(const cross_ring_evidence_t& evidence);
 
     bool traffic_redirect_op(uint32_t operation, uint32_t rule_id = 0, uint32_t protocol = 0,
                              uint32_t match_port = 0, const uint8_t* match_addr = nullptr,
@@ -773,66 +571,6 @@ namespace driver_bridge
     };
     std::vector<sniff_result_t> sniff_net_buffers_get(bool& active);
 
-    struct hv_kernel_detect_result_t {
-        uint8_t sidt_lock_prefix;
-        uint8_t sidt_invalid_pf;
-        uint8_t sidt_tlb_only;
-        uint8_t sidt_timing;
-        uint8_t sidt_compat_mode;
-        uint8_t sidt_noncanonical_gp;
-        uint8_t sidt_noncanonical_ss;
-        uint8_t sidt_cpl3_umip_off;
-        uint8_t sidt_cpl3_umip_on;
-
-        uint8_t lidt_lock_prefix;
-        uint8_t lidt_invalid_pf;
-        uint8_t lidt_tlb_only;
-        uint8_t lidt_timing;
-        uint8_t lidt_noncanonical_gp;
-        uint8_t lidt_noncanonical_ss;
-        uint8_t lidt_cpl3_gp;
-
-        uint8_t ve_trigger;
-        uint8_t ve_lbr_stack;
-        uint8_t ve_xsetbv_gp;
-        uint8_t ve_cr4_vmxe;
-
-        uint8_t vmf_cpuid_vendor;
-        uint8_t vmf_hyperv_guest;
-        uint8_t vmf_smbios_vm;
-        uint8_t vmf_acpi_vm;
-        uint8_t vmf_pci_vm;
-        uint8_t vmf_disk_vm;
-        uint8_t vmf_mac_vm;
-        uint8_t vmf_registry_vm;
-
-        uint8_t total_run;
-        uint8_t total_failed;
-        uint8_t ms_hv_root;
-        uint8_t is_virtual_machine;
-
-        char    vm_vendor_name[16];
-        uint8_t measurements_hmac[16];
-
-        bool any_hv_detected() const {
-            return (sidt_lock_prefix | sidt_invalid_pf | sidt_tlb_only | sidt_timing |
-                    sidt_compat_mode | sidt_noncanonical_gp | sidt_noncanonical_ss |
-                    sidt_cpl3_umip_off | sidt_cpl3_umip_on |
-                    lidt_lock_prefix | lidt_invalid_pf | lidt_tlb_only | lidt_timing |
-                    lidt_noncanonical_gp | lidt_noncanonical_ss | lidt_cpl3_gp |
-                    ve_trigger | ve_lbr_stack | ve_xsetbv_gp | ve_cr4_vmxe) != 0;
-        }
-
-        bool any_vm_detected() const {
-            return is_virtual_machine != 0;
-        }
-
-        bool any_detected() const {
-            return any_hv_detected() || any_vm_detected();
-        }
-    };
-    bool run_kernel_hv_detection(hv_kernel_detect_result_t& result);
-
     enum class debug_event_type_e : uint32_t {
         invalid         = 0,
         image_loaded    = 1,
@@ -865,8 +603,4 @@ namespace driver_bridge
                             debug_event_stats_t* out_stats = nullptr);
 
     uint64_t watchdog_last_ok_tick();
-
-    bool kernel_read_prologue_hash(uint64_t va, uint32_t size, uint64_t& out_hash);
-    bool query_sentinel_dispatch_guard(uint8_t& hook_detected, uint64_t& hook_target);
-    bool query_sentinel_callback_scan(uint8_t& hostile_drivers, uint8_t& modified_callbacks);
 }

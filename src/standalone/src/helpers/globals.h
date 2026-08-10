@@ -4,9 +4,6 @@
 #include "../core/editor/programming_document_service.hpp"
 #include "../core/ui/task_center.hpp"
 #include "../core/ui/terminal_view.hpp"
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-#include "standalone_license.hpp"
-#endif
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../preview/shell_preview_platform.hpp"
 #else
@@ -492,40 +489,6 @@ void poll_ai_chat();
 inline ImFont* g_code_font = nullptr;
 
 
-namespace license
-{
-	inline bool  validated       = false;
-	inline bool  checking        = false;
-	inline std::atomic<bool> activation_worker_active{false};
-	inline bool  check_failed    = false;
-	inline char  key_buf[128]    = {};
-	inline std::string error_msg;
-	inline std::string saved_key;
-
-	inline bool preserve_valid_state(bool runtime_locked, bool full_test_running)
-	{
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		return validated && !runtime_locked && full_test_running;
-#else
-		return validated && !runtime_locked && full_test_running && standalone_license::is_arc_loaded();
-#endif
-	}
-
-	inline bool runtime_ready(bool runtime_locked, bool full_test_running)
-	{
-		if (runtime_locked)
-			return false;
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		return validated || preserve_valid_state(runtime_locked, full_test_running);
-#else
-		if (standalone_license::is_valid())
-			return true;
-		return preserve_valid_state(runtime_locked, full_test_running);
-#endif
-	}
-}
-
-
 struct FileBrowserEntry {
 	std::string name;
 	std::string full_path;
@@ -711,8 +674,6 @@ namespace globals
 		inline std::atomic<bool>* bg_init_done = nullptr;
 		inline std::atomic<int>  bg_init_step{0};
 		inline std::atomic<int>  bg_init_total{6};
-		inline std::atomic<int>  arc_unseal_phase{0};
-		inline std::atomic<int>  license_activation_phase{0};
 		inline float window_w = 250;
 		inline float window_h = 200;
 		inline float ui_alpha = 0.f;
@@ -1741,27 +1702,9 @@ namespace file_tabs {
 	inline std::function<std::optional<save_result_t>(int)> preview_save_interceptor;
 #endif
 
-	inline save_result_t verify_licensed_save_gate() {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		return {true, {}};
-#else
-		if (!standalone_license::is_valid())
-			return {false, "The licensed save gate is unavailable."};
-		const uint64_t token = standalone_license::inline_gate_check(
-			standalone_license::gate_editor_save);
-		return standalone_license::verify_gate_token(
-			standalone_license::gate_editor_save, token) >= 0.5
-			? save_result_t{true, {}}
-			: save_result_t{false, "The licensed save gate rejected the operation."};
-#endif
-	}
-
 	inline save_result_t verify_tab_save_gate(int idx, bool require_destination) {
 		if (!is_valid_tab_index(idx))
 			return {false, "The document is no longer open."};
-		const auto licensed = verify_licensed_save_gate();
-		if (!licensed.succeeded)
-			return licensed;
 		const auto& tab = tabs[tab_index(idx)];
 		if (tab.save_in_progress)
 			return {false, "A save is already in progress for this document."};

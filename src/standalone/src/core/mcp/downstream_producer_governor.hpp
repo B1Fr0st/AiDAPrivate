@@ -19,7 +19,6 @@
 #include "../../helpers/diag_log.hpp"
 #include "../infra/taskflow_runtime.hpp"
 #include "../infra/win_thread.hpp"
-#include "../runtime/manual_map_tls.hpp"
 
 namespace mcp_standalone {
 namespace downstream {
@@ -1291,7 +1290,6 @@ private:
             state->active_jobs[job->seq] = job;
             decrement_counter_if_nonzero(state->queued_tasks);
         }
-        aida::manual_map_tls::ensure_current_thread();
         state->active_workers.fetch_add(1, std::memory_order_acq_rel);
         struct finish_guard_t {
             std::shared_ptr<state_t> state;

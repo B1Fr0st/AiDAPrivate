@@ -14,7 +14,6 @@
 #include "../disasm/zydis_disasm.hpp"
 #include "../disasm/function_index.hpp"
 #include "../infra/executor.hpp"
-#include "../anti-tamper/webhook.hpp"
 #include "../../helpers/globals.h"
 #include "../../helpers/win32_dialog.hpp"
 #endif
@@ -915,7 +914,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		if (!s_types_font_logged_recon) {
 			s_types_font_logged_recon = true;
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			anti_tamper::webhook::write_log("types_font", "[types_font] scaled struct_recon_view");
+			diag::log_tagged("types_font", "[types_font] scaled struct_recon_view");
 #endif
 		}
 	}
@@ -1335,7 +1334,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		if (!s_no_driver_logged) {
 			s_no_driver_logged = true;
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			anti_tamper::webhook::write_log("types_audit",
+			diag::log_tagged("types_audit",
 				"[types_audit] inferred_view_no_driver BROKEN reason='driver_not_loaded'");
 #endif
 		}

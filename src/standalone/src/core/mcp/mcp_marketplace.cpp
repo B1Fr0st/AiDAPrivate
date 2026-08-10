@@ -13,7 +13,6 @@
 #include "mcp_marketplace.hpp"
 #include "../infra/executor.hpp"
 #include "mcp_client.hpp"
-#include "standalone_license.hpp"
 #include "standalone_settings.hpp"
 #include "../settings/settings_persistence_service.hpp"
 #include "../helpers/globals.h"
@@ -505,18 +504,6 @@ void search_async(const std::string& query, registry_t reg)
 {
     diag::log_tagged_fmt("mcp_market", "search_async query='%.80s' reg=%d",
         query.c_str(), (int)reg);
-    {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_marketplace_search);
-        if (gt == 0) {
-            diag::log_tagged_fmt("mcp_market", "search_async gate blocked");
-            std::lock_guard<std::mutex> lk(s_mtx);
-            s_search_state = search_state_t::error_state;
-            s_search_error = "License gate blocked marketplace search.";
-            return;
-        }
-    }
-
 
     {
         std::lock_guard<std::mutex> lk(s_mtx);
@@ -597,17 +584,6 @@ void install_async(const package_info_t& pkg)
 {
     diag::log_tagged_fmt("mcp_market", "install_async pkg='%s' version='%s'",
         pkg.name.c_str(), pkg.version.c_str());
-    {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_marketplace_install);
-        if (gt == 0) {
-            diag::log_tagged_fmt("mcp_market", "install_async gate blocked");
-            std::lock_guard<std::mutex> lk(s_mtx);
-            s_install_state = install_state_t::error_state;
-            s_install_error = "License gate blocked marketplace install.";
-            return;
-        }
-    }
 
     {
         std::lock_guard<std::mutex> lk(s_mtx);

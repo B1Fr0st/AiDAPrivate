@@ -56,7 +56,6 @@
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
 #include "../helpers/win32_dialog.hpp"
-#include "../anti-tamper/webhook.hpp"
 #endif
 
 namespace memory_map_view {
@@ -644,7 +643,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		static bool s_mem_map_logged = false;
 		if (!s_mem_map_logged) {
 			s_mem_map_logged = true;
-			anti_tamper::webhook::write_log("mem_map", "[mem_map] scaled");
+			diag::log_tagged("mem_map", "[mem_map] scaled");
 		}
 	}
 	(void)ar; (void)ag; (void)ab;

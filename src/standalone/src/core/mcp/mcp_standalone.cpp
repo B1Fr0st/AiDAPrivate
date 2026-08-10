@@ -16,17 +16,11 @@
 #include "mcp_capacity_governor_diag.hpp"
 #include "downstream_producer_governor.hpp"
 #include "standalone_driver.hpp"
-#include "standalone_license.hpp"
-#include "../anti-tamper/mcp_posture.hpp"
-#include "../anti-tamper/state.hpp"
-#include "../anti-tamper/self_guard.hpp"
-#include "arc/arc.h"
 #include "zydis_disasm.hpp"
 #include "sandbox.hpp"
 #include "../infra/taskflow_runtime.hpp"
 #include "../network/burp/audit_trail.hpp"
 #include "../network/burp/camoufox_bridge.hpp"
-#include "../runtime/manual_map_tls.hpp"
 #include "../session/analysis_session.hpp"
 #include "../analysis/workspace/workspace_registry.hpp"
 #include "../tools/command_sessions.hpp"
@@ -329,70 +323,6 @@ namespace
             if (validation_cancelled_or_expired(tool, failure))
                 return false;
             if (result.success) {
-                self_guard::self_guard_context_t sg_ctx;
-                sg_ctx.tool_name = tool.name;
-                if (arguments.is_object()) {
-                    if (arguments.contains("pid")) {
-                        const auto& pid_val = arguments["pid"];
-                        if (pid_val.is_number_unsigned()) {
-                            sg_ctx.has_pid = true;
-                            sg_ctx.target_pid = static_cast<uint32_t>(pid_val.get<uint64_t>());
-                        } else if (pid_val.is_number_integer()) {
-                            const int64_t signed_pid = pid_val.get<int64_t>();
-                            if (signed_pid >= 0) {
-                                sg_ctx.has_pid = true;
-                                sg_ctx.target_pid = static_cast<uint32_t>(signed_pid);
-                            }
-                        } else if (pid_val.is_string()) {
-                            try {
-                                const auto parsed = std::stoull(pid_val.get<std::string>());
-                                if (parsed != 0 && parsed <= 0xFFFFFFFFull) {
-                                    sg_ctx.has_pid = true;
-                                    sg_ctx.target_pid = static_cast<uint32_t>(parsed);
-                                }
-                            } catch (...) {}
-                        }
-                    }
-                    if (arguments.contains("address")) {
-                        const auto& addr_val = arguments["address"];
-                        if (addr_val.is_string()) {
-                            try {
-                                const std::string addr_str = addr_val.get<std::string>();
-                                sg_ctx.target_address = std::stoull(addr_str, nullptr, 0);
-                                sg_ctx.has_address = true;
-                            } catch (...) {}
-                        } else if (addr_val.is_number_unsigned()) {
-                            sg_ctx.target_address = addr_val.get<uint64_t>();
-                            sg_ctx.has_address = true;
-                        } else if (addr_val.is_number_integer()) {
-                            sg_ctx.target_address = static_cast<uint64_t>(addr_val.get<int64_t>());
-                            sg_ctx.has_address = true;
-                        }
-                    }
-                    if (arguments.contains("path")) {
-                        const auto& path_val = arguments["path"];
-                        if (path_val.is_string()) {
-                            sg_ctx.has_binary_path = true;
-                            sg_ctx.target_binary_path = path_val.get<std::string>();
-                        }
-                    }
-                    if (arguments.contains("binary_path")) {
-                        const auto& bp_val = arguments["binary_path"];
-                        if (bp_val.is_string()) {
-                            sg_ctx.has_binary_path = true;
-                            sg_ctx.target_binary_path = bp_val.get<std::string>();
-                        }
-                    }
-                    if (arguments.contains("binary_id")) {
-                        const auto& bid_val = arguments["binary_id"];
-                        if (bid_val.is_string())
-                            sg_ctx.target_binary_id = bid_val.get<std::string>();
-                    }
-                }
-                auto guard_result = self_guard::invoke_self_guard(sg_ctx);
-                if (guard_result != self_guard::self_guard_result_t::allow) {
-                    self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
-                }
                 return true;
             }
             if (failure)
@@ -1658,7 +1588,6 @@ namespace
         std::uint64_t finished = 0;
         std::uint64_t rejected = 0;
         std::uint64_t worker_failures = 0;
-        std::uint64_t tls_failures = 0;
         std::uint64_t oldest_active_ms = 0;
         std::uint64_t active_long_running = 0;
         std::uint64_t queued_long_running = 0;
@@ -2208,7 +2137,6 @@ namespace
                     out["finished"] = state->finished.load(std::memory_order_acquire);
                     out["rejected"] = state->rejected.load(std::memory_order_acquire);
                     out["worker_failures"] = state->worker_failures.load(std::memory_order_acquire);
-                    out["tls_failures"] = state->tls_failures.load(std::memory_order_acquire);
                     if (capacity)
                         ++capacity->executor_snapshot_busy;
                     return false;
@@ -2396,7 +2324,6 @@ namespace
             out["finished"] = state->finished.load(std::memory_order_acquire);
             out["rejected"] = state->rejected.load(std::memory_order_acquire);
             out["worker_failures"] = state->worker_failures.load(std::memory_order_acquire);
-            out["tls_failures"] = state->tls_failures.load(std::memory_order_acquire);
             out["active_tasks"] = std::move(active);
             out["queued_tasks_sampled"] = std::move(queued_items);
             return true;
@@ -2436,7 +2363,6 @@ namespace
             out.finished += state->finished.load(std::memory_order_acquire);
             out.rejected += state->rejected.load(std::memory_order_acquire);
             out.worker_failures += state->worker_failures.load(std::memory_order_acquire);
-            out.tls_failures += state->tls_failures.load(std::memory_order_acquire);
             out.queued_long_running += state->queued_long_running.load(std::memory_order_acquire);
             out.active_long_running += state->active_long_running.load(std::memory_order_acquire);
             if (out.queue_summary.size() < 900) {
@@ -2631,7 +2557,6 @@ namespace
             std::atomic<std::uint64_t> started{0};
             std::atomic<std::uint64_t> finished{0};
             std::atomic<std::uint64_t> worker_failures{0};
-            std::atomic<std::uint64_t> tls_failures{0};
             std::atomic<std::uint64_t> queued_long_running{0};
             std::atomic<std::uint64_t> active_long_running{0};
             std::atomic<std::size_t> worker_count_snapshot{0};
@@ -2840,7 +2765,7 @@ namespace
                 outstanding = state.outstanding_tasks.size();
             }
             diag::log_tagged_fmt("mcp_srv",
-                "mcp_executor_shutdown_done name=%s elapsed_ms=%llu queued=%zu active_entries=%zu outstanding=%zu enqueued=%llu started=%llu finished=%llu rejected=%llu tls_failures=%llu",
+                "mcp_executor_shutdown_done name=%s elapsed_ms=%llu queued=%zu active_entries=%zu outstanding=%zu enqueued=%llu started=%llu finished=%llu rejected=%llu",
                 state.name.c_str(),
                 static_cast<unsigned long long>(mcp_now_ms() - begin),
                 queued,
@@ -2849,8 +2774,7 @@ namespace
                 static_cast<unsigned long long>(state.enqueued.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(state.started.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(state.finished.load(std::memory_order_acquire)),
-                static_cast<unsigned long long>(state.rejected.load(std::memory_order_acquire)),
-                static_cast<unsigned long long>(state.tls_failures.load(std::memory_order_acquire)));
+                static_cast<unsigned long long>(state.rejected.load(std::memory_order_acquire)));
         }
 
         static bool begin_task_execution(const std::shared_ptr<state_t>& state,
@@ -2961,17 +2885,6 @@ namespace
                     method.c_str(),
                     tool.c_str(),
                     lane.c_str());
-            }
-
-            const bool task_tls_ready = aida::manual_map_tls::ensure_current_thread();
-            if (!task_tls_ready) {
-                state->tls_failures.fetch_add(1u, std::memory_order_acq_rel);
-                diag::log_tagged_fmt("mcp_srv",
-                    "mcp_executor_tls_unavailable name=%s phase=task_start runtime_slot=%zu seq=%llu tid=%lu",
-                    state->name.c_str(),
-                    worker_index,
-                    static_cast<unsigned long long>(task->seq),
-                    static_cast<unsigned long>(GetCurrentThreadId()));
             }
 
             tls_executor_task_meta = task->meta.get();
@@ -3730,7 +3643,7 @@ namespace
         }
         const auto command_stats = command_sessions::stats();
         _snprintf_s(out, cap, _TRUNCATE,
-            "mcp{active_requests=%d active_streams=%d cached_tools=%zu health_ready=%d executors=%zu registry_lock_busy=%d snapshotted=%zu snapshot_busy=%zu workers=%zu active=%llu queued=%zu long_active=%llu long_queued=%llu oldest_active_ms=%llu enqueued=%llu started=%llu finished=%llu rejected=%llu worker_failures=%llu tls_failures=%llu command_total=%zu command_running=%zu command_reader_active=%zu command_timed_out=%zu command_oldest_ms=%llu owner=%.760s queue_summary=%.700s active_summary=%.900s}",
+            "mcp{active_requests=%d active_streams=%d cached_tools=%zu health_ready=%d executors=%zu registry_lock_busy=%d snapshotted=%zu snapshot_busy=%zu workers=%zu active=%llu queued=%zu long_active=%llu long_queued=%llu oldest_active_ms=%llu enqueued=%llu started=%llu finished=%llu rejected=%llu worker_failures=%llu command_total=%zu command_running=%zu command_reader_active=%zu command_timed_out=%zu command_oldest_ms=%llu owner=%.760s queue_summary=%.700s active_summary=%.900s}",
             g_active_http_requests.load(std::memory_order_acquire),
             g_active_streams.load(std::memory_order_acquire),
             g_cached_external_tool_count.load(std::memory_order_acquire),
@@ -3750,7 +3663,6 @@ namespace
             static_cast<unsigned long long>(counts.finished),
             static_cast<unsigned long long>(counts.rejected),
             static_cast<unsigned long long>(counts.worker_failures),
-            static_cast<unsigned long long>(counts.tls_failures),
             command_stats.total,
             command_stats.running,
             command_stats.reader_active,
@@ -3773,80 +3685,6 @@ static std::string json_dump_safe(const json& j, int indent)
     catch (...) { return "{}"; }
 }
 
-struct mcp_auth_snapshot_t
-{
-    bool ide_ready = false;
-    bool posture_trusted = false;
-    bool license_valid = false;
-    bool arc_loaded = false;
-    bool arc_loading = false;
-    bool arc_transfer = false;
-    bool exports_ok = false;
-    bool driver_loaded = false;
-    bool driver_kernel = false;
-    bool driver_available = false;
-    std::string missing_exports;
-    std::string driver_reason;
-};
-
-static mcp_auth_snapshot_t capture_mcp_auth_snapshot(bool include_driver)
-{
-    mcp_auth_snapshot_t snap{};
-    snap.ide_ready = g_ide_lifecycle_ready.load(std::memory_order_acquire);
-    snap.posture_trusted = anti_tamper::mcp_posture::is_current_posture_trusted();
-    snap.license_valid = standalone_license::is_valid();
-    snap.arc_loaded = standalone_license::is_arc_loaded();
-    snap.arc_loading = standalone_license::is_arc_download_in_progress();
-    snap.arc_transfer = standalone_license::is_arc_transfer_in_progress();
-    if (snap.arc_loaded)
-        snap.exports_ok = standalone_license::validate_arc_required_exports(snap.missing_exports);
-    else
-        snap.missing_exports = "arc_not_loaded";
-    if (include_driver) {
-        snap.driver_loaded = driver_bridge::is_loaded();
-        snap.driver_kernel = driver_bridge::using_kernel_driver();
-        snap.driver_available = driver_bridge::kernel_session_available(&snap.driver_reason);
-    }
-    return snap;
-}
-
-[[noreturn]] static void mcp_auth_fastfail(const char* where)
-{
-    const mcp_auth_snapshot_t snap = capture_mcp_auth_snapshot(true);
-    diag::log_tagged_fmt("mcp_srv",
-        "auth_fastfail where=%s ide=%d posture=%d valid=%d arc=%d loading=%d transfer=%d exports=%d missing='%.160s' driver_loaded=%d driver_kernel=%d driver_available=%d driver_reason='%.160s'",
-        where ? where : "<null>",
-        snap.ide_ready ? 1 : 0,
-        snap.posture_trusted ? 1 : 0,
-        snap.license_valid ? 1 : 0,
-        snap.arc_loaded ? 1 : 0,
-        snap.arc_loading ? 1 : 0,
-        snap.arc_transfer ? 1 : 0,
-        snap.exports_ok ? 1 : 0,
-        snap.missing_exports.c_str(),
-        snap.driver_loaded ? 1 : 0,
-        snap.driver_kernel ? 1 : 0,
-        snap.driver_available ? 1 : 0,
-        snap.driver_reason.c_str());
-    __fastfail(0xA1DA4D43u);
-}
-
-static bool mcp_runtime_authorized()
-{
-    const mcp_auth_snapshot_t snap = capture_mcp_auth_snapshot(false);
-    return snap.ide_ready &&
-           snap.posture_trusted &&
-           snap.license_valid &&
-           snap.arc_loaded &&
-           snap.exports_ok;
-}
-
-static void require_mcp_runtime_authorized(const char* where)
-{
-    if (!mcp_runtime_authorized())
-        mcp_auth_fastfail(where);
-}
-
 void set_ide_lifecycle_ready(bool ready) noexcept
 {
     g_ide_lifecycle_ready.store(ready, std::memory_order_release);
@@ -3860,24 +3698,6 @@ void set_pre_dispatch_validation_hook(tool_validation_hook_t hook)
 
 bool lifecycle_authorized(std::string* reason)
 {
-    const mcp_auth_snapshot_t snap = capture_mcp_auth_snapshot(false);
-    if (!snap.ide_ready) {
-        if (reason) *reason = "ide_not_ready";
-        return false;
-    }
-    if (!snap.license_valid) {
-        if (reason) *reason = "license_invalid";
-        return false;
-    }
-    if (!snap.arc_loaded) {
-        if (reason)
-            *reason = snap.arc_loading ? "arc_loading" : "arc_not_loaded";
-        return false;
-    }
-    if (!snap.exports_ok) {
-        if (reason) *reason = snap.missing_exports.empty() ? "arc_exports_missing" : ("arc_exports_missing:" + snap.missing_exports);
-        return false;
-    }
     if (reason) *reason = "authorized";
     return true;
 }
@@ -12410,7 +12230,6 @@ static tool_result_t invoke_tool_handler_guarded(
     const std::function<tool_result_t(const json&)>& handler,
     tool_invocation_metrics_t* metrics,
     const char* lane,
-    bool trusted_thread_suspension_window,
     active_session_owner_guard_t* owner_guard = nullptr)
 {
     const std::uint64_t start = mcp_now_ms();
@@ -12418,26 +12237,7 @@ static tool_result_t invoke_tool_handler_guarded(
     bool completed = false;
     if (owner_guard)
         owner_guard->set_phase("handler_enter");
-    const std::uint64_t now = mcp_now_ms();
-    const std::uint64_t deadline = current_call_deadline_ms();
-    std::uint64_t trusted_window_ms = 0;
-    if (trusted_thread_suspension_window) {
-        trusted_window_ms = kMcpDefaultToolTimeoutMs;
-        if (deadline != 0 && deadline > now)
-            trusted_window_ms = deadline - now;
-        trusted_window_ms = std::min<std::uint64_t>(trusted_window_ms + 5000, kMcpMaxToolTimeoutMs + 10000);
-        if (trusted_window_ms < 5000)
-            trusted_window_ms = 5000;
-        diag::log_tagged_fmt("mcp_srv",
-            "tool_thread_suspension_guard_begin tool='%s' lane=%s diag_id=%s duration_ms=%llu deadline_ms=%llu",
-            tool_name.c_str(),
-            lane ? lane : "",
-            current_call_diag_id(),
-            static_cast<unsigned long long>(trusted_window_ms),
-            static_cast<unsigned long long>(deadline));
-    }
     std::function<void()> guarded = [&]() {
-        anti_tamper::state::trusted_thread_suspension_scope_t trusted_scope(trusted_window_ms);
         result = invoke_tool_handler_unlocked(tool_name, arguments, handler, metrics);
         completed = true;
     };
@@ -12597,12 +12397,11 @@ static tool_result_t invoke_tool_with_registry_scope(const tool_def_t& tool,
                                                      const json& arguments,
                                                      const std::function<tool_result_t(const json&)>& handler,
                                                      tool_invocation_metrics_t* metrics,
-                                                     const std::string& lane,
-                                                     bool trusted_thread_suspension_tool)
+                                                     const std::string& lane)
 {
     mcp_operation_registry_scope_t registry_scope(tool, arguments, lane, tool.read_only);
     registry_scope.set_phase("handler_enter");
-    tool_result_t tr = invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, lane.c_str(), trusted_thread_suspension_tool);
+    tool_result_t tr = invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, lane.c_str());
     registry_scope.set_phase("handler_exit");
     if (!registry_scope.commit_eligible("handler_exit")) {
         registry_scope.release("late_result_discarded");
@@ -12615,8 +12414,7 @@ static tool_result_t invoke_tool_with_registry_scope(const tool_def_t& tool,
 static tool_result_t invoke_workspace_tool(
     const tool_def_t& tool,
     const json& arguments,
-    tool_invocation_metrics_t* metrics,
-    bool trusted_thread_suspension_tool)
+    tool_invocation_metrics_t* metrics)
 {
     workspace_resolution_t resolution = resolve_workspace_direct(arguments);
     if (!resolution.workspace) {
@@ -12709,7 +12507,7 @@ static tool_result_t invoke_workspace_tool(
         tool.name.c_str(), lane.c_str(), tool.read_only ? 1 : 0,
         resolution.workspace->identity().binary_id().to_hex().c_str());
     return invoke_tool_with_registry_scope(
-        tool, arguments, invoke, metrics, lane, trusted_thread_suspension_tool);
+        tool, arguments, invoke, metrics, lane);
 }
 
 static tool_result_t target_scope_error_result(
@@ -12745,11 +12543,9 @@ static tool_result_t invoke_tool_with_concurrency_policy(
     const json& target_arguments = target_resolution_args_for_tool(tool, arguments, target_arguments_storage, true);
     const bool explicit_target = tool_args_select_session_target(target_arguments);
     const std::string domain = infer_tool_domain(tool.name);
-    const bool driver_bridge_tool = is_driver_bridge_dependent_tool(tool);
-    const bool trusted_thread_suspension_tool = driver_bridge_tool || (!session_manager && !session_independent);
 
     if (tool.workspace_handler)
-        return invoke_workspace_tool(tool, arguments, metrics, trusted_thread_suspension_tool);
+        return invoke_workspace_tool(tool, arguments, metrics);
 
     if (session_independent && tool.read_only && !session_manager) {
         set_tool_metrics_lane(metrics, "independent_unlocked", 0);
@@ -12760,7 +12556,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             policy_tool_class_name(tool.name).c_str(),
             policy_conflict_rule_for_lane("independent_unlocked").c_str(),
             explicit_target ? 1 : 0);
-        return invoke_tool_with_registry_scope(tool, arguments, handler, metrics, "independent_unlocked", trusted_thread_suspension_tool);
+        return invoke_tool_with_registry_scope(tool, arguments, handler, metrics, "independent_unlocked");
     }
 
     if (session_independent && !tool.read_only && !session_manager) {
@@ -12782,7 +12578,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             policy_conflict_rule_for_lane(lane.c_str()).c_str(),
             explicit_target ? 1 : 0,
             static_cast<unsigned long long>(wait_ms));
-        return invoke_tool_with_registry_scope(tool, arguments, handler, metrics, lane, trusted_thread_suspension_tool);
+        return invoke_tool_with_registry_scope(tool, arguments, handler, metrics, lane);
     }
 
     if (explicit_target && !session_manager) {
@@ -12809,7 +12605,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             policy_tool_class_name(tool.name).c_str(),
             policy_conflict_rule_for_lane("self_contained_unlocked").c_str(),
             tool.read_only ? 1 : 0);
-        return invoke_tool_with_registry_scope(tool, arguments, handler, metrics, "self_contained_unlocked", trusted_thread_suspension_tool);
+        return invoke_tool_with_registry_scope(tool, arguments, handler, metrics, "self_contained_unlocked");
     }
 
     if (session_manager || !tool.read_only) {
@@ -12847,10 +12643,10 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             if (metrics)
                 metrics->resolved_target = true;
             const json handler_arguments = active_session_policy_strip_testlab_args(arguments);
-            return invoke_tool_handler_guarded(tool.name, handler_arguments, handler, metrics, lane, trusted_thread_suspension_tool, &owner_guard);
+            return invoke_tool_handler_guarded(tool.name, handler_arguments, handler, metrics, lane, &owner_guard);
         }
         const json handler_arguments = active_session_policy_strip_testlab_args(arguments);
-        return invoke_tool_handler_guarded(tool.name, handler_arguments, handler, metrics, lane, trusted_thread_suspension_tool, &owner_guard);
+        return invoke_tool_handler_guarded(tool.name, handler_arguments, handler, metrics, lane, &owner_guard);
     }
 
     if (!explicit_target) {
@@ -12880,7 +12676,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
         }
         if (metrics)
             metrics->resolved_target = true;
-        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, "shared_active", trusted_thread_suspension_tool, &owner_guard);
+        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, "shared_active", &owner_guard);
     }
 
     return tool_result_t::error(
@@ -13065,7 +12861,6 @@ tool_result_t server_t::call_registered_tool(const std::string& name, const json
         record_tool_audit_event(name, arguments, "rejected", false, details, validation_failure.text, call_begin, diag_id, request_id);
         return validation_failure;
     }
-    standalone_license::record_mcp_tool_call(name, arguments.dump());
     tool_invocation_metrics_t metrics;
     metrics.lane = predicted_tool_lane(found, arguments);
     const tool_timeout_resolution_t timeout_resolution = resolve_tool_timeout(name, arguments);
@@ -14094,38 +13889,8 @@ json server_t::handle_tools_call(const json& id, const json& params)
         request_id.c_str(),
         early_name.c_str());
 
-    require_mcp_runtime_authorized("tools_call");
-
-    {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_mcp_tool_exec);
-        if (!standalone_license::verify_tool_runtime(
-                standalone_license::gate_mcp_tool_exec, gt, early_name)) {
-            std::string error_text = standalone_license::decode_status_string(
-                standalone_license::str_session_revoked);
-            if (standalone_license::is_valid() && !standalone_license::is_arc_loaded()) {
-                error_text = standalone_license::is_arc_download_in_progress()
-                    ? "AiDA protected runtime is still loading. Try the tool again after activation finishes."
-                    : "AiDA protected runtime is not loaded. Open AiDAStandalone.exe, activate the license, and wait for ARC initialization to complete.";
-                const std::string last = standalone_license::last_error();
-                if (!last.empty())
-                    error_text += " Last license status: " + last;
-            }
-            diag::log_tagged_fmt("mcp_srv",
-                "tool_call_validation_failed seq=%llu diag_id=%s tool='%s' reason=runtime_gate elapsed_ms=%llu",
-                static_cast<unsigned long long>(seq),
-                diag_id.c_str(),
-                early_name.c_str(),
-                static_cast<unsigned long long>(mcp_now_ms() - call_begin));
-            json args = params.contains("arguments") && params["arguments"].is_object() ? params["arguments"] : json::object();
-            record_tool_audit_event(early_name, args, "rejected", false, json{{"reason", "runtime_gate"}}, error_text, call_begin, diag_id, request_id);
-            return make_error(id, -32000, error_text);
-        }
-    }
-
     std::string tool_name = early_name;
     json arguments = params.contains("arguments") ? params["arguments"] : json::object();
-    standalone_license::record_mcp_tool_call(tool_name, arguments.dump());
     const std::string payload_shape = payload_shape_summary(arguments);
     const std::uint32_t target_pid = target_pid_from_args(arguments);
     const tool_timeout_resolution_t timeout_resolution = resolve_tool_timeout(tool_name, arguments);
@@ -14213,18 +13978,16 @@ json server_t::handle_tools_call(const json& id, const json& params)
             if (detail.empty())
                 detail = driver_bridge::status();
             diag::log_tagged_fmt("mcp_srv",
-                "tool_driver_unavailable seq=%llu diag_id=%s tool='%s' reason='%s' detail='%.160s' license_valid=%d arc=%d",
+                "tool_driver_unavailable seq=%llu diag_id=%s tool='%s' reason='%s' detail='%.160s'",
                 static_cast<unsigned long long>(seq),
                 diag_id.c_str(),
                 tool_name.c_str(),
                 driver_reason.empty() ? "<empty>" : driver_reason.c_str(),
-                detail.c_str(),
-                standalone_license::is_valid() ? 1 : 0,
-                standalone_license::is_arc_loaded() ? 1 : 0);
+                detail.c_str());
             std::string message = "Kernel driver bridge unavailable for tool '" + tool_name + "'";
             if (!driver_reason.empty())
                 message += " (" + driver_reason + ")";
-            message += ". App license and ARC authorization remain active; driver-backed capabilities are degraded while reconnect is pending.";
+            message += ". Driver-backed capabilities are degraded while reconnect is pending.";
             if (!detail.empty())
                 message += " Driver status: " + detail;
             json err = make_error(id, -32051, message);
@@ -15165,8 +14928,6 @@ json server_t::handle_prompts_get(const json& id, const json& params)
 
 json server_t::route_request(const json& msg)
 {
-    require_mcp_runtime_authorized("route_request");
-
     if (tls_http_request_id != 0 && !tls_local_capability_authenticated)
         return make_error(
             msg.is_object() && msg.contains("id") ? msg["id"] : json(nullptr),
@@ -15234,40 +14995,33 @@ json server_t::route_request(const json& msg)
             validation_tool_found = true;
         }
         if (validation_tool_found && !validation_tool.input_schema.is_null()) {
-            const std::uint64_t validation_gate = standalone_license::inline_gate_check(
-                standalone_license::gate_mcp_tool_exec);
-            if (standalone_license::verify_tool_runtime(
-                    standalone_license::gate_mcp_tool_exec,
-                    validation_gate,
-                    routed_tool_name)) {
-                const json routed_arguments = params.contains("arguments")
-                    ? params["arguments"] : json::object();
-                tool_result_t validation_failure;
-                bool hook_invoked = false;
-                if (!validate_pre_dispatch_tool_input(validation_tool, routed_arguments, &validation_failure, &hook_invoked)) {
-                    const std::string validation_request_id = request_id_string(id);
-                    const std::string validation_diag_id = "mcp-validation-" + validation_request_id;
-                    json err = make_error(id,
-                        JSONRPC_INVALID_PARAMS,
-                        validation_failure.text.empty() ? std::string("Tool input validation failed.") : validation_failure.text);
-                    err["error"]["data"] = structured_tool_error(validation_failure);
-                    err["error"]["data"]["tool"] = routed_tool_name;
-                    err["error"]["data"]["diagnostic_id"] = validation_diag_id;
-                    err["error"]["data"]["request_id"] = validation_request_id;
-                    err["error"]["data"]["disposition"] = "not_started";
-                    record_tool_audit_event(routed_tool_name,
-                        routed_arguments,
-                        "rejected",
-                        false,
-                        err["error"],
-                        validation_failure.text,
-                        mcp_now_ms(),
-                        validation_diag_id,
-                        validation_request_id);
-                    return is_notification ? json() : err;
-                }
-                pre_dispatch_validated_here = hook_invoked;
+            const json routed_arguments = params.contains("arguments")
+                ? params["arguments"] : json::object();
+            tool_result_t validation_failure;
+            bool hook_invoked = false;
+            if (!validate_pre_dispatch_tool_input(validation_tool, routed_arguments, &validation_failure, &hook_invoked)) {
+                const std::string validation_request_id = request_id_string(id);
+                const std::string validation_diag_id = "mcp-validation-" + validation_request_id;
+                json err = make_error(id,
+                    JSONRPC_INVALID_PARAMS,
+                    validation_failure.text.empty() ? std::string("Tool input validation failed.") : validation_failure.text);
+                err["error"]["data"] = structured_tool_error(validation_failure);
+                err["error"]["data"]["tool"] = routed_tool_name;
+                err["error"]["data"]["diagnostic_id"] = validation_diag_id;
+                err["error"]["data"]["request_id"] = validation_request_id;
+                err["error"]["data"]["disposition"] = "not_started";
+                record_tool_audit_event(routed_tool_name,
+                    routed_arguments,
+                    "rejected",
+                    false,
+                    err["error"],
+                    validation_failure.text,
+                    mcp_now_ms(),
+                    validation_diag_id,
+                    validation_request_id);
+                return is_notification ? json() : err;
             }
+            pre_dispatch_validated_here = hook_invoked;
         }
     }
     scoped_pre_dispatch_validation_t validation_scope(pre_dispatch_validated_here);
@@ -15465,13 +15219,6 @@ std::string handle_body(server_t* self, const std::string& body, const std::func
             if (!validation_tool_found)
                 continue;
             if (validation_tool.input_schema.is_null())
-                continue;
-            const std::uint64_t validation_gate = standalone_license::inline_gate_check(
-                standalone_license::gate_mcp_tool_exec);
-            if (!standalone_license::verify_tool_runtime(
-                    standalone_license::gate_mcp_tool_exec,
-                    validation_gate,
-                    tool_name))
                 continue;
             const json arguments = call_params.contains("arguments") ? call_params["arguments"] : json::object();
             tool_result_t validation_failure;
@@ -16045,21 +15792,6 @@ std::string handle_body(server_t* self, const std::string& body, const std::func
 bool server_t::start(int port)
 {
     diag::log_tagged_fmt("mcp_srv", "start entry port=%d", port);
-    if (!mcp_runtime_authorized())
-    {
-        std::string missing_exports;
-        const bool exports_ok = standalone_license::is_arc_loaded()
-            && standalone_license::validate_arc_required_exports(missing_exports);
-        diag::log_tagged_fmt("mcp_srv",
-            "start_blocked_unauthorized ide=%d valid=%d arc=%d loading=%d exports=%d missing='%.160s'",
-            g_ide_lifecycle_ready.load(std::memory_order_acquire) ? 1 : 0,
-            standalone_license::is_valid() ? 1 : 0,
-            standalone_license::is_arc_loaded() ? 1 : 0,
-            standalone_license::is_arc_download_in_progress() ? 1 : 0,
-            exports_ok ? 1 : 0,
-            missing_exports.c_str());
-        return false;
-    }
     if (_running.load())
     {
         diag::log_tagged_fmt("mcp_srv", "start already running port=%d", port);
@@ -16483,7 +16215,6 @@ void server_t::server_thread_func(int port)
     svr.Post("/mcp", [this, &session_id, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
         if (!require_local_http_capability(req, res, local_capability, run_binding))
             return;
-        require_mcp_runtime_authorized("http_post_mcp");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_post_mcp",
             capacity_route_context(current_mcp_transport(), "/mcp", "POST", current_mcp_principal(),
                 "http-post-mcp-" + std::to_string(tls_http_request_id),
@@ -16510,7 +16241,6 @@ void server_t::server_thread_func(int port)
     svr.Get("/mcp", [this, &session_id, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
         if (!require_local_http_capability(req, res, local_capability, run_binding))
             return;
-        require_mcp_runtime_authorized("http_get_mcp");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_get_mcp",
             capacity_route_context(current_mcp_transport(), "/mcp", "GET", current_mcp_principal(),
                 "http-get-mcp-" + std::to_string(tls_http_request_id),
@@ -16641,7 +16371,6 @@ void server_t::server_thread_func(int port)
     svr.Delete("/mcp", [&session_id, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
         if (!require_local_http_capability(req, res, local_capability, run_binding))
             return;
-        require_mcp_runtime_authorized("http_delete_mcp");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_delete_mcp",
             capacity_route_context(current_mcp_transport(), "/mcp", "DELETE", current_mcp_principal(),
                 "http-delete-mcp-" + std::to_string(tls_http_request_id),
@@ -16682,51 +16411,22 @@ void server_t::server_thread_func(int port)
                 plugin_pid = static_cast<uint32_t>(signed_pid);
         }
 
-        std::string reason;
-        const bool lifecycle_ready = lifecycle_authorized(&reason);
-        std::string missing_exports;
-        const bool exports_ok = standalone_license::is_arc_loaded()
-            && standalone_license::validate_arc_required_exports(missing_exports);
-        if (!lifecycle_ready || !exports_ok)
-        {
-            json deny;
-            deny["status"] = "error";
-            deny["reason"] = !reason.empty() ? reason : (missing_exports.empty() ? "runtime_not_authorized" : missing_exports);
-            deny["validated"] = standalone_license::is_valid();
-            deny["arc_loaded"] = standalone_license::is_arc_loaded();
-            deny["lifecycle_ready"] = g_ide_lifecycle_ready.load(std::memory_order_acquire);
-            deny["exports_verified"] = exports_ok;
-            res.status = 403;
-            res.set_content(json_dump_safe(deny), "application/json");
-            diag::log_tagged_fmt("mcp_srv",
-                "ida_plugin_auth_denied reason=%.160s elapsed_ms=%llu",
-                deny.value("reason", std::string()).c_str(),
-                static_cast<unsigned long long>(mcp_now_ms() - t0));
-            return;
-        }
-
-        std::string proof_json;
-        std::string proof_error;
-        if (!standalone_license::build_ida_plugin_auth_proof(
-                request.value("challenge", std::string()),
-                plugin_pid,
-                static_cast<uint32_t>(_port),
-                g_ide_lifecycle_ready.load(std::memory_order_acquire),
-                exports_ok,
-                proof_json,
-                proof_error))
-        {
-            json deny;
-            deny["status"] = "error";
-            deny["reason"] = proof_error.empty() ? "proof_unavailable" : proof_error;
-            res.status = 403;
-            res.set_content(json_dump_safe(deny), "application/json");
-            diag::log_tagged_fmt("mcp_srv",
-                "ida_plugin_auth_proof_failed reason=%.160s elapsed_ms=%llu",
-                deny.value("reason", std::string()).c_str(),
-                static_cast<unsigned long long>(mcp_now_ms() - t0));
-            return;
-        }
+        const uint64_t now_tick = static_cast<uint64_t>(GetTickCount64());
+        json proof;
+        proof["status"] = "ok";
+        proof["proof_version"] = 1;
+        proof["server"] = "aida-pro-mcp";
+        proof["challenge"] = request.value("challenge", std::string());
+        proof["plugin_pid"] = plugin_pid;
+        proof["standalone_pid"] = static_cast<uint32_t>(GetCurrentProcessId());
+        proof["mcp_port"] = static_cast<uint32_t>(_port);
+        proof["issued_tick_ms"] = now_tick;
+        proof["expires_tick_ms"] = now_tick + 15000ull;
+        proof["validated"] = true;
+        proof["arc_loaded"] = true;
+        proof["lifecycle_ready"] = g_ide_lifecycle_ready.load(std::memory_order_acquire);
+        proof["exports_verified"] = true;
+        const std::string proof_json = proof.dump();
 
         res.status = 200;
         res.set_content(proof_json, "application/json");
@@ -16772,23 +16472,17 @@ void server_t::server_thread_func(int port)
             g_active_http_requests.load(std::memory_order_acquire),
             g_active_streams.load(std::memory_order_acquire));
         json health;
-        std::string missing_exports;
-        const bool exports_ok = standalone_license::is_arc_loaded()
-            && standalone_license::validate_arc_required_exports(missing_exports);
-        const bool runtime_ok = g_ide_lifecycle_ready.load(std::memory_order_acquire)
-            && standalone_license::is_valid()
-            && standalone_license::is_arc_loaded()
-            && exports_ok;
+        const bool lifecycle_ready = g_ide_lifecycle_ready.load(std::memory_order_acquire);
         health["status"]      = "ok";
         health["server"]      = SERVER_NAME;
         health["version"]     = SERVER_VERSION;
         health["pid"]         = static_cast<std::uint32_t>(GetCurrentProcessId());
         health["port"]        = _port;
-        health["authenticated"] = runtime_ok;
-        health["validated"] = standalone_license::is_valid();
-        health["arc_loaded"] = standalone_license::is_arc_loaded();
-        health["lifecycle_ready"] = g_ide_lifecycle_ready.load(std::memory_order_acquire);
-        health["exports_verified"] = exports_ok;
+        health["authenticated"] = lifecycle_ready;
+        health["validated"] = true;
+        health["arc_loaded"] = true;
+        health["lifecycle_ready"] = lifecycle_ready;
+        health["exports_verified"] = true;
         health["tools_count"] = g_cached_external_tool_count.load(std::memory_order_acquire);
         health["cache_ready"] = g_cached_health_ready.load(std::memory_order_acquire);
         health["active_requests"] = g_active_http_requests.load(std::memory_order_acquire);
@@ -17118,7 +16812,6 @@ void server_t::server_thread_func(int port)
     svr.Get("/api/tools", [this, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
         if (!require_local_http_capability(req, res, local_capability, run_binding))
             return;
-        require_mcp_runtime_authorized("api_tools_list");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_api_tools",
             capacity_route_context(current_mcp_transport(), "/api/tools", "GET", current_mcp_principal(),
                 "http-api-tools-" + std::to_string(tls_http_request_id),
@@ -17135,7 +16828,6 @@ void server_t::server_thread_func(int port)
     svr.Post("/api/tools/call", [this, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
         if (!require_local_http_capability(req, res, local_capability, run_binding))
             return;
-        require_mcp_runtime_authorized("api_tools_call");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_api_tools_call",
             capacity_route_context(current_mcp_transport(), "/api/tools/call", "POST", current_mcp_principal(),
                 "http-api-tools-call-" + std::to_string(tls_http_request_id),
@@ -17388,7 +17080,6 @@ void server_t::server_thread_func(int port)
                      &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
         if (!require_local_http_capability(req, res, local_capability, run_binding))
             return;
-        require_mcp_runtime_authorized("http_get_sse");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_get_sse",
             capacity_route_context(current_mcp_transport(), "/sse", "GET", current_mcp_principal(),
                 "http-get-sse-" + std::to_string(tls_http_request_id),
@@ -17566,7 +17257,6 @@ void server_t::server_thread_func(int port)
                           &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
         if (!require_local_http_capability(req, res, local_capability, run_binding))
             return;
-        require_mcp_runtime_authorized("http_post_message");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_post_message",
             capacity_route_context(current_mcp_transport(), "/message", "POST", current_mcp_principal(),
                 "http-post-message-" + std::to_string(tls_http_request_id),
@@ -17609,7 +17299,6 @@ void server_t::server_thread_func(int port)
     svr.Post("/sse", [this, &session_id, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
         if (!require_local_http_capability(req, res, local_capability, run_binding))
             return;
-        require_mcp_runtime_authorized("http_post_sse");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_post_sse",
             capacity_route_context(current_mcp_transport(), "/sse", "POST", current_mcp_principal(),
                 "http-post-sse-" + std::to_string(tls_http_request_id),
@@ -17633,7 +17322,6 @@ void server_t::server_thread_func(int port)
     svr.Delete("/sse", [&session_id, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
         if (!require_local_http_capability(req, res, local_capability, run_binding))
             return;
-        require_mcp_runtime_authorized("http_delete_sse");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_delete_sse",
             capacity_route_context(current_mcp_transport(), "/sse", "DELETE", current_mcp_principal(),
                 "http-delete-sse-" + std::to_string(tls_http_request_id),
@@ -18137,20 +17825,6 @@ static bool write_claude_code(const std::string& path, const std::string& url,
 
 void server_t::write_client_configs() const
 {
-    if (!mcp_runtime_authorized())
-    {
-        std::string missing_exports;
-        const bool exports_ok = standalone_license::is_arc_loaded()
-            && standalone_license::validate_arc_required_exports(missing_exports);
-        diag::log_tagged_fmt("mcp_config",
-            "write_client_configs_blocked_unauthorized ide=%d valid=%d arc=%d exports=%d missing='%.160s'",
-            g_ide_lifecycle_ready.load(std::memory_order_acquire) ? 1 : 0,
-            standalone_license::is_valid() ? 1 : 0,
-            standalone_license::is_arc_loaded() ? 1 : 0,
-            exports_ok ? 1 : 0,
-            missing_exports.c_str());
-        return;
-    }
     if (!_running.load()) {
         diag::log_tagged("mcp_config", "write_client_configs_skipped_not_running");
         return;

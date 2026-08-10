@@ -4,7 +4,6 @@
 #include <intrin.h>
 #include <cstdint>
 
-#include <Crypter.h>
 #include <imports/Strings.h>
 
 
@@ -1601,97 +1600,97 @@ inline bool SetupFunctions() {
         return false;
     }
 
-    *(PVOID*)&_RtlInitUnicodeString = GetProcAddress(kernelBase, (PCHAR)skCrypt("RtlInitUnicodeString"));
-    *(PVOID*)&_IoCreateDevice = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoCreateDevice"));
-    *(PVOID*)&_IoCreateSymbolicLink = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoCreateSymbolicLink"));
-    *(PVOID*)&_IofCompleteRequest = GetProcAddress(kernelBase, (PCHAR)skCrypt("IofCompleteRequest"));
-    *(PVOID*)&_MmCopyMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmCopyMemory"));
-    *(PVOID*)&_MmMapIoSpaceEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmMapIoSpaceEx"));
-    *(PVOID*)&_MmUnmapIoSpace = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmUnmapIoSpace"));
-    *(PVOID*)&_PsLookupProcessByProcessId = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsLookupProcessByProcessId"));
-    *(PVOID*)&_PsGetProcessSectionBaseAddress = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetProcessSectionBaseAddress"));
-    *(PVOID*)&_ObfDereferenceObject = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObfDereferenceObject"));
-    *(PVOID*)&_ObReferenceObjectByName = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObReferenceObjectByName"));
-    *(PVOID*)&_MmGetPhysicalMemoryRanges = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmGetPhysicalMemoryRanges"));
-    *(PVOID*)&_MmGetVirtualForPhysical = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmGetVirtualForPhysical"));
-    *(PVOID*)&_RtlGetVersion = GetProcAddress(kernelBase, (PCHAR)skCrypt("RtlGetVersion"));
-    *(PVOID*)&_KfRaiseIrql = GetProcAddress(kernelBase, (PCHAR)skCrypt("KfRaiseIrql"));
-    *(PVOID*)&_KeLowerIrql = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeLowerIrql"));
-    *(PVOID*)&_MmIsAddressValid = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmIsAddressValid"));
-    *(PVOID*)&_ZwOpenProcess = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwOpenProcess"));
-    *(PVOID*)&_ZwClose = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwClose"));
-    *(PVOID*)&_ZwTerminateProcess = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwTerminateProcess"));
+    *(PVOID*)&_RtlInitUnicodeString = GetProcAddress(kernelBase, (PCHAR)"RtlInitUnicodeString");
+    *(PVOID*)&_IoCreateDevice = GetProcAddress(kernelBase, (PCHAR)"IoCreateDevice");
+    *(PVOID*)&_IoCreateSymbolicLink = GetProcAddress(kernelBase, (PCHAR)"IoCreateSymbolicLink");
+    *(PVOID*)&_IofCompleteRequest = GetProcAddress(kernelBase, (PCHAR)"IofCompleteRequest");
+    *(PVOID*)&_MmCopyMemory = GetProcAddress(kernelBase, (PCHAR)"MmCopyMemory");
+    *(PVOID*)&_MmMapIoSpaceEx = GetProcAddress(kernelBase, (PCHAR)"MmMapIoSpaceEx");
+    *(PVOID*)&_MmUnmapIoSpace = GetProcAddress(kernelBase, (PCHAR)"MmUnmapIoSpace");
+    *(PVOID*)&_PsLookupProcessByProcessId = GetProcAddress(kernelBase, (PCHAR)"PsLookupProcessByProcessId");
+    *(PVOID*)&_PsGetProcessSectionBaseAddress = GetProcAddress(kernelBase, (PCHAR)"PsGetProcessSectionBaseAddress");
+    *(PVOID*)&_ObfDereferenceObject = GetProcAddress(kernelBase, (PCHAR)"ObfDereferenceObject");
+    *(PVOID*)&_ObReferenceObjectByName = GetProcAddress(kernelBase, (PCHAR)"ObReferenceObjectByName");
+    *(PVOID*)&_MmGetPhysicalMemoryRanges = GetProcAddress(kernelBase, (PCHAR)"MmGetPhysicalMemoryRanges");
+    *(PVOID*)&_MmGetVirtualForPhysical = GetProcAddress(kernelBase, (PCHAR)"MmGetVirtualForPhysical");
+    *(PVOID*)&_RtlGetVersion = GetProcAddress(kernelBase, (PCHAR)"RtlGetVersion");
+    *(PVOID*)&_KfRaiseIrql = GetProcAddress(kernelBase, (PCHAR)"KfRaiseIrql");
+    *(PVOID*)&_KeLowerIrql = GetProcAddress(kernelBase, (PCHAR)"KeLowerIrql");
+    *(PVOID*)&_MmIsAddressValid = GetProcAddress(kernelBase, (PCHAR)"MmIsAddressValid");
+    *(PVOID*)&_ZwOpenProcess = GetProcAddress(kernelBase, (PCHAR)"ZwOpenProcess");
+    *(PVOID*)&_ZwClose = GetProcAddress(kernelBase, (PCHAR)"ZwClose");
+    *(PVOID*)&_ZwTerminateProcess = GetProcAddress(kernelBase, (PCHAR)"ZwTerminateProcess");
 
-    *(PVOID*)&_IoAllocateMdl = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoAllocateMdl"));
-    *(PVOID*)&_IoFreeMdl = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoFreeMdl"));
-    *(PVOID*)&_MmBuildMdlForNonPagedPool = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmBuildMdlForNonPagedPool"));
-    *(PVOID*)&_MmMapLockedPagesSpecifyCache = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmMapLockedPagesSpecifyCache"));
-    *(PVOID*)&_MmUnmapLockedPages = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmUnmapLockedPages"));
-    *(PVOID*)&_MmProbeAndLockPages = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmProbeAndLockPages"));
-    *(PVOID*)&_MmUnlockPages = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmUnlockPages"));
+    *(PVOID*)&_IoAllocateMdl = GetProcAddress(kernelBase, (PCHAR)"IoAllocateMdl");
+    *(PVOID*)&_IoFreeMdl = GetProcAddress(kernelBase, (PCHAR)"IoFreeMdl");
+    *(PVOID*)&_MmBuildMdlForNonPagedPool = GetProcAddress(kernelBase, (PCHAR)"MmBuildMdlForNonPagedPool");
+    *(PVOID*)&_MmMapLockedPagesSpecifyCache = GetProcAddress(kernelBase, (PCHAR)"MmMapLockedPagesSpecifyCache");
+    *(PVOID*)&_MmUnmapLockedPages = GetProcAddress(kernelBase, (PCHAR)"MmUnmapLockedPages");
+    *(PVOID*)&_MmProbeAndLockPages = GetProcAddress(kernelBase, (PCHAR)"MmProbeAndLockPages");
+    *(PVOID*)&_MmUnlockPages = GetProcAddress(kernelBase, (PCHAR)"MmUnlockPages");
 
-    *(PVOID*)&_PsCreateSystemThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsCreateSystemThread"));
-    *(PVOID*)&_KeDelayExecutionThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeDelayExecutionThread"));
-    *(PVOID*)&_PsTerminateSystemThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsTerminateSystemThread"));
+    *(PVOID*)&_PsCreateSystemThread = GetProcAddress(kernelBase, (PCHAR)"PsCreateSystemThread");
+    *(PVOID*)&_KeDelayExecutionThread = GetProcAddress(kernelBase, (PCHAR)"KeDelayExecutionThread");
+    *(PVOID*)&_PsTerminateSystemThread = GetProcAddress(kernelBase, (PCHAR)"PsTerminateSystemThread");
 
-    *(PVOID*)&_KeStackAttachProcess = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeStackAttachProcess"));
-    *(PVOID*)&_KeUnstackDetachProcess = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeUnstackDetachProcess"));
-    *(PVOID*)&_ZwAllocateVirtualMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwAllocateVirtualMemory"));
-    *(PVOID*)&_ZwFreeVirtualMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwFreeVirtualMemory"));
-    *(PVOID*)&_IoDeleteDevice = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoDeleteDevice"));
-    *(PVOID*)&_IoDeleteSymbolicLink = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoDeleteSymbolicLink"));
+    *(PVOID*)&_KeStackAttachProcess = GetProcAddress(kernelBase, (PCHAR)"KeStackAttachProcess");
+    *(PVOID*)&_KeUnstackDetachProcess = GetProcAddress(kernelBase, (PCHAR)"KeUnstackDetachProcess");
+    *(PVOID*)&_ZwAllocateVirtualMemory = GetProcAddress(kernelBase, (PCHAR)"ZwAllocateVirtualMemory");
+    *(PVOID*)&_ZwFreeVirtualMemory = GetProcAddress(kernelBase, (PCHAR)"ZwFreeVirtualMemory");
+    *(PVOID*)&_IoDeleteDevice = GetProcAddress(kernelBase, (PCHAR)"IoDeleteDevice");
+    *(PVOID*)&_IoDeleteSymbolicLink = GetProcAddress(kernelBase, (PCHAR)"IoDeleteSymbolicLink");
 
 
-    *(PVOID*)&_PsLookupThreadByThreadId = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsLookupThreadByThreadId"));
-    *(PVOID*)&_PsGetNextProcessThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetNextProcessThread"));
-    *(PVOID*)&_PsGetThreadId = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetThreadId"));
-    *(PVOID*)&_PsGetContextThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetContextThread"));
-    *(PVOID*)&_PsSetContextThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetContextThread"));
-    *(PVOID*)&_ZwGetContextThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwGetContextThread"));
-    *(PVOID*)&_ZwSetContextThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwSetContextThread"));
-    *(PVOID*)&_PsSuspendThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSuspendThread"));
-    *(PVOID*)&_PsResumeThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsResumeThread"));
-    *(PVOID*)&_PsGetProcessPeb = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetProcessPeb"));
-    *(PVOID*)&_ZwQueryVirtualMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwQueryVirtualMemory"));
-    *(PVOID*)&_ZwProtectVirtualMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwProtectVirtualMemory"));
-    *(PVOID*)&_ObOpenObjectByPointer = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObOpenObjectByPointer"));
-    *(PVOID*)&_ZwSuspendThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwSuspendThread"));
-    *(PVOID*)&_ZwResumeThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwResumeThread"));
-    *(PVOID*)&_ZwQueryInformationThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwQueryInformationThread"));
-    *(PVOID*)&_ZwTerminateThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwTerminateThread"));
-    *(PVOID*)&_ZwSetInformationThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwSetInformationThread"));
+    *(PVOID*)&_PsLookupThreadByThreadId = GetProcAddress(kernelBase, (PCHAR)"PsLookupThreadByThreadId");
+    *(PVOID*)&_PsGetNextProcessThread = GetProcAddress(kernelBase, (PCHAR)"PsGetNextProcessThread");
+    *(PVOID*)&_PsGetThreadId = GetProcAddress(kernelBase, (PCHAR)"PsGetThreadId");
+    *(PVOID*)&_PsGetContextThread = GetProcAddress(kernelBase, (PCHAR)"PsGetContextThread");
+    *(PVOID*)&_PsSetContextThread = GetProcAddress(kernelBase, (PCHAR)"PsSetContextThread");
+    *(PVOID*)&_ZwGetContextThread = GetProcAddress(kernelBase, (PCHAR)"ZwGetContextThread");
+    *(PVOID*)&_ZwSetContextThread = GetProcAddress(kernelBase, (PCHAR)"ZwSetContextThread");
+    *(PVOID*)&_PsSuspendThread = GetProcAddress(kernelBase, (PCHAR)"PsSuspendThread");
+    *(PVOID*)&_PsResumeThread = GetProcAddress(kernelBase, (PCHAR)"PsResumeThread");
+    *(PVOID*)&_PsGetProcessPeb = GetProcAddress(kernelBase, (PCHAR)"PsGetProcessPeb");
+    *(PVOID*)&_ZwQueryVirtualMemory = GetProcAddress(kernelBase, (PCHAR)"ZwQueryVirtualMemory");
+    *(PVOID*)&_ZwProtectVirtualMemory = GetProcAddress(kernelBase, (PCHAR)"ZwProtectVirtualMemory");
+    *(PVOID*)&_ObOpenObjectByPointer = GetProcAddress(kernelBase, (PCHAR)"ObOpenObjectByPointer");
+    *(PVOID*)&_ZwSuspendThread = GetProcAddress(kernelBase, (PCHAR)"ZwSuspendThread");
+    *(PVOID*)&_ZwResumeThread = GetProcAddress(kernelBase, (PCHAR)"ZwResumeThread");
+    *(PVOID*)&_ZwQueryInformationThread = GetProcAddress(kernelBase, (PCHAR)"ZwQueryInformationThread");
+    *(PVOID*)&_ZwTerminateThread = GetProcAddress(kernelBase, (PCHAR)"ZwTerminateThread");
+    *(PVOID*)&_ZwSetInformationThread = GetProcAddress(kernelBase, (PCHAR)"ZwSetInformationThread");
 
-    _IoFileObjectType = (POBJECT_TYPE*)GetProcAddress(kernelBase, (PCHAR)skCrypt("IoFileObjectType"));
-    *(PVOID*)&_ObGetObjectType = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObGetObjectType"));
-    *(PVOID*)&_ObReferenceObjectSafe = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObReferenceObjectSafe"));
+    _IoFileObjectType = (POBJECT_TYPE*)GetProcAddress(kernelBase, (PCHAR)"IoFileObjectType");
+    *(PVOID*)&_ObGetObjectType = GetProcAddress(kernelBase, (PCHAR)"ObGetObjectType");
+    *(PVOID*)&_ObReferenceObjectSafe = GetProcAddress(kernelBase, (PCHAR)"ObReferenceObjectSafe");
 
-    *(PVOID*)&_ZwOpenKey = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwOpenKey"));
-    *(PVOID*)&_ZwQueryValueKey = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwQueryValueKey"));
-    *(PVOID*)&_ZwDeleteFile = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwDeleteFile"));
-    *(PVOID*)&_ZwSetInformationFile = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwSetInformationFile"));
-    *(PVOID*)&_IoCreateFileEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoCreateFileEx"));
+    *(PVOID*)&_ZwOpenKey = GetProcAddress(kernelBase, (PCHAR)"ZwOpenKey");
+    *(PVOID*)&_ZwQueryValueKey = GetProcAddress(kernelBase, (PCHAR)"ZwQueryValueKey");
+    *(PVOID*)&_ZwDeleteFile = GetProcAddress(kernelBase, (PCHAR)"ZwDeleteFile");
+    *(PVOID*)&_ZwSetInformationFile = GetProcAddress(kernelBase, (PCHAR)"ZwSetInformationFile");
+    *(PVOID*)&_IoCreateFileEx = GetProcAddress(kernelBase, (PCHAR)"IoCreateFileEx");
 
-    *(PVOID*)&_KeBugCheckEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeBugCheckEx"));
-    *(PVOID*)&_KdRefreshDebuggerNotPresent = GetProcAddress(kernelBase, (PCHAR)skCrypt("KdRefreshDebuggerNotPresent"));
-    *(PVOID*)&_KeInitializeDpc = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeInitializeDpc"));
-    *(PVOID*)&_KeInitializeTimerEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeInitializeTimerEx"));
-    *(PVOID*)&_KeSetTimerEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeSetTimerEx"));
-    *(PVOID*)&_KeCancelTimer = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeCancelTimer"));
-    *(PVOID*)&_KeFlushQueuedDpcs = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeFlushQueuedDpcs"));
-    *(PVOID*)&_ExQueueWorkItem = GetProcAddress(kernelBase, (PCHAR)skCrypt("ExQueueWorkItem"));
+    *(PVOID*)&_KeBugCheckEx = GetProcAddress(kernelBase, (PCHAR)"KeBugCheckEx");
+    *(PVOID*)&_KdRefreshDebuggerNotPresent = GetProcAddress(kernelBase, (PCHAR)"KdRefreshDebuggerNotPresent");
+    *(PVOID*)&_KeInitializeDpc = GetProcAddress(kernelBase, (PCHAR)"KeInitializeDpc");
+    *(PVOID*)&_KeInitializeTimerEx = GetProcAddress(kernelBase, (PCHAR)"KeInitializeTimerEx");
+    *(PVOID*)&_KeSetTimerEx = GetProcAddress(kernelBase, (PCHAR)"KeSetTimerEx");
+    *(PVOID*)&_KeCancelTimer = GetProcAddress(kernelBase, (PCHAR)"KeCancelTimer");
+    *(PVOID*)&_KeFlushQueuedDpcs = GetProcAddress(kernelBase, (PCHAR)"KeFlushQueuedDpcs");
+    *(PVOID*)&_ExQueueWorkItem = GetProcAddress(kernelBase, (PCHAR)"ExQueueWorkItem");
 
-    *(PVOID*)&_ObRegisterCallbacks = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObRegisterCallbacks"));
-    *(PVOID*)&_ObUnRegisterCallbacks = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObUnRegisterCallbacks"));
+    *(PVOID*)&_ObRegisterCallbacks = GetProcAddress(kernelBase, (PCHAR)"ObRegisterCallbacks");
+    *(PVOID*)&_ObUnRegisterCallbacks = GetProcAddress(kernelBase, (PCHAR)"ObUnRegisterCallbacks");
 
-    *(PVOID*)&_PsSetCreateProcessNotifyRoutineEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetCreateProcessNotifyRoutineEx"));
+    *(PVOID*)&_PsSetCreateProcessNotifyRoutineEx = GetProcAddress(kernelBase, (PCHAR)"PsSetCreateProcessNotifyRoutineEx");
 
-    *(PVOID*)&_PsSetLoadImageNotifyRoutine = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetLoadImageNotifyRoutine"));
-    *(PVOID*)&_PsRemoveLoadImageNotifyRoutine = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsRemoveLoadImageNotifyRoutine"));
+    *(PVOID*)&_PsSetLoadImageNotifyRoutine = GetProcAddress(kernelBase, (PCHAR)"PsSetLoadImageNotifyRoutine");
+    *(PVOID*)&_PsRemoveLoadImageNotifyRoutine = GetProcAddress(kernelBase, (PCHAR)"PsRemoveLoadImageNotifyRoutine");
 
-    *(PVOID*)&_CmRegisterCallbackEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("CmRegisterCallbackEx"));
-    *(PVOID*)&_CmUnRegisterCallback = GetProcAddress(kernelBase, (PCHAR)skCrypt("CmUnRegisterCallback"));
+    *(PVOID*)&_CmRegisterCallbackEx = GetProcAddress(kernelBase, (PCHAR)"CmRegisterCallbackEx");
+    *(PVOID*)&_CmUnRegisterCallback = GetProcAddress(kernelBase, (PCHAR)"CmUnRegisterCallback");
 
-    *(PVOID*)&_DbgPrintEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("DbgPrintEx"));
+    *(PVOID*)&_DbgPrintEx = GetProcAddress(kernelBase, (PCHAR)"DbgPrintEx");
 
     WW_LOG("SetupFunctions: kernelBase=%p", kernelBase);
     WW_LOG("SetupFunctions: _RtlInitUnicodeString=%p _IoCreateDevice=%p _IoCreateSymbolicLink=%p", _RtlInitUnicodeString, _IoCreateDevice, _IoCreateSymbolicLink);

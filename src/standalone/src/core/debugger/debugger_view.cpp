@@ -22,7 +22,6 @@
 #endif
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
-#include "../anti-tamper/webhook.hpp"
 #endif
 #include "ui_anim.hpp"
 #include "memory_map_view.hpp"
@@ -3202,7 +3201,7 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 		static bool s_dbg_strip_logged = false;
 		if (!s_dbg_strip_logged) {
 			s_dbg_strip_logged = true;
-			anti_tamper::webhook::write_log("dbg_strip", "[dbg_strip] applied solid_line");
+			diag::log_tagged("dbg_strip", "[dbg_strip] applied solid_line");
 		}
 	}
 
@@ -3429,7 +3428,7 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 		static bool s_stealth_pill_removed_logged = false;
 		if (!s_stealth_pill_removed_logged) {
 			s_stealth_pill_removed_logged = true;
-			anti_tamper::webhook::write_log("stealth_remove", "[stealth_remove] pill_removed=1");
+			diag::log_tagged("stealth_remove", "[stealth_remove] pill_removed=1");
 		}
 	}
 }
@@ -4297,7 +4296,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 		static bool s_logged_once = false;
 		if (!s_logged_once) {
 			s_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] cpu enter ok=1");
 			diag::log_tagged_critical_fmt("cpu_view",
 				"cpu_pane_enter w=%.0f h=%.0f", static_cast<double>(w),
@@ -4709,7 +4708,7 @@ static void render_cfg_overlay(ImDrawList* dl, float ox, float oy, float w, floa
 		static bool s_logged_once = false;
 		if (!s_logged_once) {
 			s_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] cfg enter ok=1");
 		}
 	}
@@ -4736,7 +4735,7 @@ static void render_cfg_overlay(ImDrawList* dl, float ox, float oy, float w, floa
 		diag::log_tagged_critical_fmt("cfg",
 			"cfg_build_from_debugger rip=0x%llx",
 			static_cast<unsigned long long>(rip));
-		anti_tamper::webhook::write_log("dbg_audit",
+		diag::log_tagged("dbg_audit",
 			"[dbg_audit] cfg build_at_rip ok=1");
 	}
 	ImGui::SameLine(0.f, btn_gap);
@@ -4753,10 +4752,10 @@ static void render_cfg_overlay(ImDrawList* dl, float ox, float oy, float w, floa
 			diag::log_tagged_critical_fmt("cfg",
 				"cfg_open_graph_view target=0x%llx",
 				static_cast<unsigned long long>(target_addr));
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] cfg open_full ok=1");
 		} else {
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] cfg open_full fail reason=no_address");
 		}
 	}
@@ -4770,15 +4769,15 @@ static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, 
 		static bool s_logged_once = false;
 		if (!s_logged_once) {
 			s_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] modules enter ok=1");
 		}
 		static bool s_cap_logged_once = false;
 		if (!s_cap_logged_once) {
 			s_cap_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] modules capability_unavailable feature=modules_inject_dll reason=driver_bridge_has_no_LoadLibrary_helper");
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] modules capability_unavailable feature=modules_unload reason=driver_bridge_has_no_FreeLibrary_helper");
 		}
 	}
@@ -4805,14 +4804,14 @@ static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, 
 		if (driver_bridge::attached_pid() == 0) {
 			toast_notification::push("Attach to a target first.",
 				toast_notification::toast_type_t::warning);
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] modules dump fail reason=no_attached_target");
 		} else if (!dump_target.present || dump_target.base == 0 || dump_target.size == 0) {
 			toast_notification::push(dump_target.base != 0
 				? "Selected module is no longer loaded."
 				: "Select a module first.",
 				toast_notification::toast_type_t::warning);
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				dump_target.base != 0
 					? "[dbg_audit] modules dump fail reason=selected_module_unloaded"
 					: "[dbg_audit] modules dump fail reason=no_selection");
@@ -4821,7 +4820,7 @@ static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, 
 			if (dump_target.size > cap) {
 				toast_notification::push("Module exceeds 256 MiB dump cap.",
 					toast_notification::toast_type_t::warning);
-				anti_tamper::webhook::write_log("dbg_audit",
+				diag::log_tagged("dbg_audit",
 					"[dbg_audit] modules dump fail reason=cap_exceeded");
 			} else {
 				char default_name[160] = {};
@@ -4880,7 +4879,7 @@ static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, 
 							result->ok ? 1 : 0,
 							result->verified ? 1 : 0,
 							path_copy.c_str());
-						anti_tamper::webhook::write_log("dbg_audit", result->verified
+						diag::log_tagged("dbg_audit", result->verified
 							? "[dbg_audit] modules dump ok=1"
 							: "[dbg_audit] modules dump fail reason=read_or_write_failed");
 						const bool posted = post_debugger_ui([result, count = buf.size(), name_copy]() {
@@ -4957,13 +4956,13 @@ static void render_seh_overlay(ImDrawList* dl, float ox, float oy, float w, floa
 		static bool s_logged_once = false;
 		if (!s_logged_once) {
 			s_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] seh enter ok=1");
 		}
 		static bool s_cap_logged_once = false;
 		if (!s_cap_logged_once) {
 			s_cap_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] seh capability_unavailable feature=seh_break_on_exception reason=driver_bridge_has_no_debug_event_subscription");
 		}
 	}
@@ -5172,7 +5171,7 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 		static bool s_logged_once = false;
 		if (!s_logged_once) {
 			s_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] breakpoints enter ok=1");
 		}
 	}
@@ -5454,7 +5453,7 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 					i,
 					static_cast<unsigned long long>(bp.address),
 					ok ? 1 : 0);
-				anti_tamper::webhook::write_log("dbg_audit", ok
+				diag::log_tagged("dbg_audit", ok
 					? "[dbg_audit] bp jump ok=1"
 					: "[dbg_audit] bp jump fail reason=zero_addr");
 			}
@@ -5470,7 +5469,7 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 			if (bp_edit_clicked) {
 				if (retain_breakpoint_edit(ui, i, bp, breakpoint_context,
 					breakpoint_editor_focus_t::condition))
-					anti_tamper::webhook::write_log("dbg_audit",
+					diag::log_tagged("dbg_audit",
 						"[dbg_audit] bp edit_open ok=1");
 			}
 
@@ -5663,7 +5662,7 @@ static void render_memmap(ImDrawList* dl, float ox, float oy, float w, float h, 
 		static bool s_logged_once = false;
 		if (!s_logged_once) {
 			s_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] memmap enter ok=1");
 		}
 	}
@@ -5683,7 +5682,7 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 		static bool s_logged_once = false;
 		if (!s_logged_once) {
 			s_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] callstack enter ok=1");
 		}
 	}
@@ -5950,7 +5949,7 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 		static bool s_logged_once = false;
 		if (!s_logged_once) {
 			s_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] threads enter ok=1");
 		}
 	}
@@ -6142,7 +6141,7 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 				debugger_engine::invalidate_cache();
 				diag::log_tagged_critical_fmt("debugger",
 					"thread_switch_context tid=%u", static_cast<unsigned>(th.tid));
-				anti_tamper::webhook::write_log("dbg_audit",
+				diag::log_tagged("dbg_audit",
 					"[dbg_audit] threads switch ok=1");
 				toast_notification::push("Active thread context switched.",
 					toast_notification::toast_type_t::info);
@@ -6160,7 +6159,7 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 				ui.thread_kill_context = debugger_interaction::capture(
 					debugger_interaction::kind_t::thread, th.rip, 0, ti, th.tid);
 				ui.thread_kill_popup_open = true;
-				anti_tamper::webhook::write_log("dbg_audit",
+				diag::log_tagged("dbg_audit",
 					"[dbg_audit] threads kill_request ok=1");
 			}
 
@@ -6249,7 +6248,7 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 		static bool s_logged_once = false;
 		if (!s_logged_once) {
 			s_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] watches enter ok=1");
 		}
 	}
@@ -6519,7 +6518,7 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 		static bool s_logged_once = false;
 		if (!s_logged_once) {
 			s_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] trace enter ok=1");
 		}
 	}
@@ -6574,7 +6573,7 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 			st.trace_dropped.store(0, std::memory_order_release);
 			trace_lock.unlock();
 			diag::log_tagged_fmt("trace", "trace_clear removed=%zu", before);
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] trace clear ok=1");
 		} else
 			toast_notification::push("Trace is updating; retry Clear in a moment.",
@@ -6593,7 +6592,7 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 		if (trace_empty) {
 			toast_notification::push("Trace is empty.",
 				toast_notification::toast_type_t::warning);
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] trace export fail reason=empty");
 		} else {
 			char path_buf[MAX_PATH] = "trace.csv";
@@ -6888,7 +6887,7 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 		static bool s_logged_once = false;
 		if (!s_logged_once) {
 			s_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] strings enter ok=1");
 		}
 	}
@@ -7094,7 +7093,7 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 		static bool s_logged_once = false;
 		if (!s_logged_once) {
 			s_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] bookmarks enter ok=1");
 		}
 	}
@@ -7281,7 +7280,7 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 		static bool s_logged_once = false;
 		if (!s_logged_once) {
 			s_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] handles enter ok=1");
 		}
 	}
@@ -7298,7 +7297,7 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 		diag::log_tagged_critical_fmt("handles",
 			"handles_enumerate_request attached_pid=%u",
 			static_cast<unsigned>(driver_bridge::attached_pid()));
-		anti_tamper::webhook::write_log("dbg_audit",
+		diag::log_tagged("dbg_audit",
 			"[dbg_audit] handles enumerate ok=1");
 		aida::infra::executor::submission_t sub;
 		sub.owner_subsystem = "debugger";
@@ -7447,7 +7446,7 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 					debugger_interaction::kind_t::handle, 0, he.handle, hi, 0, 0,
 					he.name, he.type_name);
 				ui.handle_close_popup_open = true;
-				anti_tamper::webhook::write_log("dbg_audit",
+				diag::log_tagged("dbg_audit",
 					"[dbg_audit] handles close_request ok=1");
 			}
 
@@ -7941,7 +7940,7 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 		static bool s_logged_once = false;
 		if (!s_logged_once) {
 			s_logged_once = true;
-			anti_tamper::webhook::write_log("dbg_audit",
+			diag::log_tagged("dbg_audit",
 				"[dbg_audit] patches enter ok=1");
 		}
 	}
