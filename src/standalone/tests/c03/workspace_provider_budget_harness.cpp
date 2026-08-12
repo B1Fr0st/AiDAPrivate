@@ -1142,7 +1142,7 @@ void verify_regression_surfaces(const std::filesystem::path& root) {
             install_services(workspace);
             analyze_workspace(workspace, lanes);
             const auto snapshot = workspace->snapshot();
-            require(snapshot, "regression baseline did not publish a snapshot");
+            require(snapshot != nullptr, "regression baseline did not publish a snapshot");
             counts.instructions = snapshot->instructions.size();
             counts.xrefs = snapshot->xrefs.size();
             counts.strings = snapshot->strings.size();
@@ -1208,7 +1208,7 @@ void verify_memory_ceiling_300mb(const std::filesystem::path& root) {
     try {
         install_services(workspace);
         const auto provider = workspace->provider_handle();
-        require(provider, "ceiling provider handle is unavailable");
+        require(provider != nullptr, "ceiling provider handle is unavailable");
         const auto mapped = std::dynamic_pointer_cast<const mapped_file_provider_t>(provider);
         require(mapped && mapped->content_pin_active() &&
                     mapped->identity().immutable_snapshot &&

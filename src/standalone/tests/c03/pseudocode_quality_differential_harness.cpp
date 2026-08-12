@@ -390,7 +390,7 @@ void verify_string_inline(const decompiler_entity_key_t& entity_value,
     auto transformed = transform_checked(source, types, evidence);
     require(transformed.result.metrics.string_literals_inlined == 1,
         "string_inline substitution did not fire exactly once");
-    const auto rendered = render_checked(transformed.ast, types, evidence);
+    const auto rendered = render_checked(transformed.ast, types, &evidence);
     require(rendered.text.find("\"Hello, AiDA\"") != std::string::npos,
         "string_inline render lacks the quoted literal at the call argument");
     const auto call_line = rendered.text.substr(rendered.text.find("print_text"));
@@ -410,7 +410,7 @@ void verify_string_inline(const decompiler_entity_key_t& entity_value,
     decompiler_render_evidence_t wide_evidence;
     wide_evidence.strings.push_back(string_evidence(string_address, "Wide", true, true));
     auto wide_transformed = transform_checked(source, types, wide_evidence);
-    const auto wide_rendered = render_checked(wide_transformed.ast, types, wide_evidence);
+    const auto wide_rendered = render_checked(wide_transformed.ast, types, &wide_evidence);
     require(wide_rendered.text.find("L\"Wide\"") != std::string::npos,
         "string_inline wide fixture lacks the L-prefixed literal");
 }
@@ -456,7 +456,7 @@ void verify_scalar_and_comment_channels(const decompiler_entity_key_t& entity_va
         "global scalar trailing comment did not fire exactly once");
     require(transformed.result.metrics.user_comments_injected == 1,
         "address-anchored user comment did not fire exactly once");
-    const auto rendered = render_checked(transformed.ast, types, evidence);
+    const auto rendered = render_checked(transformed.ast, types, &evidence);
     require(rendered.text.find("// = 42 (0x2a)") != std::string::npos,
         "global scalar comment text missing from the render");
     require(rendered.text.find("// entry comment") != std::string::npos,
@@ -504,7 +504,7 @@ void verify_member_chain(const decompiler_entity_key_t& entity_value,
     auto transformed = transform_checked(source, types, evidence);
     require(transformed.result.metrics.member_accesses_rewritten >= 2,
         "member_chain did not rewrite both deref levels");
-    const auto rendered = render_checked(transformed.ast, types, evidence);
+    const auto rendered = render_checked(transformed.ast, types, &evidence);
     require(rendered.text.find("base->b->c") != std::string::npos,
         "member_chain render lacks base->b->c");
 }
@@ -554,7 +554,7 @@ void verify_array_member(const decompiler_entity_key_t& entity_value,
     auto transformed = transform_checked(source, types, evidence);
     require(transformed.result.metrics.member_accesses_rewritten == 1,
         "array_member did not rewrite exactly once");
-    const auto rendered = render_checked(transformed.ast, types, evidence);
+    const auto rendered = render_checked(transformed.ast, types, &evidence);
     require(rendered.text.find("base[i].field") != std::string::npos,
         "array_member render lacks base[i].field");
 }
@@ -592,7 +592,7 @@ void verify_thiscall_this(const decompiler_entity_key_t& entity_value,
     auto transformed = transform_checked(source, types, evidence);
     require(transformed.result.metrics.member_accesses_rewritten == 1,
         "thiscall member rewrite did not fire exactly once");
-    const auto rendered = render_checked(transformed.ast, types, evidence);
+    const auto rendered = render_checked(transformed.ast, types, &evidence);
     require(rendered.text.find("this->field") != std::string::npos,
         "thiscall render lacks this->field");
     require(rendered.text.find("param_1") == std::string::npos,
@@ -634,7 +634,7 @@ void verify_union_selection(const decompiler_entity_key_t& entity_value,
     auto int_transformed = transform_checked(int_source, types, evidence);
     require(int_transformed.result.metrics.member_accesses_rewritten == 1,
         "union int-typed read did not rewrite exactly once");
-    const auto int_rendered = render_checked(int_transformed.ast, types, evidence);
+    const auto int_rendered = render_checked(int_transformed.ast, types, &evidence);
     require(int_rendered.text.find("base->as_int") != std::string::npos,
         "union int-typed read did not select as_int");
 
@@ -642,7 +642,7 @@ void verify_union_selection(const decompiler_entity_key_t& entity_value,
     auto short_transformed = transform_checked(short_source, types, evidence);
     require(short_transformed.result.metrics.member_accesses_rewritten == 0,
         "union ambiguous read rewrote instead of degrading gracefully");
-    const auto short_rendered = render_checked(short_transformed.ast, types, evidence);
+    const auto short_rendered = render_checked(short_transformed.ast, types, &evidence);
     require(short_rendered.text.find("as_float") == std::string::npos &&
             short_rendered.text.find("as_int") == std::string::npos,
         "union ambiguous read selected a member");
@@ -725,7 +725,7 @@ void verify_cast_noise(const decompiler_entity_key_t& entity_value,
         "cast_noise cast count was not reduced by at least 30 percent");
     require(transformed.result.metrics.cast_masks_folded == 1,
         "cast_noise mask fold did not fire exactly once");
-    const auto rendered = render_checked(transformed.ast, types, evidence);
+    const auto rendered = render_checked(transformed.ast, types, &evidence);
     require(rendered.text.find("(unsigned char)(y & 255)") == std::string::npos &&
             rendered.text.find("(unsigned char)") == std::string::npos,
         "cast_noise render retained the folded mask cast");
@@ -830,7 +830,7 @@ void verify_loop_intrinsics(const decompiler_entity_key_t& entity_value,
     auto memset_transformed = transform_checked(memset_source, types, evidence);
     require(memset_transformed.result.metrics.loop_intrinsics_rewritten == 1,
         "loop_memset was not rewritten exactly once");
-    const auto memset_rendered = render_checked(memset_transformed.ast, types, evidence);
+    const auto memset_rendered = render_checked(memset_transformed.ast, types, &evidence);
     require(memset_rendered.text.find("memset(dst, 0, n)") != std::string::npos,
         "loop_memset render lacks memset(dst, 0, n)");
     require(memset_rendered.text.find("for (") == std::string::npos,
@@ -841,7 +841,7 @@ void verify_loop_intrinsics(const decompiler_entity_key_t& entity_value,
     auto memcpy_transformed = transform_checked(memcpy_source, types, evidence);
     require(memcpy_transformed.result.metrics.loop_intrinsics_rewritten == 1,
         "loop_memcpy was not rewritten exactly once");
-    const auto memcpy_rendered = render_checked(memcpy_transformed.ast, types, evidence);
+    const auto memcpy_rendered = render_checked(memcpy_transformed.ast, types, &evidence);
     require(memcpy_rendered.text.find("memcpy(dst, src, n * 4)") != std::string::npos,
         "loop_memcpy render lacks memcpy(dst, src, n * 4)");
 
@@ -976,7 +976,7 @@ void verify_bit_idioms(const decompiler_entity_key_t& entity_value,
     auto transformed = transform_checked(source, types, evidence);
     require(transformed.result.metrics.bit_operation_idioms_rewritten == 2,
         "rotate_bswap did not rewrite exactly two idioms");
-    const auto rendered = render_checked(transformed.ast, types, evidence);
+    const auto rendered = render_checked(transformed.ast, types, &evidence);
     require(rendered.text.find("_rotl(x, 8)") != std::string::npos,
         "rotate_bswap render lacks _rotl(x, 8)");
     require(rendered.text.find("_byteswap_ulong(x)") != std::string::npos,
@@ -1028,7 +1028,7 @@ void verify_magic_division(const decompiler_entity_key_t& entity_value,
         auto transformed = transform_checked(source, types, evidence);
         require(transformed.result.metrics.magic_divisions_recognized == 1,
             "magic_div row did not rewrite exactly once");
-        const auto rendered = render_checked(transformed.ast, types, evidence);
+        const auto rendered = render_checked(transformed.ast, types, &evidence);
         const std::string expected = "x / " + std::to_string(row.divisor);
         require(rendered.text.find(expected) != std::string::npos,
             "magic_div render lacks the recovered division");
@@ -1703,7 +1703,7 @@ void verify_local_rename(const decompiler_entity_key_t& entity_value,
     namespace model = aida::workbench::pseudocode_document;
     const decompiler_render_evidence_t evidence;
     const auto source_ast = make_rename_ast(entity_value, types);
-    const auto canonical_render = render_checked(source_ast, types, evidence);
+    const auto canonical_render = render_checked(source_ast, types, &evidence);
     require(canonical_render.text.find("local_4") != std::string::npos,
         "rename fixture canonical render lost local_4");
 
@@ -1730,27 +1730,27 @@ void verify_local_rename(const decompiler_entity_key_t& entity_value,
 
     quality_fake_source_t source;
     source.set_bundle(types, evidence);
-    model::pseudocode_document_model_t model(source);
+    model::pseudocode_document_model_t doc_model(source);
     model::pseudocode_request_t request;
     request.entity = entity_value;
     request.profile = decompiler_profile_id_t::balanced;
     request.workspace_generation = 31;
     request.timeout_ms = model::k_pseudocode_document_default_timeout_ms;
-    require(model.request(request).ok() && model.cached_document(),
+    require(doc_model.request(request).ok() && doc_model.cached_document(),
         "rename fixture model request failed");
-    const auto job_id = model.cached_document()->job_id;
+    const auto job_id = doc_model.cached_document()->job_id;
     source.complete(canonical_render.document);
-    require(model.poll(job_id).ok() &&
-            model.cache_state() == model::pseudocode_cache_state_t::cached,
+    require(doc_model.poll(job_id).ok() &&
+            doc_model.cache_state() == model::pseudocode_cache_state_t::cached,
         "rename fixture model did not cache the canonical document");
     std::uint64_t renamed = 0;
-    const auto applied = model.apply_local_rename("local_4", "counter", renamed);
+    const auto applied = doc_model.apply_local_rename("local_4", "counter", renamed);
     require(applied.ok() && renamed != 0,
         "model-level local rename failed");
-    require(model.cached_document()->job_id == job_id,
+    require(doc_model.cached_document()->job_id == job_id,
         "model-level local rename forced a pipeline re-entry (job id changed)");
     model::pseudocode_page_t page;
-    require(model.page({0, model::k_pseudocode_document_max_page_lines}, page).ok(),
+    require(doc_model.page({0, model::k_pseudocode_document_max_page_lines}, page).ok(),
         "model-level renamed document did not page");
     std::string renamed_text;
     for (const auto& line : page.lines)
@@ -1758,10 +1758,10 @@ void verify_local_rename(const decompiler_entity_key_t& entity_value,
     require(renamed_text.find("counter") != std::string::npos &&
             renamed_text.find("local_4") == std::string::npos,
         "model-level renamed document lacks the new name at every use");
-    const auto keyword_model = model.apply_local_rename("counter", "int", renamed);
+    const auto keyword_model = doc_model.apply_local_rename("counter", "int", renamed);
     require(!keyword_model.ok(),
         "model-level rename accepted a keyword");
-    const auto absent_model = model.apply_local_rename("nonexistent_local", "other", renamed);
+    const auto absent_model = doc_model.apply_local_rename("nonexistent_local", "other", renamed);
     require(!absent_model.ok(),
         "model-level rename accepted an absent identifier");
 
@@ -1816,6 +1816,8 @@ void run_pseudocode_quality_differential_harness()
 
 }
 
+}
+
 int main()
 {
     try {
@@ -1827,6 +1829,4 @@ int main()
         std::cerr << error.what() << '\n';
         return 1;
     }
-}
-
 }

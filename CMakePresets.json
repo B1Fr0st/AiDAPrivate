@@ -21,7 +21,8 @@
       "environment": {
         "SCCACHE_DIR":             "${sourceDir}/.sccache",
         "SCCACHE_CACHE_SIZE":      "20G",
-        "SCCACHE_IDLE_TIMEOUT":    "0"
+        "SCCACHE_IDLE_TIMEOUT":    "0",
+        "SCCACHE_DISABLE":         "1"
       }
     }
   ],
@@ -29,13 +30,13 @@
     {
       "name": "ninja-msvc-release",
       "configurePreset": "ninja-msvc-release",
-      "jobs": 12
+      "jobs": 6
     },
     {
       "name": "ninja-msvc-rebuild",
       "configurePreset": "ninja-msvc-release",
       "cleanFirst": true,
-      "jobs": 12
+      "jobs": 6
     }
   ]
 }

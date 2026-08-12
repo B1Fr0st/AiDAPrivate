@@ -1445,6 +1445,7 @@ packed_analysis_shard_t::packed_analysis_shard_t(std::unique_ptr<impl_t> impl) n
 {
 }
 
+packed_analysis_shard_t::packed_analysis_shard_t() noexcept = default;
 packed_analysis_shard_t::packed_analysis_shard_t(packed_analysis_shard_t&&) noexcept = default;
 packed_analysis_shard_t& packed_analysis_shard_t::operator=(packed_analysis_shard_t&&) noexcept = default;
 packed_analysis_shard_t::~packed_analysis_shard_t() = default;

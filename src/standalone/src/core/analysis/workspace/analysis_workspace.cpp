@@ -3416,7 +3416,7 @@ analysis_workspace_t::canonicalize_snapshot(
                                          "workspace_snapshot_bind"));
             }
             canonical->string_pool =
-                std::make_shared<const packed_string_pool_t>(pool.take_value());
+                std::make_shared<const packed_string_pool_t>(std::move(pool).take_value());
         }
         return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::success(
             std::static_pointer_cast<const analysis_snapshot_t>(std::move(canonical)));

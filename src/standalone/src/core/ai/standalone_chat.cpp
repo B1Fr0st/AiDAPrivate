@@ -2334,6 +2334,7 @@ void init_standalone_chat()
     diag::log_tagged("init_chat", "marketplace_autoconnect_deferred_until_authorized_ide");
     diag::log_tagged("init_chat", "marketplace_load_installed_done");
 
+    const std::string run_id = "init_" + std::to_string(GetCurrentProcessId()) + "_" + std::to_string(GetTickCount64());
     diag::log_tagged_fmt("init_chat", "driver_bridge_initialize_start run_id=%s", run_id.c_str());
     driver_bridge::initialize();
     diag::log_tagged_fmt("init_chat",

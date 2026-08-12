@@ -482,6 +482,7 @@ class packed_analysis_shard_compatibility_view_t;
 
 class packed_analysis_shard_t final {
 public:
+    packed_analysis_shard_t() noexcept;
     packed_analysis_shard_t(packed_analysis_shard_t&&) noexcept;
     packed_analysis_shard_t& operator=(packed_analysis_shard_t&&) noexcept;
     ~packed_analysis_shard_t();

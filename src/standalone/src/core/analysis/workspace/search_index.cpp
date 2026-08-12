@@ -45,6 +45,8 @@ struct packed_string_id_t {
     }
 };
 
+using interned_string_id_t = packed_string_id_t;
+
 struct packed_address_t {
     std::uint64_t value = 0;
     std::uint32_t metadata = 0;
@@ -1103,7 +1105,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build_impl(
 
         std::vector<std::string> global_values;
         {
-            std::unordered_map<std::string, packed_string_id_t> global_index;
+            std::unordered_map<std::string, interned_string_id_t> global_index;
             std::uint64_t merge_checks = 0;
             for (auto& task : tasks) {
                 const auto& local_values = task.strings.values();
@@ -1129,7 +1131,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build_impl(
                     }
                     const auto global_id = static_cast<std::uint32_t>(global_values.size() + 1U);
                     global_values.push_back(value);
-                    global_index.emplace(global_values.back(), packed_string_id_t{global_id});
+                    global_index.emplace(global_values.back(), interned_string_id_t{global_id});
                     task.local_to_global.push_back(global_id);
                 }
             }
@@ -1439,9 +1441,9 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build_impl(
             normalized_ids.end());
         parallel_sort(normalized_ids.begin(), normalized_ids.end(),
             [&](std::uint32_t lhs, std::uint32_t rhs) {
-                const auto left = impl->strings.lookup(packed_string_id_t{lhs})
+                const auto left = impl->strings.lookup(interned_string_id_t{lhs})
                     .value_or(std::string_view{});
-                const auto right = impl->strings.lookup(packed_string_id_t{rhs})
+                const auto right = impl->strings.lookup(interned_string_id_t{rhs})
                     .value_or(std::string_view{});
                 return left < right;
             }, worker_count);

@@ -1352,11 +1352,11 @@ void verify_type_graph_merge_determinism(const decompiler_entity_key_t& entity)
     };
     for (const auto& shape : {std::pair<std::uint32_t, std::uint32_t>{1, 0}, {10, 2}, {100, 3}, {1000, 5}}) {
         auto corpus = corpus_case(shape.first, shape.second);
-        type_seed_batch_t batch;
+        type_graph::type_seed_batch_t batch;
         batch.source = decompiler_fact_provenance_t::debug_metadata;
         batch.source_label = "c03_merge_seed";
         for (std::uint32_t extra = 1; extra <= 4; ++extra) {
-            type_candidate_t candidate;
+            type_graph::type_candidate_t candidate;
             candidate.kind = decompiler_type_kind_t::structure;
             candidate.canonical_name = "Seed" + std::to_string(extra);
             candidate.display_name = candidate.canonical_name;
@@ -1364,7 +1364,7 @@ void verify_type_graph_merge_determinism(const decompiler_entity_key_t& entity)
             candidate.alignment = 8;
             candidate.confidence = 70;
             candidate.provenance = decompiler_fact_provenance_t::debug_metadata;
-            type_edge_candidate_t edge;
+            type_graph::type_edge_candidate_t edge;
             edge.kind = decompiler_type_edge_kind_t::member;
             edge.target_canonical_name = "T1";
             edge.stable_name = "embedded";
@@ -1372,7 +1372,7 @@ void verify_type_graph_merge_determinism(const decompiler_entity_key_t& entity)
             edge.confidence = 70;
             edge.provenance = decompiler_fact_provenance_t::debug_metadata;
             candidate.edges.push_back(std::move(edge));
-            type_edge_candidate_t unresolved;
+            type_graph::type_edge_candidate_t unresolved;
             unresolved.kind = decompiler_type_edge_kind_t::member;
             unresolved.target_canonical_name = "Absent" + std::to_string(extra);
             unresolved.stable_name = "missing";

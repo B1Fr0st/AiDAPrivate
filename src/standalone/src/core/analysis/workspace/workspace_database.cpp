@@ -5372,6 +5372,9 @@ struct workspace_snapshot_staging_t::state_t {
 
 namespace {
 
+void publish_commit_metrics(workspace_database_t::connection_state_t& state,
+                            const persistence_commit_metrics_t& metrics) noexcept;
+
 workspace_result_t<void> bind_committed_page_source(
     sqlite3* database,
     workspace_database_t::connection_state_t& conn,
@@ -11013,7 +11016,7 @@ workspace_result_t<void> load_relational_instruction_blobs(
     const cancellation_token_t& cancel) {
     statement_t statement;
     auto prepared = statement.prepare(database,
-        "SELECT chunk_id,payload FROM " + slot_table(active_slot, "instruction_chunks") + " ORDER BY chunk_id",
+        ("SELECT chunk_id,payload FROM " + slot_table(active_slot, "instruction_chunks") + " ORDER BY chunk_id").c_str(),
         "workspace_database.load.instructions");
     if (!prepared) return prepared;
     constexpr std::uint64_t kChunkBlobLimit =
@@ -11072,7 +11075,7 @@ workspace_result_t<void> load_relational_operands_targets(
                 record_bytes, packed_operand_stream_record_bytes);
             if (!decoded)
                 return workspace_result_t<void>::failure(decoded.error());
-            snapshot_operand_append(*loaded, decoded.take_value());
+            snapshot_operand_append(loaded, decoded.take_value());
             return workspace_result_t<void>::success();
         });
     if (!operand_chunks)
@@ -11087,7 +11090,7 @@ workspace_result_t<void> load_relational_operands_targets(
                 record_bytes, packed_target_stream_record_bytes);
             if (!decoded)
                 return workspace_result_t<void>::failure(decoded.error());
-            loaded->target_facts.push_back(decoded.take_value());
+            loaded.target_facts.push_back(decoded.take_value());
             return workspace_result_t<void>::success();
         });
     if (!target_chunks)
@@ -11139,7 +11142,7 @@ workspace_result_t<void> load_relational_operands_targets(
             fact.address_components = static_cast<std::uint16_t>(sqlite3_column_int(statement, 29));
             fact.address_expression = static_cast<address_expression_kind_t>(sqlite3_column_int(statement, 30));
             fact.address_resolution = static_cast<target_resolution_t>(sqlite3_column_int(statement, 31));
-            snapshot_operand_append(*loaded, fact);
+            snapshot_operand_append(loaded, fact);
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11160,7 +11163,7 @@ workspace_result_t<void> load_relational_operands_targets(
             fact.access_count = static_cast<std::uint16_t>(sqlite3_column_int(statement, 11));
             fact.direct = sqlite3_column_int(statement, 12) != 0;
             fact.is_external = sqlite3_column_int(statement, 13) != 0;
-            loaded->target_facts.push_back(fact);
+            loaded.target_facts.push_back(fact);
             return workspace_result_t<void>::success();
         });
     return result;
@@ -11190,7 +11193,7 @@ workspace_result_t<void> load_relational_functions_blocks(
             record.confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 17));
             record.thunk = sqlite3_column_int(statement, 18) != 0;
             record.noreturn = sqlite3_column_int(statement, 19) != 0;
-            loaded->functions.push_back(record);
+            loaded.functions.push_back(record);
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11207,7 +11210,7 @@ workspace_result_t<void> load_relational_functions_blocks(
             record.instruction_count = static_cast<std::uint32_t>(sqlite3_column_int64(statement, 11));
             record.provenance = static_cast<fact_provenance_t>(sqlite3_column_int(statement, 12));
             record.confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 13));
-            loaded->blocks.push_back(record);
+            loaded.blocks.push_back(record);
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11226,7 +11229,7 @@ workspace_result_t<void> load_relational_functions_blocks(
             record.confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 13));
             record.cold = sqlite3_column_int(statement, 14) != 0;
             record.shared = sqlite3_column_int(statement, 15) != 0;
-            loaded->function_chunks.push_back(record);
+            loaded.function_chunks.push_back(record);
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11241,7 +11244,7 @@ workspace_result_t<void> load_relational_functions_blocks(
             record.block_index = static_cast<std::uint32_t>(sqlite3_column_int64(statement, 3));
             record.ordinal = static_cast<std::uint32_t>(sqlite3_column_int64(statement, 4));
             record.shared = sqlite3_column_int(statement, 5) != 0;
-            loaded->function_block_memberships.push_back(record);
+            loaded.function_block_memberships.push_back(record);
             return workspace_result_t<void>::success();
         });
     return result;
@@ -11256,7 +11259,7 @@ workspace_result_t<void> load_relational_edges_xrefs_call_graph(
         kMaximumInstructionChunkRecords, output.total_rows, maximum_records, cancel,
         "workspace_database.load.edges",
         [&loaded](const std::uint8_t* record_bytes) -> workspace_result_t<void> {
-            loaded->edges.push_back(decode_edge_chunk_record(record_bytes));
+            loaded.edges.push_back(decode_edge_chunk_record(record_bytes));
             return workspace_result_t<void>::success();
         });
     if (!edge_chunks)
@@ -11270,7 +11273,7 @@ workspace_result_t<void> load_relational_edges_xrefs_call_graph(
                 record_bytes, packed_xref_stream_record_bytes);
             if (!decoded)
                 return workspace_result_t<void>::failure(decoded.error());
-            loaded->xrefs.push_back(decoded.take_value());
+            loaded.xrefs.push_back(decoded.take_value());
             return workspace_result_t<void>::success();
         });
     if (!xref_chunks)
@@ -11291,7 +11294,7 @@ workspace_result_t<void> load_relational_edges_xrefs_call_graph(
             record.kind = static_cast<edge_kind_t>(sqlite3_column_int(statement, 11));
             record.provenance = static_cast<fact_provenance_t>(sqlite3_column_int(statement, 12));
             record.confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 13));
-            loaded->edges.push_back(record);
+            loaded.edges.push_back(record);
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11307,7 +11310,7 @@ workspace_result_t<void> load_relational_edges_xrefs_call_graph(
             record.kind = static_cast<xref_kind_t>(sqlite3_column_int(statement, 9));
             record.provenance = static_cast<fact_provenance_t>(sqlite3_column_int(statement, 10));
             record.confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 11));
-            loaded->xrefs.push_back(record);
+            loaded.xrefs.push_back(record);
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11321,11 +11324,11 @@ workspace_result_t<void> load_relational_edges_xrefs_call_graph(
         if (!result) return result;
         const int status = sqlite3_step(call_graph_state.get());
         if (status == SQLITE_ROW) {
-            loaded->call_graph.indirect_site_count = static_cast<std::uint64_t>(
+            loaded.call_graph.indirect_site_count = static_cast<std::uint64_t>(
                 sqlite3_column_int64(call_graph_state.get(), 0));
-            loaded->call_graph.unresolved_site_count = static_cast<std::uint64_t>(
+            loaded.call_graph.unresolved_site_count = static_cast<std::uint64_t>(
                 sqlite3_column_int64(call_graph_state.get(), 1));
-            loaded->call_graph.bounded = sqlite3_column_int(call_graph_state.get(), 2) != 0;
+            loaded.call_graph.bounded = sqlite3_column_int(call_graph_state.get(), 2) != 0;
         } else if (status != SQLITE_DONE) {
             return workspace_result_t<void>::failure(database_error(
                 database, status, "unable to read call-graph state",
@@ -11343,7 +11346,7 @@ workspace_result_t<void> load_relational_edges_xrefs_call_graph(
             record.outgoing_edges = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 6));
             record.indirect_edges = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 7));
             record.unresolved_sites = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 8));
-            loaded->call_graph.nodes.push_back(record);
+            loaded.call_graph.nodes.push_back(record);
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11362,7 +11365,7 @@ workspace_result_t<void> load_relational_edges_xrefs_call_graph(
             record.indirect = sqlite3_column_int(statement, 10) != 0;
             record.tail_call = sqlite3_column_int(statement, 11) != 0;
             record.unresolved = sqlite3_column_int(statement, 12) != 0;
-            loaded->call_graph.call_sites.push_back(record);
+            loaded.call_graph.call_sites.push_back(record);
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11384,7 +11387,7 @@ workspace_result_t<void> load_relational_edges_xrefs_call_graph(
             record.stable_source_id = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 12));
             record.rank = static_cast<std::uint32_t>(sqlite3_column_int64(statement, 13));
             record.external_target = sqlite3_column_int(statement, 14) != 0;
-            loaded->call_graph.candidates.push_back(record);
+            loaded.call_graph.candidates.push_back(record);
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11409,7 +11412,7 @@ workspace_result_t<void> load_relational_edges_xrefs_call_graph(
             record.candidate_rank = static_cast<std::uint32_t>(sqlite3_column_int64(statement, 18));
             record.external_target = sqlite3_column_int(statement, 19) != 0;
             record.target_noreturn = sqlite3_column_int(statement, 20) != 0;
-            loaded->call_graph.edges.push_back(record);
+            loaded.call_graph.edges.push_back(record);
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11427,7 +11430,7 @@ workspace_result_t<void> load_relational_edges_xrefs_call_graph(
             record.competing_target_rva = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 6));
             record.selected_target_function_id = static_cast<entity_id_t>(sqlite3_column_int64(statement, 7));
             record.competing_target_function_id = static_cast<entity_id_t>(sqlite3_column_int64(statement, 8));
-            loaded->call_graph.conflicts.push_back(record);
+            loaded.call_graph.conflicts.push_back(record);
             return workspace_result_t<void>::success();
         });
     return result;
@@ -11449,7 +11452,7 @@ workspace_result_t<void> load_relational_strings_symbols_coverage_rich(
             record.value = column_text(statement, 7);
             record.provenance = static_cast<fact_provenance_t>(sqlite3_column_int(statement, 8));
             record.confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 9));
-            loaded->strings.push_back(std::move(record));
+            loaded.strings.push_back(std::move(record));
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11464,7 +11467,7 @@ workspace_result_t<void> load_relational_strings_symbols_coverage_rich(
             record.kind = static_cast<symbol_kind_t>(sqlite3_column_int(statement, 6));
             record.provenance = static_cast<fact_provenance_t>(sqlite3_column_int(statement, 7));
             record.confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 8));
-            loaded->symbols.push_back(std::move(record));
+            loaded.symbols.push_back(std::move(record));
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11480,7 +11483,7 @@ workspace_result_t<void> load_relational_strings_symbols_coverage_rich(
             record.target = read_optional_address(statement, 7);
             record.provenance = static_cast<fact_provenance_t>(sqlite3_column_int(statement, 11));
             record.confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 12));
-            loaded->rich_facts.data_candidates.push_back(record);
+            loaded.rich_facts.data_candidates.push_back(record);
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11497,7 +11500,7 @@ workspace_result_t<void> load_relational_strings_symbols_coverage_rich(
             record.width_bytes = static_cast<std::uint8_t>(sqlite3_column_int(statement, 11));
             record.provenance = static_cast<fact_provenance_t>(sqlite3_column_int(statement, 12));
             record.confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 13));
-            loaded->rich_facts.data_pointer_facts.push_back(record);
+            loaded.rich_facts.data_pointer_facts.push_back(record);
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11515,7 +11518,7 @@ workspace_result_t<void> load_relational_strings_symbols_coverage_rich(
             record.rejected_provenance = static_cast<fact_provenance_t>(sqlite3_column_int(statement, 15));
             record.selected_confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 16));
             record.rejected_confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 17));
-            loaded->rich_facts.data_conflicts.push_back(record);
+            loaded.rich_facts.data_conflicts.push_back(record);
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11534,7 +11537,7 @@ workspace_result_t<void> load_relational_strings_symbols_coverage_rich(
             record.provenance = static_cast<metadata_provenance_t>(sqlite3_column_int(statement, 13));
             record.confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 14));
             record.explicitly_unknown = sqlite3_column_int(statement, 15) != 0;
-            loaded->rich_facts.type_candidates.push_back(std::move(record));
+            loaded.rich_facts.type_candidates.push_back(std::move(record));
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11552,7 +11555,7 @@ workspace_result_t<void> load_relational_strings_symbols_coverage_rich(
             record.provenance = static_cast<metadata_provenance_t>(sqlite3_column_int(statement, 12));
             record.confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 13));
             record.source_key = column_text(statement, 14);
-            loaded->rich_facts.type_references.push_back(std::move(record));
+            loaded.rich_facts.type_references.push_back(std::move(record));
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11571,7 +11574,7 @@ workspace_result_t<void> load_relational_strings_symbols_coverage_rich(
             record.rejected_provenance = static_cast<metadata_provenance_t>(sqlite3_column_int(statement, 10));
             record.selected_confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 11));
             record.rejected_confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 12));
-            loaded->rich_facts.metadata_conflicts.push_back(std::move(record));
+            loaded.rich_facts.metadata_conflicts.push_back(std::move(record));
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
@@ -11586,7 +11589,7 @@ workspace_result_t<void> load_relational_strings_symbols_coverage_rich(
             record.provenance = static_cast<fact_provenance_t>(sqlite3_column_int(statement, 6));
             record.confidence = static_cast<std::uint8_t>(sqlite3_column_int(statement, 7));
             record.detail_code = static_cast<std::uint32_t>(sqlite3_column_int64(statement, 8));
-            loaded->coverage.push_back(record);
+            loaded.coverage.push_back(record);
             return workspace_result_t<void>::success();
         });
     return result;

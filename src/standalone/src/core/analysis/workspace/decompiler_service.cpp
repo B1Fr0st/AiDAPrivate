@@ -1976,6 +1976,8 @@ workspace_result_t<decompiler_quality_result_t> run_decompiler_quality(
     return workspace_result_t<decompiler_quality_result_t>::success(std::move(quality));
 }
 
+}
+
 workspace_result_t<std::vector<workspace_result_t<decompiler_quality_batch_item_t>>>
 decompiler_service_t::decompile_quality_batch(
     const std::vector<address_t>& functions,
@@ -2134,6 +2136,8 @@ decompiler_service_t::decompile_quality_batch(
         functions.size(), resolved.size());
     return result_t::success(std::move(results));
 }
+
+namespace {
 
 workspace_error_t feedback_error(
     workspace_error_code_t code,

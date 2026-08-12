@@ -15,7 +15,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_program(AIDA_SCCACHE_PROGRAM sccache
     HINTS "${CMAKE_SOURCE_DIR}/sccache-v0.15.0-x86_64-pc-windows-msvc")
-if(AIDA_SCCACHE_PROGRAM)
+if(AIDA_SCCACHE_PROGRAM AND NOT DEFINED ENV{SCCACHE_DISABLE})
     message(STATUS "AiDA: sccache enabled for C++ at ${AIDA_SCCACHE_PROGRAM}")
     set(CMAKE_C_COMPILER_LAUNCHER   "" CACHE STRING "compiler launcher (disabled for C)" FORCE)
     set(CMAKE_CXX_COMPILER_LAUNCHER "${AIDA_SCCACHE_PROGRAM}" CACHE STRING "compiler launcher (sccache)" FORCE)
@@ -1912,7 +1912,7 @@ if(WIN32)
             "${CMAKE_BINARY_DIR}/aida_embedded.rc"
         )
         set_source_files_properties("${STANDALONE_ROOT}/core/runtime/kernel_symbols.cpp"
-            PROPERTIES CXX_STANDARD 20 SKIP_PRECOMPILE_HEADERS ON)
+            PROPERTIES COMPILE_OPTIONS "/std:c++20" SKIP_PRECOMPILE_HEADERS ON)
         set(_aida_c03_production_sources ${AIDA_C03_PRODUCTION_STANDALONE_SOURCES})
         list(REMOVE_ITEM _aida_c03_production_sources ${STANDALONE_SOURCES})
         list(REMOVE_DUPLICATES _aida_c03_production_sources)
@@ -2207,6 +2207,19 @@ if(WIN32)
         if(TARGET encrypt_drivers)
             add_dependencies(AiDAStandalone encrypt_drivers)
         endif()
+
+        if(TARGET ghidra_specs)
+            add_dependencies(AiDAStandalone ghidra_specs)
+        endif()
+
+        add_custom_command(TARGET AiDAStandalone POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/build-ninja/Release/WindMapper.exe"
+                "${CMAKE_BINARY_DIR}/AiDAWindMapper.exe"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/build-ninja/Release/WhosWho.sys"
+                "${CMAKE_BINARY_DIR}/WhosWho.sys"
+            COMMENT "Copying WindMapper and WhosWho.sys next to AiDAStandalone")
 
         add_executable(AiDAParserProof
             "${STANDALONE_ROOT}/core/testlab/parser_proof_runner.cpp"

@@ -6671,7 +6671,7 @@ nlohmann::json build_launch_args(const launch_config_t& cfg)
     if (!cfg.browser_executable.empty())
     {
         j["executable_path"] = cfg.browser_executable;
-        j["ff_version"] = 135;
+        j["ff_version"] = 152;
     }
     return j;
 }
@@ -10078,6 +10078,8 @@ bool start_bridge(const launch_config_t& cfg)
     emit_stage_timing(true, "ready", sg().child_pid);
     clear_sticky_setup_failure("start_bridge_ready");
     launch_guard.committed = true;
+    if (launch_guard.token_ptr && *launch_guard.token_ptr != 0)
+        release_launch_admission(*launch_guard.token_ptr, "start_bridge_ready", effective_cfg.session_id);
     return true;
 }
 

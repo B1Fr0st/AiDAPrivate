@@ -958,12 +958,15 @@ function(aida_c03_register_worker_targets application_target)
         "${STANDALONE_ROOT}/../workers/native_decompiler/native_decompiler_worker.cpp"
         "${STANDALONE_ROOT}/../workers/native_decompiler/ghidra_native_provider.cpp"
         "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_contracts.cpp"
+        "${STANDALONE_ROOT}/core/analysis/decompiler/legacy_document_adapter.cpp"
         "${STANDALONE_ROOT}/core/analysis/decompiler/providers/dalvik_ssa.cpp"
         "${STANDALONE_ROOT}/core/analysis/decompiler/providers/ghidra_ir_adapter.cpp"
         "${STANDALONE_ROOT}/core/analysis/decompiler/providers/jvm_ssa.cpp"
         "${STANDALONE_ROOT}/core/analysis/decompiler/pseudocode_readability.cpp"
         "${STANDALONE_ROOT}/core/analysis/decompiler/pseudocode_renderer.cpp"
         "${STANDALONE_ROOT}/core/analysis/decompiler/typed_ast.cpp"
+        "${STANDALONE_ROOT}/core/analysis/decompiler/type_graph_builder.cpp"
+        "${STANDALONE_ROOT}/core/analysis/decompiler/metadata_provenance.cpp"
         "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_pretty_xml_encode.cpp"
         "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_function_db.cpp"
         "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_load_image.cpp"
@@ -972,13 +975,16 @@ function(aida_c03_register_worker_targets application_target)
         "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_scope.cpp"
         "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_architecture.cpp"
         "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_code_xml_parse.cpp"
+        "${STANDALONE_ROOT}/core/infra/allocator.cpp"
+        "${STANDALONE_ROOT}/core/infra/host_topology.cpp"
         "${STANDALONE_ROOT}/core/analysis/workspace/workspace_identity.cpp")
     aida_c03_require_sources("B14 native decompiler worker" ${_aida_native_sources})
     add_executable(aida_c03_b14_native_decompiler_worker ${_aida_native_sources})
     aida_c03_configure_native_target(aida_c03_b14_native_decompiler_worker)
     target_compile_definitions(aida_c03_b14_native_decompiler_worker PRIVATE
         AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER=1)
-    target_link_libraries(aida_c03_b14_native_decompiler_worker PRIVATE libdecomp_aida bcrypt advapi32 userenv ws2_32)
+    target_link_libraries(aida_c03_b14_native_decompiler_worker PRIVATE libdecomp_aida bcrypt advapi32 userenv ws2_32 zlibstatic mimalloc-static)
+    target_include_directories(aida_c03_b14_native_decompiler_worker PRIVATE ${DEPS_DIR}/mimalloc/include)
     target_link_options(aida_c03_b14_native_decompiler_worker PRIVATE /ENTRY:wmainCRTStartup)
     set_target_properties(aida_c03_b14_native_decompiler_worker PROPERTIES
         OUTPUT_NAME "AiDA_NativeDecompilerWorker"
@@ -1167,7 +1173,7 @@ function(aida_c03_register_safe_headless_targets application_target)
         _aida_system_powershell_sha256
         "${_aida_system_root}/System32/WindowsPowerShell/v1.0/powershell.exe"
         "Windows system PowerShell interpreter")
-    set(_aida_authority_archive "C:/Users/ruar1337/ida-pro-mcp.zip")
+    set(_aida_authority_archive "C:/Users/tyler/Downloads/ida-pro-mcp.zip")
     aida_c03_validate_canonical_regular_file(
         _aida_authority_archive
         _aida_authority_archive_sha256
@@ -1258,6 +1264,7 @@ function(aida_c03_register_safe_headless_targets application_target)
         "${CMAKE_SOURCE_DIR}/src/emulation_engine.cpp")
     list(APPEND _aida_runtime_sources
         "${AIDA_C03_TEST_ROOT}/testlab_runtime/safe_headless_emulation_bridge.cpp"
+        "${STANDALONE_ROOT}/core/runtime/kernel_symbols.cpp"
         "${imgui_SOURCE_DIR}/imgui.cpp"
         "${imgui_SOURCE_DIR}/imgui_draw.cpp"
         "${imgui_SOURCE_DIR}/imgui_tables.cpp"
@@ -1279,7 +1286,10 @@ function(aida_c03_register_safe_headless_targets application_target)
         "${STANDALONE_ROOT}/core/scanner"
         "${STANDALONE_ROOT}/core/session"
         "${STANDALONE_ROOT}/core/tools"
-        "${sol2_SOURCE_DIR}/include")
+        "${sol2_SOURCE_DIR}/include"
+        "${DEPS_DIR}/MemPDB/include")
+    set_source_files_properties("${STANDALONE_ROOT}/core/runtime/kernel_symbols.cpp"
+        PROPERTIES COMPILE_OPTIONS "/std:c++20" SKIP_PRECOMPILE_HEADERS ON)
     target_compile_definitions(aida_c03_safe_headless_runtime PRIVATE
         AIDA_C03_SAFE_HEADLESS_RUNTIME=1
         CPPHTTPLIB_OPENSSL_SUPPORT)
@@ -1290,6 +1300,7 @@ function(aida_c03_register_safe_headless_targets application_target)
         brotlidec brotlienc brotlicommon llhttp_static nghttp2_static lua54_static
         aida_openssl_ssl_mt aida_openssl_crypto_mt
         mimalloc-static
+        MemPDB
         bcrypt crypt32 advapi32 userenv ws2_32 shell32 ole32 Shlwapi
         cabinet cfgmgr32 dnsapi gdiplus iphlpapi ntdll Psapi setupapi version winhttp wintrust)
     set_target_properties(aida_c03_safe_headless_runtime PROPERTIES

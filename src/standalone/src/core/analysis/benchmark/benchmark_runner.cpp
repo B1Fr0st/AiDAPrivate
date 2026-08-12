@@ -2247,7 +2247,7 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
             if (counters == metrics.end() || !counters->is_object())
                 return nullptr;
             const auto entry = counters->find(name);
-            if (entry == counters.end() || !entry->is_number())
+            if (entry == counters->end() || !entry->is_number())
                 return nullptr;
             return *entry;
         };

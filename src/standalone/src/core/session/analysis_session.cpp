@@ -594,6 +594,7 @@ using aida::analysis::analysis_workspace_t;
 using aida::analysis::baseline_analysis_service_t;
 using aida::analysis::baseline_analysis_settings_t;
 using aida::analysis::cancellation_token_t;
+using aida::analysis::decompile_batch_orchestrator_t;
 using aida::analysis::decompiler_service_t;
 using aida::analysis::make_workspace_error;
 using aida::analysis::open_live_workspace_request_t;

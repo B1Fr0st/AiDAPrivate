@@ -966,7 +966,7 @@ void verify_ternary_formation_fixtures(const decompiler_entity_key_t& entity_val
             count_kind(ast, typed_pseudocode_ast_node_kind_t::if_statement) == 0,
         "ternary assign form left an if or wrong conditional count");
     {
-        const auto* conditional = nullptr;
+        const typed_pseudocode_ast_node_t* conditional = nullptr;
         for (const auto& value : ast.nodes) {
             if (value.kind == typed_pseudocode_ast_node_kind_t::conditional_expression)
                 conditional = &value;
@@ -1042,7 +1042,7 @@ void verify_ternary_formation_fixtures(const decompiler_entity_key_t& entity_val
     require(count_kind(ast, typed_pseudocode_ast_node_kind_t::conditional_expression) == 0,
         "min/max precedence fixture produced a conditional expression");
     {
-        const auto* call = nullptr;
+        const typed_pseudocode_ast_node_t* call = nullptr;
         for (const auto& value : ast.nodes) {
             if (value.kind == typed_pseudocode_ast_node_kind_t::call_expression)
                 call = &value;

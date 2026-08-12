@@ -858,6 +858,8 @@ void verify_per_query_isolation_under_concurrency()
         }), "per-query isolation leaked facts across concurrent refine calls");
 }
 
+}
+
 void run_semantic_refiner_harness()
 {
     verify_thorough_only_no_baseline_invocation();
@@ -875,8 +877,6 @@ void run_semantic_refiner_harness()
     verify_concurrent_refine_completion();
     verify_slot_pool_exhaustion_denial();
     verify_per_query_isolation_under_concurrency();
-}
-
 }
 
 }

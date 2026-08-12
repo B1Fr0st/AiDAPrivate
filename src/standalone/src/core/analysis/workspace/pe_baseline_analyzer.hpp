@@ -121,8 +121,9 @@ public:
     void request_cancel() noexcept;
     void report_failure(const workspace_error_t& error) noexcept;
 
-private:
     struct impl_t;
+
+private:
     explicit pe_baseline_analyzer_t(std::unique_ptr<impl_t> impl);
     std::unique_ptr<impl_t> impl_;
 };

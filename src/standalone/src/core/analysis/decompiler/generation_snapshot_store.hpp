@@ -31,7 +31,7 @@ public:
         void* mapping_handle = nullptr;
         std::uint64_t mapping_size = 0;
         std::uint64_t publish_tick = 0;
-        std::atomic<std::uint32_t> pins{0};
+        mutable std::atomic<std::uint32_t> pins{0};
 
         entry_t() = default;
         entry_t(const entry_t&) = delete;

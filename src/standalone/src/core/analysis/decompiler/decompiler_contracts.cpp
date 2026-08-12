@@ -2781,7 +2781,7 @@ decompiler_contract_decode_result_t<decompiler_document_t> deserialize_decompile
             read_vector(reader, decoded.tokens, read_document_token) &&
             read_vector(reader, decoded.source_maps, read_document_source_map) &&
             read_vector(reader, decoded.unknowns, read_unknown) && read_vector(reader, decoded.diagnostics, read_diagnostic);
-    }, validate_decompiler_document);
+    }, [](const decompiler_document_t& v) { return validate_decompiler_document(v); });
 }
 
 decompiler_contract_decode_result_t<decompiler_diagnostic_t> deserialize_decompiler_diagnostic(const std::string& value)

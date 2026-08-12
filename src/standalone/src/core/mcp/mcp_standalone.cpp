@@ -2573,7 +2573,7 @@ namespace
         {
             using domain_t = aida::infra::taskflow_runtime::executor_domain_t;
             if (name.rfind("mcp_http", 0) == 0)
-                return domain_t::service;
+                return domain_t::critical;
             if (name.rfind("mcp_jsonrpc_batch", 0) == 0 || name.rfind("mcp_tool", 0) == 0 || name.rfind("mcp_domain_", 0) == 0)
                 return domain_t::external_tool;
             return domain_t::external_tool;
@@ -3681,8 +3681,14 @@ namespace
 
 static std::string json_dump_safe(const json& j, int indent)
 {
-    try { return j.dump(indent); }
-    catch (...) { return "{}"; }
+    try { return j.dump(indent, '\t', false, nlohmann::json::error_handler_t::replace); }
+    catch (const std::exception& e) {
+        diag::log_tagged_fmt("mcp_srv", "json_dump_safe exception what='%s' type=json_dump", e.what());
+        return "{}";
+    } catch (...) {
+        diag::log_tagged_fmt("mcp_srv", "json_dump_safe unknown_exception type=json_dump");
+        return "{}";
+    }
 }
 
 void set_ide_lifecycle_ready(bool ready) noexcept

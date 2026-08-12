@@ -196,7 +196,7 @@ inline void ensure_started() noexcept {
 
 }
 
-watch_id_t register_watch(watch_descriptor_t desc) noexcept {
+inline watch_id_t register_watch(watch_descriptor_t desc) noexcept {
     watch_id_t id;
     if (!desc.on_fire)
         return id;
@@ -234,7 +234,7 @@ watch_id_t register_watch(watch_descriptor_t desc) noexcept {
     return id;
 }
 
-bool unregister_watch(watch_id_t id) noexcept {
+inline bool unregister_watch(watch_id_t id) noexcept {
     if (!id.valid() || id.slot >= watch_capacity)
         return false;
     detail::watch_registry_t& reg = detail::registry();
@@ -255,19 +255,19 @@ bool unregister_watch(watch_id_t id) noexcept {
     return true;
 }
 
-std::uint64_t last_sweep_lag_ms() noexcept {
+inline std::uint64_t last_sweep_lag_ms() noexcept {
     return detail::registry().last_sweep_lag_ms.load(std::memory_order_acquire);
 }
 
-std::uint64_t last_sweep_duration_ms() noexcept {
+inline std::uint64_t last_sweep_duration_ms() noexcept {
     return detail::registry().last_sweep_duration_ms.load(std::memory_order_acquire);
 }
 
-std::uint64_t registered_watch_count() noexcept {
+inline std::uint64_t registered_watch_count() noexcept {
     return detail::registry().registered_count.load(std::memory_order_acquire);
 }
 
-std::uint64_t fired_watch_count() noexcept {
+inline std::uint64_t fired_watch_count() noexcept {
     return detail::registry().fired_count.load(std::memory_order_acquire);
 }
 

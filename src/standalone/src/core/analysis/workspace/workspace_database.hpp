@@ -241,11 +241,11 @@ public:
     void expect_complete_baseline() noexcept;
     void discard(workspace_error_t error) noexcept;
 
-private:
     struct state_t;
-    explicit workspace_snapshot_staging_t(std::shared_ptr<state_t> state);
-
     std::shared_ptr<state_t> state_;
+
+private:
+    explicit workspace_snapshot_staging_t(std::shared_ptr<state_t> state);
 
     friend class workspace_database_t;
 };

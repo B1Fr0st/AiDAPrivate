@@ -6,6 +6,7 @@
 #include "comm.h"
 #include "win_thread.hpp"
 #include "../infra/executor.hpp"
+#include "../infra/event_bus.hpp"
 #include "../mcp/mcp_standalone.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../diagnostics/metadata_ring.hpp"

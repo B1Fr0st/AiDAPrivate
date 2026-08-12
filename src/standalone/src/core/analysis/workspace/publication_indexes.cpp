@@ -2725,6 +2725,7 @@ void append_timing(std::string& detail, const char* family,
 }
 
 bool differential_selftest(std::string& detail) {
+    using namespace selftest;
     bool pass = true;
     detail += "publication_indexes differential selftest\n";
     struct scale_case_t {

@@ -3,7 +3,7 @@
 #include "../c03/analysis_memory_provider.hpp"
 
 #include "../../src/core/analysis/workspace/parallel_pass.hpp"
-#include "../../src/core/analysis/workspace/provider_snapshot.hpp"
+#include "../../src/core/analysis/workspace/byte_provider.hpp"
 #include "../../src/core/analysis/workspace/query_index.hpp"
 #include "../../src/core/analysis/workspace/search_index.hpp"
 

@@ -477,7 +477,8 @@ recovery_fixture_t build_recovery_fixture(bool reverse_seed_order)
     memory_provider_t provider(std::vector<std::uint8_t>(
         static_cast<std::size_t>(fixture.normalized_image.provider_size), 0));
     fixture.recovery = require_value(function_recovery_t::recover(
-        fixture.normalized_image, provider, fixture.instructions, {}, fixture.targets,
+        fixture.normalized_image, provider, fixture.instructions,
+        std::vector<operand_fact_t>{}, fixture.targets,
         evidence, {}, limits, {}), "function recovery fixture failed");
     return fixture;
 }
@@ -577,7 +578,8 @@ void test_image_endpoint_known_end()
     memory_provider_t provider(std::vector<std::uint8_t>(
         static_cast<std::size_t>(normalized.provider_size), 0));
     const auto recovered = require_value(function_recovery_t::recover(
-        normalized, provider, instructions, {}, targets, evidence, {}, limits, {}),
+        normalized, provider, instructions,
+        std::vector<operand_fact_t>{}, targets, evidence, {}, limits, {}),
         "image-endpoint recovery failed");
     const auto& function = function_at(recovered, 0x1fff);
     require(function.end.value == normalized.image_size &&
@@ -614,7 +616,8 @@ void test_contiguous_owner_shared_tail_publication()
     memory_provider_t provider(std::vector<std::uint8_t>(
         static_cast<std::size_t>(normalized.provider_size), 0));
     const auto recovered = require_value(function_recovery_t::recover(
-        normalized, provider, instructions, {}, targets, evidence, {}, limits, {}),
+        normalized, provider, instructions,
+        std::vector<operand_fact_t>{}, targets, evidence, {}, limits, {}),
         "contiguous shared-tail recovery failed");
     const auto& owner_function = function_at(recovered, 0x1010);
     const auto owner_chunk_end = static_cast<std::uint64_t>(owner_function.first_chunk) +
@@ -690,7 +693,8 @@ void test_delay_slots()
     memory_provider_t provider(std::vector<std::uint8_t>(
         static_cast<std::size_t>(normalized.provider_size), 0));
     const auto recovered = require_value(function_recovery_t::recover(
-        normalized, provider, instructions, {}, targets, evidence, delays, limits, {}),
+        normalized, provider, instructions,
+        std::vector<operand_fact_t>{}, targets, evidence, delays, limits, {}),
         "delay-slot production recovery failed");
     auto snapshot = recovery_snapshot(normalized, instructions, targets, recovered, delays);
     const auto validated = validate_analysis_snapshot(snapshot, false, {});

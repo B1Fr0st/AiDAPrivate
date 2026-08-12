@@ -425,6 +425,12 @@ void apply_resolution_outcomes(
     }
 }
 
+void reapply_tab_local_renames(
+    aida::workbench::pseudocode_document::pseudocode_document_model_t& model,
+    tab_t& tab,
+    const std::shared_ptr<state_t>& state,
+    const aida::analysis::binary_id_t& binary_id);
+
 void refresh_tab_states(
     aida::workbench::pseudocode_document::pseudocode_document_model_t& model,
     const std::shared_ptr<state_t>& state)

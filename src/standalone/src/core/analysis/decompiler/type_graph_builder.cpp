@@ -1223,7 +1223,7 @@ type_graph_index_t build_type_graph_index(const type_graph_t& graph)
     for (std::uint32_t edge_index = 0; edge_index < graph.edges.size(); ++edge_index) {
         const auto& edge = graph.edges[edge_index];
         if (edge.kind == decompiler_type_edge_kind_t::member && edge.byte_offset.has_value()) {
-            const state_t::member_key_t key{edge.source_type_id, *edge.byte_offset};
+            const type_graph_index_t::state_t::member_key_t key{edge.source_type_id, *edge.byte_offset};
             const auto found = state.member_by_offset.find(key);
             if (found == state.member_by_offset.end()) {
                 state.member_by_offset.emplace(key, edge_index);

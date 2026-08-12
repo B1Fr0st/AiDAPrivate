@@ -2585,7 +2585,7 @@ void await_persistent_inflight(
         if (op.operation_cancel.stop_requested() || budget <= std::chrono::milliseconds(0))
             return;
         const auto slice = (std::min)(budget, std::chrono::milliseconds(25));
-        if (task.cv.wait_for(lock, slice, [&task] { return task.done; }))
+        if (task.cv.wait_for(lock, slice, [&task] { return task.done.load(); }))
             return;
         budget -= slice;
         if (op.operation_deadline != std::chrono::steady_clock::time_point::max() &&

@@ -1616,6 +1616,17 @@ workspace_result_t<std::vector<function_seed_t>> function_recovery_t::converge_s
 namespace {
 
 template <typename Operands>
+workspace_result_t<function_recovery_result_t> finalize_cfg_calls_with_operands(
+    const workspace_image_t& image,
+    const byte_provider_t& provider,
+    const std::vector<instruction_record_t>& instructions,
+    const Operands&,
+    const std::vector<target_fact_t>& targets,
+    function_recovery_result_t result,
+    const function_recovery_limits_t& limits,
+    const cancellation_token_t& cancel);
+
+template <typename Operands>
 workspace_result_t<function_recovery_result_t> recover_with_operands(
     const workspace_image_t& image,
     const byte_provider_t& provider,
@@ -1627,15 +1638,15 @@ workspace_result_t<function_recovery_result_t> recover_with_operands(
     const function_recovery_limits_t& limits,
     const cancellation_token_t& cancel)
 {
-    auto seeds = converge_seed_sources(image, targets, evidence, limits, cancel);
+    auto seeds = function_recovery_t::converge_seed_sources(image, targets, evidence, limits, cancel);
     if (!seeds)
         return workspace_result_t<function_recovery_result_t>::failure(seeds.error());
     const auto converged_seed_count = static_cast<std::uint64_t>(seeds.value().size());
-    auto blocks = build_blocks(image, instructions, targets, seeds.value(),
+    auto blocks = function_recovery_t::build_blocks(image, instructions, targets, seeds.value(),
         delay_slot_counts, limits, cancel);
     if (!blocks)
         return workspace_result_t<function_recovery_result_t>::failure(blocks.error());
-    auto functions = recover_functions(image, instructions, seeds.value(),
+    auto functions = function_recovery_t::recover_functions(image, instructions, seeds.value(),
         blocks.take_value(), limits, cancel);
     if (!functions)
         return workspace_result_t<function_recovery_result_t>::failure(functions.error());

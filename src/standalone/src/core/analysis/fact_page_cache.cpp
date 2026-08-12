@@ -300,7 +300,7 @@ bool fact_page_cache_t::insert(const fact_page_key_t& key,
                 return true;
             }
         }
-        if (!evict_one_approx(hint)) {
+        if (!state_->evict_one_approx(hint)) {
             state_->admission_rejections.fetch_add(1, std::memory_order_relaxed);
             provider_metrics_relay::record_budget_rejection();
             return false;
@@ -373,7 +373,7 @@ void fact_page_cache_t::set_ceiling(std::uint64_t bytes) noexcept {
     std::size_t guard = 0;
     while (state_->resident_bytes.load(std::memory_order_acquire) > bounded &&
            guard < state_->shards.size() * 4U) {
-        if (!evict_one_approx(guard % state_->shards.size()))
+        if (!state_->evict_one_approx(guard % state_->shards.size()))
             break;
         ++guard;
     }

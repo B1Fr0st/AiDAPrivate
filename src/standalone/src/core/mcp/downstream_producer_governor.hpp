@@ -90,7 +90,7 @@ struct producer_quota_set_t
 
     std::size_t global_active_camoufox_longops = 2;
     std::size_t per_principal_active_camoufox_longops = 1;
-    std::size_t per_session_active_camoufox_longops = 1;
+    std::size_t per_session_active_camoufox_longops = 2;
 
     std::size_t global_active_driver_debugger = 4;
     std::size_t per_principal_active_driver_debugger = 2;

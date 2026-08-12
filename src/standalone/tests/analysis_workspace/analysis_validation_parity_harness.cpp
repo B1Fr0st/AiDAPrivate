@@ -731,25 +731,25 @@ void verify_valid_fixtures() {
     for (const std::uint32_t workers : {0U, 1U, 8U}) {
         auto snapshot = make_fixture({});
         auto result = validate_analysis_snapshot_parallel(*snapshot, true, workers, {});
-        require(result, "valid fixture failed validation at workers=" +
+        require(static_cast<bool>(result), "valid fixture failed validation at workers=" +
             std::to_string(workers) + ": " +
             (result ? std::string() : result.error().message));
         auto relaxed = validate_analysis_snapshot_parallel(*snapshot, false,
             workers, {});
-        require(relaxed, "valid fixture failed relaxed validation at workers=" +
+        require(static_cast<bool>(relaxed), "valid fixture failed relaxed validation at workers=" +
             std::to_string(workers));
         auto delay_snapshot = make_fixture(fixture_params_t{64U, 8U, 5U, true});
         auto delay_result = validate_analysis_snapshot_parallel(*delay_snapshot,
             true, workers, {});
-        require(delay_result, "valid delay-slot fixture failed validation at workers=" +
+        require(static_cast<bool>(delay_result), "valid delay-slot fixture failed validation at workers=" +
             std::to_string(workers) + ": " +
             (delay_result ? std::string() : delay_result.error().message));
         auto rich = validate_rich_fact_publication_parallel(*snapshot,
             snapshot->rich_facts, workers, {});
-        require(rich, "valid rich facts failed at workers=" + std::to_string(workers));
+        require(static_cast<bool>(rich), "valid rich facts failed at workers=" + std::to_string(workers));
         auto graph = validate_call_graph_publication_parallel(*snapshot,
             snapshot->call_graph, workers, {});
-        require(graph, "valid call graph failed at workers=" + std::to_string(workers));
+        require(static_cast<bool>(graph), "valid call graph failed at workers=" + std::to_string(workers));
     }
     fixture_params_t large;
     large.function_count = 2048;
@@ -757,7 +757,7 @@ void verify_valid_fixtures() {
     for (const std::uint32_t workers : {1U, 8U}) {
         auto snapshot = make_fixture(large);
         auto result = validate_analysis_snapshot_parallel(*snapshot, true, workers, {});
-        require(result, "large valid fixture failed validation at workers=" +
+        require(static_cast<bool>(result), "large valid fixture failed validation at workers=" +
             std::to_string(workers) + ": " +
             (result ? std::string() : result.error().message));
     }
@@ -843,7 +843,7 @@ void verify_coverage_scaling_diagnostic() {
                 workers, {});
             const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 harness_log_t::clock_t::now() - started).count();
-            require(result, "coverage scaling fixture failed at workers=" +
+            require(static_cast<bool>(result), "coverage scaling fixture failed at workers=" +
                 std::to_string(workers));
             harness_log_t::emit("validation_parity", "coverage_scaling", "pass",
                 static_cast<std::uint64_t>(elapsed_ms),

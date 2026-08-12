@@ -74,7 +74,7 @@ namespace kernel_symbols
 
         struct snapshot_t
         {
-            MemPDB::PDB                 pdb;
+            std::optional<MemPDB::PDB>  pdb;
             std::uint64_t               module_base = 0;
             std::uint64_t               module_size = 0;
             std::vector<symbol_entry_t> by_va;
@@ -790,13 +790,13 @@ namespace kernel_symbols
                 if (!generation_current(gen))
                 {
                     finish_load(gen, state_t::failed, "stale", "load superseded before parse",
-                        elapsed_ms(), nullptr, 0, false, 0, 0, 0);
+                        nullptr, elapsed_ms(), false, 0, 0, 0);
                     return;
                 }
                 if (cancel_requested())
                 {
                     finish_load(gen, state_t::failed, "cancelled",
-                        "load cancelled by runtime shutdown", elapsed_ms(), nullptr, 0,
+                        "load cancelled by runtime shutdown", nullptr, elapsed_ms(),
                         false, 0, 0, 0);
                     return;
                 }
@@ -839,13 +839,13 @@ namespace kernel_symbols
                 if (!generation_current(gen))
                 {
                     finish_load(gen, state_t::failed, "stale", "load superseded after parse",
-                        elapsed_ms(), nullptr, 0, false, 0, 0, 0);
+                        nullptr, elapsed_ms(), false, 0, 0, 0);
                     return;
                 }
                 if (cancel_requested())
                 {
                     finish_load(gen, state_t::failed, "cancelled",
-                        "load cancelled by runtime shutdown", elapsed_ms(), nullptr, 0,
+                        "load cancelled by runtime shutdown", nullptr, elapsed_ms(),
                         false, 0, 0, 0);
                     return;
                 }
@@ -1091,9 +1091,9 @@ namespace kernel_symbols
         if (!snap)
             return std::nullopt;
         std::uint64_t rva = 0;
-        if (const auto fn = snap->pdb.TryResolveFunction(name))
+        if (const auto fn = snap->pdb->TryResolveFunction(name))
             rva = fn->RVA;
-        else if (const auto gl = snap->pdb.TryResolveGlobal(name))
+        else if (const auto gl = snap->pdb->TryResolveGlobal(name))
             rva = gl->RVA;
         else
             return std::nullopt;
@@ -1107,9 +1107,9 @@ namespace kernel_symbols
         const auto snap = current_snapshot();
         if (!snap)
             return std::nullopt;
-        std::optional<MemPDB::Struct> layout = snap->pdb.TryResolveStruct(name);
+        std::optional<MemPDB::Struct> layout = snap->pdb->TryResolveStruct(name);
         if (!layout && name.front() != '_')
-            layout = snap->pdb.TryResolveStruct("_" + name);
+            layout = snap->pdb->TryResolveStruct("_" + name);
         if (!layout)
             return std::nullopt;
         struct_desc_t out;

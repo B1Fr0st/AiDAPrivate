@@ -214,6 +214,8 @@ public:
 private:
     struct state_t;
     std::unique_ptr<state_t> state_;
+
+    friend type_graph_index_t build_type_graph_index(const type_graph_t&);
 };
 
 type_graph_index_t build_type_graph_index(const type_graph_t& graph);
