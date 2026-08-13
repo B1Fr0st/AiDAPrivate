@@ -329,14 +329,14 @@ namespace aida::ui {
 		r.accent_grad_bot = detail::u32_from_v4(sc[ImGuiCol_CheckMark]);
 	}
 
-	inline void apply(const theme_t& t) {
-		apply_immediate(t);
-	}
-
 	inline void apply_immediate(const theme_t& t) {
 		detail::s_resolved = t;
 		apply_imgui_style(t);
 		detail::s_theme_generation.fetch_add(1u, std::memory_order_release);
+	}
+
+	inline void apply(const theme_t& t) {
+		apply_immediate(t);
 	}
 
 	inline void tick_theme_animation(float) {}

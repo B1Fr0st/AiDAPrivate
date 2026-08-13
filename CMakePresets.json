@@ -16,7 +16,8 @@
         "AIDA_ENABLE_LTCG": "OFF",
         "AIDA_FAST_LINK":   "ON",
         "AIDA_CAMOUFOX_BUILD_REVERSE_MCP_EXE": "ON",
-        "AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS": "ON"
+        "AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS": "ON",
+        "BUILD_AIDA_PLUGIN": "OFF"
       },
       "environment": {
         "SCCACHE_DIR":             "${sourceDir}/.sccache",

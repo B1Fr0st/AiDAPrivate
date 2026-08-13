@@ -1826,7 +1826,6 @@ if(WIN32)
             "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
             "${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp"
             "${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp"
-            "${imgui_SOURCE_DIR}/misc/freetype/imgui_freetype.cpp"
         )
 
         set(STANDALONE_ASM driver/syscall.asm)
@@ -1952,7 +1951,6 @@ if(WIN32)
             "${imgui_SOURCE_DIR}/backends"
             "${lua_src_SOURCE_DIR}"
             "${sol2_SOURCE_DIR}/include"
-            "${STANDALONE_ROOT}/freetype/include"
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/cpp-httplib"
             "${CMAKE_CURRENT_SOURCE_DIR}/libs"
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -1985,7 +1983,6 @@ if(WIN32)
             CPPHTTPLIB_OPENSSL_SUPPORT
             NOMINMAX
             WIN32_LEAN_AND_MEAN
-            IMGUI_ENABLE_FREETYPE
             IMGUI_ENABLE_STB_TRUETYPE
             UNICODE
             _UNICODE
@@ -2079,10 +2076,6 @@ if(WIN32)
             "$<$<COMPILE_LANGUAGE:CXX>:<cstdlib$<ANGLE-R>>"
         )
 
-        target_link_directories(AiDAStandalone PRIVATE
-            "${STANDALONE_ROOT}/freetype/lib/x64"
-        )
-
         target_link_libraries(AiDAStandalone PRIVATE
             Zydis
             unicorn
@@ -2093,7 +2086,6 @@ if(WIN32)
             mimalloc-static
             nlohmann_json_schema_validator::validator
             libdecomp_aida
-            freetype
             zlibstatic
             libzstd_static
             liblzma

@@ -3160,7 +3160,6 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                         ImGuiSelectableFlags_AllowItemOverlap;
                     ImU32 dim_col = aida::ui::with_alpha(th.text_dim, r_alpha);
                     float row_h = ImGui::GetTextLineHeight() + ImGui::GetStyle().CellPadding.y * 2.f;
-                    ImGuiSelectableFlags sel_flags =
                     if (ImGui::Selectable("##row_select", selected, sel_flags, ImVec2(0.f, row_h))) {
                         pending_selection = row.packet_index;
                         cap_snapshot.selected_index = row.packet_index;
