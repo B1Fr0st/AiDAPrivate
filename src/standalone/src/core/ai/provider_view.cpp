@@ -1392,10 +1392,7 @@ namespace {
 			const std::string raw = raw_model_json_for(st.selected_detail_provider_id, mid);
 			ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + (detail_actions_stack ? 326.f : 268.f)));
 			ImGui::PushTextWrapPos(a.x + pane_w - 14.f);
-			ImGui::PushStyleColor(ImGuiCol_Text,
-				ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)));
 			ImGui::TextUnformatted(raw.c_str());
-			ImGui::PopStyleColor();
 			ImGui::PopTextWrapPos();
 		}
 

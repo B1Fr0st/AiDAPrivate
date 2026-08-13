@@ -876,17 +876,11 @@ void render_install_panel(float pos_x, float pos_y, float width, float& consumed
     int idx = 0;
     for (const auto& line : snap) {
         float ra = ui_anim::render_row_entrance(idx, g_state.anim_time, 0.012f);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-            aida::ui::with_alpha(th.text_secondary, alpha * ra)));
         ImGui::TextUnformatted(line.c_str());
-        ImGui::PopStyleColor();
         ++idx;
     }
     if (snap.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-            aida::ui::with_alpha(th.text_dim, alpha)));
         ImGui::TextUnformatted("No install output yet.");
-        ImGui::PopStyleColor();
     }
     if (g_state.install_log_dirty.exchange(false, std::memory_order_acq_rel)) {
         ImGui::SetScrollHereY(1.f);
@@ -1067,13 +1061,8 @@ void render_page_info_section(const aida::ui::theme_t& th, float alpha)
         errs         = g_state.bridge_status.total_errors;
     }
 
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-        aida::ui::with_alpha(th.text_secondary, alpha)));
     ImGui::TextUnformatted("Current page info");
-    ImGui::PopStyleColor();
 
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-        aida::ui::with_alpha(th.text_primary, alpha)));
     ImGui::Text("URL:       %s", url.empty() ? "-" : url.c_str());
     ImGui::Text("Browser:   %s", browser_open ? "open" : "closed");
     ImGui::Text("Calls:     %llu  errors=%llu",
@@ -1083,7 +1072,6 @@ void render_page_info_section(const aida::ui::theme_t& th, float alpha)
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.error, alpha)),
                            "Err: %s", last_err.c_str());
     }
-    ImGui::PopStyleColor();
 }
 
 std::string console_row_summary(const nlohmann::json& j)
@@ -1145,10 +1133,7 @@ void render_console_section(const aida::ui::theme_t& th, float alpha, float regi
         std::memory_order_acquire);
     const std::uint64_t sig = g_state.console_cache_signature.load(std::memory_order_acquire);
 
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-        aida::ui::with_alpha(th.text_secondary, alpha)));
     ImGui::TextUnformatted("Console logs");
-    ImGui::PopStyleColor();
     ImGui::SameLine();
     ImGui::Checkbox("auto-scroll##headless_console", &g_state.console_autoscroll);
     ImGui::SameLine();
@@ -1180,10 +1165,7 @@ void render_console_section(const aida::ui::theme_t& th, float alpha, float regi
             }
         }
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-            aida::ui::with_alpha(th.text_dim, alpha)));
         ImGui::TextUnformatted("(no console messages)");
-        ImGui::PopStyleColor();
     }
 
     static std::uint64_t s_last_sig = 0;
@@ -1235,10 +1217,7 @@ void render_network_section(const aida::ui::theme_t& th, float alpha, float regi
         std::memory_order_acquire);
     const std::uint64_t sig = g_state.network_cache_signature.load(std::memory_order_acquire);
 
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-        aida::ui::with_alpha(th.text_secondary, alpha)));
     ImGui::TextUnformatted("Network requests");
-    ImGui::PopStyleColor();
     ImGui::SameLine();
     ImGui::Checkbox("auto-scroll##headless_net", &g_state.network_autoscroll);
     ImGui::SameLine();
@@ -1286,10 +1265,7 @@ void render_network_section(const aida::ui::theme_t& th, float alpha, float regi
             }
         }
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-            aida::ui::with_alpha(th.text_dim, alpha)));
         ImGui::TextUnformatted("(no requests)");
-        ImGui::PopStyleColor();
     }
     static std::uint64_t s_last_sig_n = 0;
     if (g_state.network_autoscroll) {
@@ -1304,10 +1280,7 @@ void render_network_section(const aida::ui::theme_t& th, float alpha, float regi
 
 void render_eval_repl(const aida::ui::theme_t& th, float alpha, float width_avail)
 {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-        aida::ui::with_alpha(th.text_secondary, alpha)));
     ImGui::TextUnformatted("Evaluate JS");
-    ImGui::PopStyleColor();
 
     const float input_h = ImGui::GetFrameHeight() * 8.f;
     ImGui::InputTextMultiline("##headless_eval_input",
@@ -1351,10 +1324,7 @@ void render_eval_repl(const aida::ui::theme_t& th, float alpha, float width_avai
         }
     }
 
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-        aida::ui::with_alpha(th.text_dim, alpha)));
     ImGui::TextUnformatted("Output:");
-    ImGui::PopStyleColor();
 
     std::string out;
     {
@@ -1378,10 +1348,7 @@ void render_eval_repl(const aida::ui::theme_t& th, float alpha, float width_avai
 
 void render_hooks_section(const aida::ui::theme_t& th, float alpha)
 {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-        aida::ui::with_alpha(th.text_secondary, alpha)));
     ImGui::TextUnformatted("Hooks");
-    ImGui::PopStyleColor();
 
     ImGui::SetNextItemWidth(220.f);
     const char* current = (g_state.selected_hook_preset >= 0 && g_state.selected_hook_preset < kHookPresetCount)
@@ -1414,20 +1381,14 @@ void render_hooks_section(const aida::ui::theme_t& th, float alpha)
 
 void render_screenshot_section(const aida::ui::theme_t& th, float alpha)
 {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-        aida::ui::with_alpha(th.text_secondary, alpha)));
     ImGui::TextUnformatted("Latest screenshot");
-    ImGui::PopStyleColor();
 
     std::string path;
     {
         std::lock_guard<std::mutex> lk(g_state.status_mtx);
         path = g_state.last_screenshot_path;
     }
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-        aida::ui::with_alpha(path.empty() ? th.text_dim : th.text_primary, alpha)));
     ImGui::TextWrapped("%s", path.empty() ? "(none yet)" : path.c_str());
-    ImGui::PopStyleColor();
 
     if (path.empty()) ImGui::BeginDisabled();
     if (ImGui::Button("Open in Explorer", ImVec2(160.f, 26.f))) {
@@ -1446,10 +1407,7 @@ void render_screenshot_section(const aida::ui::theme_t& th, float alpha)
 
 void render_advanced_section(const aida::ui::theme_t& th, float alpha)
 {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-        aida::ui::with_alpha(th.text_secondary, alpha)));
     ImGui::TextUnformatted("Launch profile");
-    ImGui::PopStyleColor();
 
     ImGui::SetNextItemWidth(140.f);
     const char* os_cur = (g_state.selected_os >= 0 && g_state.selected_os < kOsPresetCount)

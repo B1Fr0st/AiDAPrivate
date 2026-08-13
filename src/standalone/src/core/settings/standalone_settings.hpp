@@ -355,7 +355,6 @@ struct theme_pack_t
     int         version = 1;
     std::string name;
     std::string palette_json;
-    uint32_t    acrylic_color = 0;
     std::string icon_mode = "builtin";
     int         builtin_icon = 3;
     std::string custom_icon_path;

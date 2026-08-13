@@ -863,33 +863,21 @@ void render_issues_pane(float w, float h, float alpha)
                            "%s", severity_label(selected.severity));
         if (ImGui::GetContentRegionAvail().x >= 400.f)
             ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)));
         ImGui::TextWrapped("%s", selected.name.c_str());
-        ImGui::PopStyleColor();
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)));
         ImGui::TextWrapped("%s://%s:%u%s   param=%s   ip=%s",
             selected.scheme.c_str(), selected.host.c_str(), selected.port,
             selected.path.c_str(), selected.parameter.c_str(),
             selected.insertion_point.c_str());
-        ImGui::PopStyleColor();
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)));
         ImGui::TextWrapped(
             "Confidence: %s   Type: %s", confidence_label(selected.confidence),
             selected.type_key.c_str());
-        ImGui::PopStyleColor();
         if (!selected.cwe.empty()) {
             std::string cwe;
             for (size_t i = 0; i < selected.cwe.size(); ++i) {
                 if (i) cwe += ", ";
                 cwe += selected.cwe[i];
             }
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)));
             ImGui::TextWrapped("CWE: %s", cwe.c_str());
-            ImGui::PopStyleColor();
         }
         ImGui::Spacing();
         if (ImGui::CollapsingHeader("Description", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -901,11 +889,7 @@ void render_issues_pane(float w, float h, float alpha)
         if (!selected.evidence.empty() && ImGui::CollapsingHeader("Evidence", ImGuiTreeNodeFlags_DefaultOpen)) {
             for (size_t i = 0; i < selected.evidence.size(); ++i) {
                 const auto& ev = selected.evidence[i];
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                    ImGui::ColorConvertU32ToFloat4(
-                        aida::ui::with_alpha(th.text_secondary, alpha)));
                 ImGui::TextWrapped("Evidence #%zu  marker=%s", i + 1, ev.marker.c_str());
-                ImGui::PopStyleColor();
                 render_evidence_artifact(selected, i, false, alpha);
                 render_evidence_artifact(selected, i, true, alpha);
                 ImGui::Spacing();

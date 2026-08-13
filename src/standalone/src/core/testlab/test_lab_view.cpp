@@ -1092,14 +1092,9 @@ namespace test_lab_view {
 			dl->AddRectFilled(wp, ImVec2(wp.x + pane_w, wp.y + pane_h),
 				aida::ui::with_alpha(t.panel_bg, 0.55f), 6.f);
 
-			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.f, 4.f));
-			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 6.f));
-
 			ImGui::Dummy(ImVec2(0.f, 4.f));
 			ImGui::Indent(10.f);
-			ImGui::PushStyleColor(ImGuiCol_Text, t.text_secondary);
 			ImGui::TextUnformatted("DRIVER TEST LAB");
-			ImGui::PopStyleColor();
 			ImGui::Unindent(10.f);
 			ImGui::Dummy(ImVec2(0.f, 2.f));
 			ImGui::Separator();
@@ -1128,21 +1123,15 @@ namespace test_lab_view {
 				if (row.is_header) {
 					ImGui::Dummy(ImVec2(0.f, 4.f));
 					ImGui::Indent(10.f);
-					ImGui::PushStyleColor(ImGuiCol_Text,
-						aida::ui::with_alpha(t.text_dim, ent));
 					ImGui::TextUnformatted(row.header_text.c_str());
-					ImGui::PopStyleColor();
 					category_counts_t counts = category_counts(row.header_text, summaries);
 					if (counts.pass != 0 || counts.fail != 0 || counts.skip != 0 || counts.running != 0) {
 						std::string count_text = format_category_counts(counts);
 						float tw = ImGui::CalcTextSize(count_text.c_str()).x;
 						float x = pane_w - tw - 22.f;
 						if (x > ImGui::GetCursorPosX()) {
-							ImGui::SameLine(x);
-							ImGui::PushStyleColor(ImGuiCol_Text,
-								aida::ui::with_alpha(t.text_dim, ent * 0.86f));
-							ImGui::TextUnformatted(count_text.c_str());
-							ImGui::PopStyleColor();
+						ImGui::SameLine(x);
+						ImGui::TextUnformatted(count_text.c_str());
 						}
 					}
 					ImGui::Unindent(10.f);
@@ -1257,17 +1246,12 @@ namespace test_lab_view {
 
 			ImGui::EndChild();
 
-			ImGui::PopStyleVar();
-			ImGui::PopStyleVar();
-
-			ImGui::EndChild();
+		ImGui::EndChild();
 		}
 
 		void render_inputs_section(const test_lab::feature_t& f) {
 			const auto& t = aida::ui::resolved();
-			ImGui::PushStyleColor(ImGuiCol_Text, t.text_secondary);
-			ImGui::TextUnformatted("INPUTS");
-			ImGui::PopStyleColor();
+		ImGui::TextUnformatted("INPUTS");
 			ImGui::Separator();
 			ImGui::Dummy(ImVec2(0.f, 4.f));
 			if (f.render_inputs != nullptr) {
@@ -1407,9 +1391,7 @@ namespace test_lab_view {
 				}
 			}
 
-			ImGui::PushStyleColor(ImGuiCol_Text, t.text_secondary);
 			ImGui::TextUnformatted("RESULT");
-			ImGui::PopStyleColor();
 			ImGui::Separator();
 			ImGui::Dummy(ImVec2(0.f, 4.f));
 
@@ -1442,9 +1424,7 @@ namespace test_lab_view {
 			ImGui::Dummy(ImVec2(0.f, 8.f));
 
 			if (using_cached_summary) {
-				ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
-				ImGui::TextWrapped("Showing the cached run summary for this feature. Raw bytes and parsed fields are shown when the selected feature has a direct result snapshot; run-all evidence remains in the log tail below.");
-				ImGui::PopStyleColor();
+			ImGui::TextWrapped("Showing the cached run summary for this feature. Raw bytes and parsed fields are shown when the selected feature has a direct result snapshot; run-all evidence remains in the log tail below.");
 				ImGui::Dummy(ImVec2(0.f, 6.f));
 			}
 
@@ -1535,14 +1515,10 @@ namespace test_lab_view {
 
 		void render_run_all_evidence_panel(float max_h = 170.f) {
 			const auto& t = aida::ui::resolved();
-			ImGui::PushStyleColor(ImGuiCol_Text, t.text_secondary);
-			ImGui::TextUnformatted("RECENT RUN EVIDENCE");
-			ImGui::PopStyleColor();
+		ImGui::TextUnformatted("RECENT RUN EVIDENCE");
 			ImGui::Separator();
 
-			ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
-			ImGui::TextWrapped("Log: %s", run_all_log_path());
-			ImGui::PopStyleColor();
+		ImGui::TextWrapped("Log: %s", run_all_log_path());
 
 			if (ImGui::Button("Copy log path", ImVec2(118.f, 26.f))) {
 				ImGui::SetClipboardText(run_all_log_path());
@@ -1575,8 +1551,7 @@ namespace test_lab_view {
 			if (tail.empty()) {
 				render_empty_panel("No run-all evidence yet", "Run All Safe Tests writes target launch, driver attach, diagnostics, and result evidence here.", 82.f);
 			} else {
-				ImGui::PushStyleColor(ImGuiCol_Text, t.text_secondary);
-				const float line_h = ImGui::GetTextLineHeightWithSpacing();
+			const float line_h = ImGui::GetTextLineHeightWithSpacing();
 				ImGuiListClipper clipper;
 				clipper.Begin(static_cast<int>(tail.size()), line_h);
 				while (clipper.Step()) {
@@ -1588,8 +1563,7 @@ namespace test_lab_view {
 					}
 				}
 				clipper.End();
-				ImGui::PopStyleColor();
-				if (g_run_all_active.load(std::memory_order_acquire))
+			if (g_run_all_active.load(std::memory_order_acquire))
 					ImGui::SetScrollHereY(1.f);
 			}
 			ImGui::EndChild();
@@ -1632,13 +1606,9 @@ namespace test_lab_view {
 
 			const auto& f = features[static_cast<std::size_t>(g_selected_idx)];
 
-			ImGui::PushStyleColor(ImGuiCol_Text, t.text_primary);
 			ImGui::Text("%s", f.name != nullptr ? f.name : "");
-			ImGui::PopStyleColor();
 			if (f.summary != nullptr && f.summary[0] != '\0') {
-				ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
 				ImGui::TextWrapped("%s", f.summary);
-				ImGui::PopStyleColor();
 			}
 			ImGui::Dummy(ImVec2(0.f, 6.f));
 

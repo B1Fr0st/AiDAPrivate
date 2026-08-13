@@ -401,8 +401,6 @@ void render_toolbar(bottom_tab_t tab, const char* stable_scope) {
             filter.enabled, false, filter.visible}
     };
     const float toolbar_height = metrics.control_height + 4.0f * metrics.scale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-        ImVec2(0.0f, 2.0f * metrics.scale));
     ImGui::BeginChild("##output_toolbar", ImVec2(available, toolbar_height), false,
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
         ImGuiWindowFlags_NoSavedSettings);
@@ -431,7 +429,6 @@ void render_toolbar(bottom_tab_t tab, const char* stable_scope) {
         design::draw_focus_ring_for_last_item();
     }
     ImGui::EndChild();
-    ImGui::PopStyleVar();
     if (!wide && supports_search) {
         const auto slot = index(tab);
         if (state().focus_filter[slot])
@@ -740,7 +737,6 @@ void render_terminal_session_bar() {
     ImGui::BeginChild("##terminal_actions", ImVec2(0.0f, action_bar_height), false,
         ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoBackground);
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, 3.0f));
     const auto terminal_action = [](const char* action_id, const char* label) {
         const auto presentation = application_ui::present_output_action(
             static_cast<int>(bottom_tab_t::terminal), action_id);
@@ -784,7 +780,6 @@ void render_terminal_session_bar() {
     terminal_action("terminal.restart", "Restart");
     ImGui::SameLine();
     terminal_action("terminal.close", "Close");
-    ImGui::PopStyleVar();
     if (!view.terminal_persistence_error.empty()) {
         ImGui::SameLine();
         ImGui::TextDisabled("Session layout not saved");

@@ -579,7 +579,6 @@ static void render_payload_scroll_child(
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.f, 0.f, 0.f, 0.f));
     ImGui::SetCursorScreenPos(pos);
     ImGui::BeginChild(id, size, false,
         ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings |
@@ -643,7 +642,6 @@ static void render_payload_scroll_child(
     }
 
     ImGui::EndChild();
-    ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
 }
 
@@ -775,7 +773,6 @@ float chat_render::render_code_block(
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.f, 0.f, 0.f, 0.f));
     ImGui::SetCursorScreenPos(ImVec2(code_area_x, body_top));
     ImGui::BeginChild("##cb_code_scroll", ImVec2(code_area_w, body_h), false,
         ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings |
@@ -824,7 +821,6 @@ float chat_render::render_code_block(
     }
 
     ImGui::EndChild();
-    ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
 
     ImU32 gutter_bg = aida::ui::with_alpha(th.panel_header, alpha * 0.55f);
@@ -1627,14 +1623,10 @@ chat_render::render_result_t chat_render::render_rich_message(
             run_inline_in_box(span.text, c, body_font, body_fs, hov, false, c);
             if (hov) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 6.f));
-                ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(th.bg_overlay));
                 if (ImGui::BeginTooltip()) {
                     ImGui::TextUnformatted("Click to copy link");
                     ImGui::EndTooltip();
                 }
-                ImGui::PopStyleColor();
-                ImGui::PopStyleVar();
             }
             if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !span.url.empty()) {
                 ImGui::SetClipboardText(span.url.c_str());

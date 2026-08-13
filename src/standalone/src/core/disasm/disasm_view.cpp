@@ -3320,7 +3320,6 @@ void render(float, float, float width, float height,
     ImGui::PushID(id.c_str());
     ImGui::BeginChild("##workspace_disassembly", ImVec2(width, height), false);
     const auto& theme = aida::ui::resolved();
-    ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(theme.text_primary, alpha));
 
     const bool can_rebase =
         context.workspace->target_kind() == aida::analysis::target_kind_t::static_file &&
@@ -3648,7 +3647,6 @@ void render(float, float, float width, float height,
                 "This target has no instruction records at the current readiness level.", nullptr,
                 ImVec2(0.0f, 152.0f));
         }
-        ImGui::PopStyleColor();
         ImGui::EndChild();
         ImGui::PopID();
         comment_dialog::render();
@@ -3772,13 +3770,10 @@ void render(float, float, float width, float height,
                     navigation_instructions[range->first + offset].address.value), context);
         }
     }
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImGui::ColorConvertU32ToFloat4(disasm_theme::panel_bg()));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::BeginChild("##instruction_rows", ImVec2(0.0f, 0.0f), false,
         ImGuiWindowFlags_HorizontalScrollbar);
     ImGui::PopStyleVar();
-    ImGui::PopStyleColor();
     {
         std::lock_guard<std::mutex> lock(context.view->mutex);
         if (context.view->scroll_restore_pending) {
@@ -4382,7 +4377,6 @@ void render(float, float, float width, float height,
     }
     ImGui::EndChild();
     render_xref_popup(context);
-    ImGui::PopStyleColor();
     ImGui::EndChild();
     ImGui::PopID();
     comment_dialog::render();

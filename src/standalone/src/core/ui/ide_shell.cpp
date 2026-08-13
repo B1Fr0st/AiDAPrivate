@@ -133,10 +133,8 @@ void render_status_segment(const status_segment_t& segment, float height, float 
     const ImU32 text_color = segment.semantic == design::semantic_t::neutral
         ? theme.text_secondary : design::semantic_color(segment.semantic);
     draw->PushClipRect(origin, ImVec2(origin.x + segment.width, origin.y + height), true);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(text_color));
     ImGui::RenderTextEllipsis(draw, text_min, text_max, text_max.x,
         segment.label ? segment.label : "", nullptr, nullptr);
-    ImGui::PopStyleColor();
     if (segment.semantic != design::semantic_t::neutral)
         draw->AddCircleFilled(ImVec2(origin.x + 4.0f * scale, origin.y + height * 0.5f),
             1.5f * scale, text_color);
@@ -545,19 +543,11 @@ bool render_activity_button(const char* stable_id, const char* action_id,
         : capability_state_t::available();
     const bool enabled = capability.visible && capability.enabled;
     const ImVec2 minimum = ImGui::GetCursorScreenPos();
-    ImGui::PushStyleColor(ImGuiCol_Button, active
-        ? ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(theme.accent_u32, 0.18f))
-        : ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-        ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(theme.accent_u32, 0.13f)));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-        ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(theme.accent_u32, 0.24f)));
     if (!enabled)
         ImGui::BeginDisabled();
     const bool invoked = ImGui::Button("##activity", size);
     if (!enabled)
         ImGui::EndDisabled();
-    ImGui::PopStyleColor(3);
     ImDrawList* draw = ImGui::GetWindowDrawList();
     if (active) {
         draw->AddRectFilled(minimum, ImVec2(minimum.x + 3.0f * scale, minimum.y + size.y),
@@ -628,8 +618,6 @@ void render_activity_bar() noexcept
     ImGui::SetNextWindowViewport(viewport->ID);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.0f * scale, 6.0f * scale));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 2.0f * scale));
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus;
@@ -748,7 +736,7 @@ void render_activity_bar() noexcept
             activity_glyph_t::settings, focused_view == "view.settings", size, scale);
     }
     ImGui::End();
-    ImGui::PopStyleVar(4);
+    ImGui::PopStyleVar(2);
 #endif
 }
 

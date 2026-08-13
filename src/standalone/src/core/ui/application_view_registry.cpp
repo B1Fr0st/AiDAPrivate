@@ -934,7 +934,6 @@ void render_code_group(const view_render_context_t& context) {
         ImGui::EndChild();
     }
     if (selected_tab.recovery.available) {
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.15f, 0.24f, 0.96f));
         if (ImGui::BeginChild("##aida_document_recovery", ImVec2(0.f, 70.f), true,
                 ImGuiWindowFlags_NoSavedSettings)) {
             ImGui::TextUnformatted("A verified unsaved recovery journal is available.");
@@ -962,7 +961,6 @@ void render_code_group(const view_render_context_t& context) {
 #endif
         }
         ImGui::EndChild();
-        ImGui::PopStyleColor();
     }
     if (file_tabs::pending_recovery_discard_document == selected_tab.document_id &&
         !ImGui::IsPopupOpen("Discard Recovery###aida.editor.recovery.discard"))
@@ -1008,7 +1006,6 @@ void render_code_group(const view_render_context_t& context) {
         ImGui::EndPopup();
     }
     if (selected_tab.external_conflict) {
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.24f, 0.12f, 0.04f, 0.92f));
         if (ImGui::BeginChild("##aida_external_change", ImVec2(0.f, 48.f), true)) {
             ImGui::TextUnformatted("The file changed on disk. AiDA will not overwrite it without your decision.");
             ImGui::SameLine();
@@ -1031,7 +1028,6 @@ void render_code_group(const view_render_context_t& context) {
 #endif
         }
         ImGui::EndChild();
-        ImGui::PopStyleColor();
     }
 
     code_editor_widget::document_pane_render_context_t render_context;

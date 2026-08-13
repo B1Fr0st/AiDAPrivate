@@ -3109,7 +3109,6 @@ void code_editor_widget::render_document_pane(const document_pane_render_context
         return;
     }
     if (current_document().read_only) {
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.16f, 0.12f, 0.04f, 0.94f));
         if (ImGui::BeginChild("##aida_editor_read_only_mode", ImVec2(0.f, 40.f), true,
                 ImGuiWindowFlags_NoSavedSettings)) {
             ImGui::TextUnformatted("Read-only large-file view");
@@ -3117,7 +3116,6 @@ void code_editor_widget::render_document_pane(const document_pane_render_context
             ImGui::TextDisabled("%s", current_document().read_only_reason.c_str());
         }
         ImGui::EndChild();
-        ImGui::PopStyleColor();
         origin = ImGui::GetCursorPos();
         available = ImGui::GetContentRegionAvail();
     }
@@ -5551,13 +5549,6 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         ImGui::SetNextWindowPos(ImVec2(bar_x, bar_y), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(bar_w, total_bar_h), ImGuiCond_Always);
 
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(bar_pad_x, bar_pad_y));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.f);
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3.f, 3.f));
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, bg);
-        ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, 0.35f)));
-
         ImGuiWindowFlags find_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
             ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
@@ -5575,21 +5566,16 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             if (!tooltip || !*tooltip) return;
             if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNone | ImGuiHoveredFlags_NoSharedDelay |
                 ImGuiHoveredFlags_AllowWhenDisabled | ImGuiHoveredFlags_AllowWhenBlockedByPopup)) return;
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 6.f));
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.f);
             ImGui::BeginTooltip();
             ImGui::TextUnformatted(tooltip);
             ImGui::EndTooltip();
-            ImGui::PopStyleVar(2);
         };
 
 
         auto centered_button = [&](const char* label, const ImVec2& size, ImGuiButtonFlags flags = 0) -> bool {
             const float text_h = ImGui::GetFontSize();
             const float pad_y = (size.y - text_h) * 0.5f;
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2.f, pad_y < 0.f ? 0.f : pad_y));
             bool clicked = ImGui::ButtonEx(label, size, flags);
-            ImGui::PopStyleVar();
             return clicked;
         };
 
@@ -5598,19 +5584,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             ImGui::PushID(id_suffix);
             ImVec2 sz(btn_sz, row_h);
             bool was = state;
-            if (state) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(accent_col.x, accent_col.y, accent_col.z, 0.25f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(accent_col.x, accent_col.y, accent_col.z, 0.35f));
-                ImGui::PushStyleColor(ImGuiCol_Text, accent_col);
-            } else {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.f, 0.f, 0.f, 0.f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(txt2.x, txt2.y, txt2.z, 0.4f));
-                ImGui::PushStyleColor(ImGuiCol_Text, txt2);
-            }
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
             if (centered_button(label, sz)) state = !state;
-            ImGui::PopStyleVar();
-            ImGui::PopStyleColor(3);
             draw_instant_tooltip(tooltip);
             ImGui::PopID();
             return state != was;
@@ -5619,13 +5593,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
         auto icon_button = [&](const char* label, const char* id_suffix, const char* tooltip, float w = 26.f) -> bool {
             ImGui::PushID(id_suffix);
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.f, 0.f, 0.f, 0.f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(txt_d.x, txt_d.y, txt_d.z, 0.3f));
-            ImGui::PushStyleColor(ImGuiCol_Text, txt2);
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
             bool clicked = centered_button(label, ImVec2(w, row_h));
-            ImGui::PopStyleVar();
-            ImGui::PopStyleColor(3);
             draw_instant_tooltip(tooltip);
             ImGui::PopID();
             return clicked;
@@ -5641,12 +5609,6 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
 
         {
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, (row_h - ImGui::GetFontSize()) * 0.5f - 1.f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, bg_inp);
-            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(bg_inp.x + 0.03f, bg_inp.y + 0.03f, bg_inp.z + 0.03f, bg_inp.w));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(bg_inp.x + 0.05f, bg_inp.y + 0.05f, bg_inp.z + 0.05f, bg_inp.w));
-            ImGui::PushStyleColor(ImGuiCol_Text, txt1);
             ImGui::PushItemWidth(input_w);
             if (s_focus_find_input) {
                 ImGui::SetKeyboardFocusHere();
@@ -5656,8 +5618,6 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 sizeof(s_find.find_buf), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
             bool edited = ImGui::IsItemEdited();
             ImGui::PopItemWidth();
-            ImGui::PopStyleColor(4);
-            ImGui::PopStyleVar(2);
 
 
             if (edited && strcmp(s_find.find_buf, s_find_last_buf) != 0) {
@@ -5730,12 +5690,10 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 bool no_match = !current_document().find_loading &&
                     (s_find.total_matches == 0 && s_find.find_buf[0] != '\0');
                 ImVec4 mc = no_match ? ImGui::ColorConvertU32ToFloat4(th.error) : txt2;
-                ImGui::PushStyleColor(ImGuiCol_Text, mc);
                 ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (row_h - ImGui::GetFontSize()) * 0.5f);
                 ImGui::TextUnformatted(match_buf);
                 if (!current_document().find_error.empty() && ImGui::IsItemHovered())
                     ImGui::SetTooltip("%s", current_document().find_error.c_str());
-                ImGui::PopStyleColor();
                 ImGui::SameLine();
             }
         }
@@ -5751,17 +5709,9 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         if (s_find.replace_mode) {
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 22.f);
 
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, (row_h - ImGui::GetFontSize()) * 0.5f - 1.f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, bg_inp);
-            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(bg_inp.x + 0.03f, bg_inp.y + 0.03f, bg_inp.z + 0.03f, bg_inp.w));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(bg_inp.x + 0.05f, bg_inp.y + 0.05f, bg_inp.z + 0.05f, bg_inp.w));
-            ImGui::PushStyleColor(ImGuiCol_Text, txt1);
             ImGui::PushItemWidth(input_w);
             ImGui::InputText("##replace_input", s_find.replace_buf, sizeof(s_find.replace_buf));
             ImGui::PopItemWidth();
-            ImGui::PopStyleColor(4);
-            ImGui::PopStyleVar(2);
             ImGui::SameLine();
 
             if (icon_button("R1", "repl_one", "Replace"))    replace_current();
@@ -5777,8 +5727,6 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         }
 
         ImGui::End();
-        ImGui::PopStyleColor(2);
-        ImGui::PopStyleVar(4);
 
 
         ImDrawList* fdl = ImGui::GetForegroundDrawList();
@@ -5804,15 +5752,9 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
         ImGui::SetCursorPos(ImVec2(pos_x + 18.f, pos_y + 6.f));
         ImGui::PushID("##editor_goto_overlay");
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 4.f));
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.bg_base, 0.65f)));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(th.text_primary));
         ImGui::SetNextItemWidth(140.f);
         bool go = ImGui::InputTextWithHint("##goto_line", "line", s_goto.line_buf, sizeof(s_goto.line_buf),
             ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsDecimal);
-        ImGui::PopStyleColor(2);
-        ImGui::PopStyleVar(2);
 
         ImGui::SameLine();
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 2.f);

@@ -595,7 +595,6 @@ struct ThemePreset {
 	ImU32       text_primary;
 	ImU32       text_secondary;
 	ImU32       text_dim;
-	DWORD       acrylic_color;
 };
 
 namespace themes
@@ -610,8 +609,7 @@ namespace themes
 		  IM_COL32(12, 17, 31, 232),
 		  IM_COL32(226, 234, 250, 242),
 		  IM_COL32(158, 174, 206, 206),
-		  IM_COL32(108, 124, 160, 182),
-		  (DWORD)((10) | (17 << 8) | (44 << 16) | (0x7A << 24))
+		  IM_COL32(108, 124, 160, 182)
 		},
 
 		{ "AiDA Light",
@@ -622,8 +620,7 @@ namespace themes
 		  IM_COL32(231, 237, 248, 232),
 		  IM_COL32(22, 28, 44, 252),
 		  IM_COL32(78, 92, 122, 232),
-		  IM_COL32(140, 152, 178, 220),
-		  (DWORD)((240) | (244 << 8) | (251 << 16) | (0xA8 << 24))
+		  IM_COL32(140, 152, 178, 220)
 		},
 
 		{ "Claude Dark",
@@ -634,8 +631,7 @@ namespace themes
 		  IM_COL32(0x1A, 0x1A, 0x18, 232),
 		  IM_COL32(0xE8, 0xE4, 0xDC, 242),
 		  IM_COL32(0xB8, 0xB1, 0xA4, 218),
-		  IM_COL32(0x88, 0x88, 0x88, 200),
-		  (DWORD)((0x1A) | (0x1A << 8) | (0x18 << 16) | (0x84 << 24))
+		  IM_COL32(0x88, 0x88, 0x88, 200)
 		},
 
 		{ "Claude Light",
@@ -646,8 +642,7 @@ namespace themes
 		  IM_COL32(0xE9, 0xEC, 0xEC, 232),
 		  IM_COL32(0x1F, 0x1E, 0x1D, 252),
 		  IM_COL32(0x6F, 0x6F, 0x78, 232),
-		  IM_COL32(0xB1, 0xAD, 0xA1, 220),
-		  (DWORD)((0xEE) | (0xF3 << 8) | (0xF4 << 16) | (0xA8 << 24))
+		  IM_COL32(0xB1, 0xAD, 0xA1, 220)
 		},
 	};
 	inline constexpr int count = sizeof(presets) / sizeof(presets[0]);
@@ -793,7 +788,6 @@ struct CustomThemeData {
 	ImU32 text_primary   = IM_COL32(230, 228, 255, 240);
 	ImU32 text_secondary = IM_COL32(170, 175, 190, 200);
 	ImU32 text_dim       = IM_COL32(110, 105, 145, 140);
-	DWORD acrylic_color  = (DWORD)((5) | (12 << 8) | (65 << 16) | (0x70 << 24));
 	int   icon_index     = 3;
 	std::string icon_file_path;
 };

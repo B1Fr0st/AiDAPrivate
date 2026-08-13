@@ -178,7 +178,6 @@ void render(float pos_x, float pos_y, float width, float height,
     s_state.active = true;
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
     ImGui::BeginChild("##wse_root", ImVec2(width, height), false);
 
     ImGui::SetCursorPos(ImVec2(8.f, 6.f));
@@ -480,7 +479,6 @@ void render(float pos_x, float pos_y, float width, float height,
 
     ImGui::EndChild();
     ImGui::EndChild();
-    ImGui::PopStyleColor();
 }
 
 }

@@ -75,7 +75,6 @@ void render(float pos_x, float pos_y, float width, float height,
     s_state.active = true;
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
     ImGui::BeginChild("##gql_root", ImVec2(width, height), false);
 
     ImGui::SetCursorPos(ImVec2(8.f, 6.f));
@@ -342,12 +341,10 @@ void render(float pos_x, float pos_y, float width, float height,
         {
             std::lock_guard<std::mutex> lk(s_state.lock);
             if (mono) ImGui::PushFont(mono);
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(th.panel_header, alpha));
             ImGui::InputTextMultiline("##gql_resp", s_state.last_response_raw.data(),
                                        s_state.last_response_raw.size() + 1,
                                        ImVec2(width - 16.f, content_h - content_h * 0.4f - 220.f),
-                                       ImGuiInputTextFlags_ReadOnly);
-            ImGui::PopStyleColor();
+                                        ImGuiInputTextFlags_ReadOnly);
             if (mono) ImGui::PopFont();
         }
         ImGui::EndChild();
@@ -365,7 +362,6 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
     ImGui::EndChild();
-    ImGui::PopStyleColor();
 }
 
 }

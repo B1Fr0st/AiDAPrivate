@@ -1539,8 +1539,6 @@ void render(float, float, float width, float height,
     ImGui::PushID(id.c_str());
     ImGui::BeginChild("##workspace_pseudocode", ImVec2(width, height), false);
     const auto& theme = aida::ui::resolved();
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        aida::ui::with_alpha(theme.text_primary, alpha));
 
     const auto tabs = snapshot_tabs(context);
     const std::uint64_t header_address = active_tab_address(context);
@@ -1743,8 +1741,6 @@ void render(float, float, float width, float height,
         const float row_height = (std::max)(
             ImGui::GetTextLineHeight() + 3.0f,
             aida::ui::metrics::table::compact_row_h);
-        ImGui::PushStyleColor(ImGuiCol_ChildBg,
-            ImGui::ColorConvertU32ToFloat4(theme.panel_header));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
         ImGui::BeginChild("##pseudocode_header",
             ImVec2(0.0f, aida::ui::metrics::table::header_h), true,
@@ -1762,7 +1758,6 @@ void render(float, float, float width, float height,
             "PSEUDOCODE");
         ImGui::EndChild();
         ImGui::PopStyleVar();
-        ImGui::PopStyleColor();
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
         ImGui::BeginChild("##pseudocode_lines", ImVec2(0.0f, 0.0f), false,
             ImGuiWindowFlags_HorizontalScrollbar);
@@ -2024,7 +2019,6 @@ void render(float, float, float width, float height,
         }
     }
     aida::ui::analysis_context_menu::render();
-    ImGui::PopStyleColor();
     ImGui::EndChild();
     ImGui::PopID();
     comment_dialog::render();

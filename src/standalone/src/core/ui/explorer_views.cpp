@@ -1819,8 +1819,6 @@ void render_project_explorer() {
         : (file_browser::roots.size() > 1 ? "Each workspace root is indexed independently and remains docked in this Explorer"
                                          : file_browser::current_dir.c_str()));
 
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-        ImVec2(metrics.spacing_sm, aida::ui::scale_px(5.0f, metrics.scale)));
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
         ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F, false))
         ImGui::SetKeyboardFocusHere();
@@ -1828,7 +1826,6 @@ void render_project_explorer() {
     if (ImGui::InputTextWithHint("##project_filter", "Filter files and folders",
             presentation.filter, sizeof(presentation.filter)))
         presentation.filter_dirty = true;
-    ImGui::PopStyleVar();
     design::tooltip_for_last_item("Filter the visible project tree", "Ctrl+F");
     design::draw_focus_ring_for_last_item();
 

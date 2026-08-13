@@ -133,7 +133,6 @@ nlohmann::json serialize_theme(const theme_t& theme)
         {"text_primary", theme.text_primary},
         {"text_secondary", theme.text_secondary},
         {"text_dim", theme.text_dim},
-        {"acrylic_color", theme.acrylic_color},
         {"icon_index", theme.icon_index},
         {"icon_file_path", theme.icon_file_path}
     };
@@ -178,7 +177,7 @@ bool parse_theme(const std::string& payload, theme_t& theme, std::string& error)
     static const std::unordered_set<std::string> allowed{
         "schema_version", "name", "accent", "bg_base", "panel_bg",
         "panel_header", "title_bar", "text_primary", "text_secondary",
-        "text_dim", "acrylic_color", "icon_index", "icon_file_path"
+        "text_dim", "icon_index", "icon_file_path"
     };
     for (auto iterator = root.begin(); iterator != root.end(); ++iterator) {
         if (allowed.find(iterator.key()) == allowed.end()) {
@@ -221,8 +220,7 @@ bool parse_theme(const std::string& payload, theme_t& theme, std::string& error)
         !read_u32(root, "title_bar", theme.title_bar, error) ||
         !read_u32(root, "text_primary", theme.text_primary, error) ||
         !read_u32(root, "text_secondary", theme.text_secondary, error) ||
-        !read_u32(root, "text_dim", theme.text_dim, error) ||
-        !read_u32(root, "acrylic_color", theme.acrylic_color, error))
+        !read_u32(root, "text_dim", theme.text_dim, error))
         return false;
     const auto icon_index = root.find("icon_index");
     if (icon_index == root.end() || !icon_index->is_number_integer()) {

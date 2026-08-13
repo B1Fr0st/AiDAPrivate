@@ -278,7 +278,6 @@ void render(float pos_x, float pos_y, float width, float height,
     if (left_w < 360.f) left_w = 360.f;
     float right_w = width - left_w - 8.f;
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, aida::ui::with_alpha(th.panel_bg, 0.55f * alpha));
     ImGui::BeginChild("##burp_h2_edit", ImVec2(left_w, height - 36.f), true, ImGuiWindowFlags_NoBackground);
 
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
@@ -540,11 +539,9 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
     ImGui::EndChild();
-    ImGui::PopStyleColor();
 
     ImGui::SameLine(0.f, 8.f);
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, aida::ui::with_alpha(th.panel_bg, 0.45f * alpha));
     ImGui::BeginChild("##burp_h2_resp", ImVec2(right_w, height - 36.f), true, ImGuiWindowFlags_NoBackground);
 
     h2_editor::response_t r_copy;
@@ -659,7 +656,6 @@ void render(float pos_x, float pos_y, float width, float height,
             !response_identity.valid(), artifact_id);
     }
 #endif
-    ImGui::PopStyleColor();
 
     ImGui::EndChild();
 }

@@ -2341,10 +2341,7 @@ namespace auth_view {
 				aida::ui::size_t_::sm, status.dot_pulse);
 			if (!status.detail.empty()) {
 				ImGui::SameLine(0.f, 10.f);
-				ImGui::PushStyleColor(ImGuiCol_Text,
-					ImGui::ColorConvertU32ToFloat4(th.text_dim));
 				ImGui::TextUnformatted(status.detail.c_str());
-				ImGui::PopStyleColor();
 			}
 			cy += 32.f;
 
@@ -2358,14 +2355,11 @@ namespace auth_view {
 			const float input_h = 36.f;
 			const float input_w = section_w - pad * 2.f - eye_w - 8.f;
 			ImGui::SetCursorScreenPos(ImVec2(origin_x + pad, cy));
-			ImGui::PushStyleColor(ImGuiCol_FrameBg,
-				ImGui::ColorConvertU32ToFloat4(th.panel_header));
 			ImGui::SetNextItemWidth(input_w);
 			ImGuiInputTextFlags ifl = ImGuiInputTextFlags_None;
 			if (!g_state.chatbox_key_show) ifl |= ImGuiInputTextFlags_Password;
 			ImGui::InputTextWithHint("##chatbox_api_key", "Paste API key",
 				g_state.chatbox_key_buf, sizeof(g_state.chatbox_key_buf), ifl);
-			ImGui::PopStyleColor();
 			ImGui::SameLine(0.f, 8.f);
 			eye_toggle_button("##chatbox_api_key_eye", &g_state.chatbox_key_show,
 				ImVec2(eye_w, input_h));
@@ -2444,10 +2438,7 @@ namespace auth_view {
 
 			if (busy) {
 				ImGui::SetCursorScreenPos(ImVec2(origin_x + pad, cy));
-				ImGui::PushStyleColor(ImGuiCol_Text,
-					ImGui::ColorConvertU32ToFloat4(th.text_secondary));
 				ImGui::TextUnformatted("Calling /models endpoint to verify the key...");
-				ImGui::PopStyleColor();
 				cy += 24.f;
 			} else if (have_res) {
 				const ImU32 line_col = cur_res.success ? th.success : th.error;
@@ -2471,10 +2462,7 @@ namespace auth_view {
 
 			if (status.authenticated) {
 				ImGui::SetCursorScreenPos(ImVec2(origin_x + pad, cy));
-				ImGui::PushStyleColor(ImGuiCol_Text,
-					ImGui::ColorConvertU32ToFloat4(th.text_secondary));
 				ImGui::TextUnformatted("Default model for chat");
-				ImGui::PopStyleColor();
 				cy += 22.f;
 
 				ImGui::SetCursorScreenPos(ImVec2(origin_x + pad, cy));
@@ -3390,13 +3378,8 @@ namespace auth_view {
 			false,
 			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
-		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
-		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 6.f));
-
 		render_combined_view(ImGui::GetContentRegionAvail().x,
 			ImGui::GetContentRegionAvail().y);
-
-		ImGui::PopStyleVar(2);
 
 		ImGui::EndChild();
 		ImGui::PopID();

@@ -355,7 +355,6 @@ void render(float pos_x, float pos_y, float width, float height,
     float gap = 8.f;
     float right_w = width - left_w - gap;
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, aida::ui::with_alpha(th.panel_bg, 0.6f * alpha));
     ImGui::BeginChild("##burp_intruder_jobs", ImVec2(left_w, height - 36.f), true, ImGuiWindowFlags_NoBackground);
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                        "Jobs");
@@ -427,11 +426,9 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
     ImGui::EndChild();
-    ImGui::PopStyleColor();
 
     ImGui::SameLine(0.f, gap);
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, aida::ui::with_alpha(th.panel_bg, 0.45f * alpha));
     ImGui::BeginChild("##burp_intruder_results", ImVec2(right_w, height - 36.f), true, ImGuiWindowFlags_NoBackground);
 
     if (selected == 0) {
@@ -606,7 +603,6 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
     ImGui::EndChild();
-    ImGui::PopStyleColor();
 
     bool need_open = false;
     {

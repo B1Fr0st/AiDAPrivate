@@ -146,9 +146,7 @@ void render() {
         ImGui::Spacing();
         const ImVec4 color = current.succeeded ? ImVec4(0.35f, 0.82f, 0.55f, 1.f)
                                                : ImVec4(0.95f, 0.55f, 0.32f, 1.f);
-        ImGui::PushStyleColor(ImGuiCol_Text, color);
         ImGui::TextWrapped("%s", current.status.c_str());
-        ImGui::PopStyleColor();
     }
 }
 }

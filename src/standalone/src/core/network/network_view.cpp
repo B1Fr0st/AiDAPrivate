@@ -2132,14 +2132,10 @@ static void render_payload_box(const char* id, const char* title, const std::str
                                const std::string& text, ImVec2 size,
                                const aida::ui::theme_t& th, float alpha) {
     ImGui::BeginChild(id, size, true, ImGuiWindowFlags_HorizontalScrollbar);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)));
     ImGui::TextUnformatted(title ? title : "");
-    ImGui::PopStyleColor();
     if (!meta.empty()) {
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)));
         ImGui::TextUnformatted(meta.c_str());
-        ImGui::PopStyleColor();
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("Copy")) {
@@ -2152,9 +2148,7 @@ static void render_payload_box(const char* id, const char* title, const std::str
         ImGui::PushFont(code_font);
         pushed = true;
     }
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)));
     ImGui::TextUnformatted(text.empty() ? "(empty)" : text.c_str());
-    ImGui::PopStyleColor();
     if (pushed)
         ImGui::PopFont();
     ImGui::EndChild();
@@ -2395,16 +2389,10 @@ static float render_tab_bar(state_t& state, float x, float y, float w, float alp
             text_col, draw_label);
 
         if (use_short && hovered) {
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 6.f));
-            ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(th.bg_overlay));
             if (ImGui::BeginTooltip()) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(th.text_primary));
                 ImGui::TextUnformatted(tab_names[tab_idx]);
-                ImGui::PopStyleColor();
                 ImGui::EndTooltip();
             }
-            ImGui::PopStyleColor();
-            ImGui::PopStyleVar();
         }
     }
 
@@ -3121,11 +3109,6 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         ImGui::Dummy(ImVec2(0.f, list_h));
     } else {
 
-        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(8.f, 7.f));
-        ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, aida::ui::with_alpha(th.panel_header, alpha));
-        ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, aida::ui::with_alpha(th.hover_wash, alpha * 0.35f));
-        ImGui::PushStyleColor(ImGuiCol_TableBorderLight, aida::ui::with_alpha(th.border_subtle, alpha));
-
         ImGuiTableFlags table_flags =
             ImGuiTableFlags_Resizable |
             ImGuiTableFlags_Reorderable |
@@ -3176,11 +3159,8 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                         ImGuiSelectableFlags_SpanAllColumns |
                         ImGuiSelectableFlags_AllowItemOverlap;
                     ImU32 dim_col = aida::ui::with_alpha(th.text_dim, r_alpha);
-                    ImVec4 transparent(0.f, 0.f, 0.f, 0.f);
-                    ImGui::PushStyleColor(ImGuiCol_Header, transparent);
-                    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, transparent);
-                    ImGui::PushStyleColor(ImGuiCol_HeaderActive, transparent);
                     float row_h = ImGui::GetTextLineHeight() + ImGui::GetStyle().CellPadding.y * 2.f;
+                    ImGuiSelectableFlags sel_flags =
                     if (ImGui::Selectable("##row_select", selected, sel_flags, ImVec2(0.f, row_h))) {
                         pending_selection = row.packet_index;
                         cap_snapshot.selected_index = row.packet_index;
@@ -3212,7 +3192,6 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                         pending_selection = row.packet_index;
                     }
                     bool hovered = ImGui::IsItemHovered();
-                    ImGui::PopStyleColor(3);
 
                     if (hovered && !selected) {
                         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
@@ -3230,9 +3209,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
 
                     ImU32 txt_col = aida::ui::with_alpha(selected ? th.text_primary : th.text_secondary, r_alpha);
                     ImGui::SetCursorScreenPos(ImVec2(row_min.x + 8.f, row_min.y + ImGui::GetStyle().CellPadding.y));
-                    ImGui::PushStyleColor(ImGuiCol_Text, dim_col);
                     ImGui::Text("%d", row.packet_index + 1);
-                    ImGui::PopStyleColor();
 
                     ImGui::TableSetColumnIndex(1);
                     table_text(format_timestamp(row.timestamp), dim_col);
@@ -3431,9 +3408,6 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                 state.cap_selected = current_packets && !current_packets->empty()
                     ? static_cast<int>(current_packets->size()) - 1 : -1;
         }
-
-        ImGui::PopStyleColor(3);
-        ImGui::PopStyleVar();
     }
 
     ImGui::EndChild();
@@ -5270,10 +5244,7 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
                 ImGui::SetCursorScreenPos(ImVec2(mp.x + 12.f, mp.y - 6.f));
                 char tip[64];
                 snprintf(tip, sizeof(tip), "%s", format_rate(ordered[hi]).c_str());
-                ImGui::PushStyleColor(ImGuiCol_PopupBg,
-                                       ImGui::ColorConvertU32ToFloat4(th.bg_overlay));
                 ImGui::SetTooltip("%s", tip);
-                ImGui::PopStyleColor();
             }
         }
 
@@ -8945,7 +8916,6 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
             cfg.payload_sets.pop_back();
 
         float sets_h = std::min(h * 0.35f, 200.f);
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, aida::ui::with_alpha(th.panel_bg, 0.6f * alpha));
         ImGui::BeginChild("##fuzz_sets_panel", ImVec2(w - 8.f, sets_h), true,
                           ImGuiWindowFlags_NoBackground);
 
@@ -9001,7 +8971,6 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
         }
 
         ImGui::EndChild();
-        ImGui::PopStyleColor();
     }
 
     ImGui::Spacing();
@@ -10070,7 +10039,6 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
     (void)ar; (void)ag; (void)ab;
     const auto& th = aida::ui::resolved();
     ImGui::SetCursorPos(ImVec2(x, y));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
     ImGui::BeginChild("##ws_tab", ImVec2(w, h), false);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -10136,7 +10104,6 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
         cfg.body  = "Frames captured by the proxy will appear here.";
         aida::ui::empty_state::render(ep, ImVec2(w, list_h), cfg);
         ImGui::EndChild();
-        ImGui::PopStyleColor();
         ImGui::EndChild();
         return;
     }
@@ -10277,8 +10244,8 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
         if (pushed) ImGui::PopFont();
     }
 
-    ImGui::EndChild();
-    ImGui::PopStyleColor();
+        ImGui::EndChild();
+
     ImGui::EndChild();
 }
 
@@ -11053,7 +11020,6 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
         ImVec2 fb = ImVec2(ed.body_max.x - inner_pad, fa.y + field_h);
         dl->AddRectFilled(fa, fb, aida::ui::with_alpha(th.bg_base, alpha * 0.85f), 8.f);
 
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
             aida::ui::with_alpha(th.syn_identifier, alpha)));
         ImFont* code_font = aida::ui::fonts::code();
@@ -11068,7 +11034,7 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
         bool editor_active = ImGui::IsItemActive();
 
         if (code_pushed) ImGui::PopFont();
-        ImGui::PopStyleColor(2);
+        ImGui::PopStyleColor();
 
         dl->AddRect(fa, fb, aida::ui::with_alpha(
             editor_active ? th.border_focus : th.border_subtle, alpha), 8.f, 0,
@@ -11130,9 +11096,6 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
             dl->AddText(ImVec2(fa.x + 10.f, fa.y + (field_h - prompt_fs) * 0.5f),
                         aida::ui::with_alpha(th.accent_u32, alpha), ">");
 
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-            aida::ui::with_alpha(th.text_primary, alpha)));
         bool code_pushed = false;
         if (code_font) { ImGui::PushFont(code_font); code_pushed = true; }
 
@@ -11145,7 +11108,6 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
         bool console_active = ImGui::IsItemActive();
 
         if (code_pushed) ImGui::PopFont();
-        ImGui::PopStyleColor(2);
 
         dl->AddRect(fa, fb, aida::ui::with_alpha(
             console_active ? th.border_focus : th.border_subtle, alpha), 8.f, 0,
@@ -11178,10 +11140,7 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
         float ctrl_w = 200.f;
         ImGui::SetCursorScreenPos(ImVec2(lg.body_max.x - ctrl_w - 12.f,
             lg.origin.y + (lg.header_h - 22.f) * 0.5f));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-            aida::ui::with_alpha(th.text_secondary, alpha)));
         aida::ui::toggle_switch("Auto-scroll##scriptlog", &state.script_log_auto_scroll);
-        ImGui::PopStyleColor();
         ImGui::SameLine(0.f, 10.f);
         if (aida::ui::button("Clear", aida::ui::button_kind_t::ghost,
                              aida::ui::size_t_::sm, ImVec2(64.f, 24.f),
@@ -11296,7 +11255,6 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
     (void)ar; (void)ag; (void)ab;
     const auto& th = aida::ui::resolved();
     ImGui::SetCursorPos(ImVec2(x, y));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
     ImGui::BeginChild("##decoder_tab", ImVec2(w, h), false);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -11527,7 +11485,6 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
     }
     ImGui::EndChild();
 
-    ImGui::PopStyleColor();
     ImGui::EndChild();
 }
 
@@ -11769,17 +11726,6 @@ void render(float pos_x, float pos_y, float width, float height,
     }
     s_tab_content_in.tick(dt);
 
-    ImGui::PushStyleColor(ImGuiCol_FrameBg,         aida::ui::with_alpha(th.panel_header, alpha));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,  aida::ui::with_alpha(th.hover_wash, alpha));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,   aida::ui::with_alpha(th.selection, alpha));
-    ImGui::PushStyleColor(ImGuiCol_Border,          aida::ui::with_alpha(th.border_subtle, alpha));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg,     IM_COL32(0,0,0,0));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab,   aida::ui::with_alpha(th.accent_dim, alpha));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, aida::ui::with_alpha(th.accent_hover, alpha));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive,  aida::ui::with_alpha(th.accent_u32, alpha));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-
     switch (g_state.active_tab) {
         case sub_tab_t::connections:
             render_connections(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
@@ -11893,9 +11839,6 @@ void render(float pos_x, float pos_y, float width, float height,
             break;
     }
 
-    ImGui::PopStyleVar(2);
-    ImGui::PopStyleColor(8);
-
     render_network_status_bar(g_state, ImVec2(outer_pad, status_y), inner_width, has_target);
     ImGui::EndChild();
 }
@@ -11936,20 +11879,8 @@ void render_pane(sub_tab_t tab, float pos_x, float pos_y, float width, float hei
                 "Attach or launch a target to enable this driver-backed Network pane.",
                 alpha, aida::ui::empty_state::glyph_t::network);
         } else {
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(aida::ui::resolved().panel_header, alpha));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, aida::ui::with_alpha(aida::ui::resolved().hover_wash, alpha));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, aida::ui::with_alpha(aida::ui::resolved().selection, alpha));
-            ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(aida::ui::resolved().border_subtle, alpha));
-            ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, IM_COL32(0, 0, 0, 0));
-            ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, aida::ui::with_alpha(aida::ui::resolved().accent_dim, alpha));
-            ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, aida::ui::with_alpha(aida::ui::resolved().accent_hover, alpha));
-            ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, aida::ui::with_alpha(aida::ui::resolved().accent_u32, alpha));
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
             render_tab_content(tab, g_state, 0.f, 0.f, size.x, size.y, alpha,
                 accent_r, accent_g, accent_b);
-            ImGui::PopStyleVar(2);
-            ImGui::PopStyleColor(8);
         }
     }
     ImGui::EndChild();

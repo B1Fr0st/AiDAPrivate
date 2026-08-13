@@ -34,9 +34,6 @@
 #include <exception>
 #include <utility>
 #include <nlohmann/json.hpp>
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-#include "blur.h"
-#endif
 #include "../assets/icons.h"
 #include "../ide_icons.h"
 #include "standalone_chat.hpp"
@@ -1200,7 +1197,6 @@ namespace {
 		captured.text_primary = static_cast<std::uint32_t>(theme.text_primary);
 		captured.text_secondary = static_cast<std::uint32_t>(theme.text_secondary);
 		captured.text_dim = static_cast<std::uint32_t>(theme.text_dim);
-		captured.acrylic_color = static_cast<std::uint32_t>(theme.acrylic_color);
 		captured.icon_index = theme.icon_index;
 		captured.icon_file_path = theme.icon_file_path;
 		return captured;
@@ -1220,7 +1216,6 @@ namespace {
 		materialized.text_primary = static_cast<ImU32>(theme.text_primary);
 		materialized.text_secondary = static_cast<ImU32>(theme.text_secondary);
 		materialized.text_dim = static_cast<ImU32>(theme.text_dim);
-		materialized.acrylic_color = static_cast<DWORD>(theme.acrylic_color);
 		materialized.icon_index = theme.icon_index;
 		materialized.icon_file_path = theme.icon_file_path;
 		return materialized;
@@ -1276,7 +1271,6 @@ namespace {
 				{"text_primary", captured.text_primary},
 				{"text_secondary", captured.text_secondary},
 				{"text_dim", captured.text_dim},
-				{"acrylic_color", captured.acrylic_color},
 				{"icon_index", captured.icon_index},
 				{"icon_file_path", captured.icon_file_path}
 			});
@@ -3098,7 +3092,6 @@ void helpers::render_title()
 		themes::resolved.text_primary  = ct.text_primary;
 		themes::resolved.text_secondary= ct.text_secondary;
 		themes::resolved.text_dim      = ct.text_dim;
-		themes::resolved.acrylic_color = ct.acrylic_color;
 	} else {
 		themes::resolved = themes::presets[themes::active];
 	}
@@ -3146,7 +3139,6 @@ void helpers::render_title()
 				base.text_primary    = ct.text_primary;
 				base.text_secondary  = ct.text_secondary;
 				base.text_dim        = ct.text_dim;
-				base.acrylic_color   = ct.acrylic_color;
 				base.name            = ct.name;
 				if (first_apply) aida::ui::apply_immediate(base);
 				else             aida::ui::apply(base);
@@ -4051,13 +4043,9 @@ void helpers::render_title()
 				popup_x = std::max(wp.x + 8.f, popup_x);
 				ImGui::SetNextWindowPos(ImVec2(popup_x, wp.y + title_h + 2.f));
 				ImGui::SetNextWindowBgAlpha(0.96f);
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, metrics.corner_radius);
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(gap * 2.f, gap * 2.f));
-				const auto& th_tp = aida::ui::resolved();
-				ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(th_tp.bg_overlay));
-				ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(th_tp.border_strong));
+			const auto& th_tp = aida::ui::resolved();
 
-				if (ImGui::BeginPopup("##theme_popup",
+			if (ImGui::BeginPopup("##theme_popup",
 					ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
 					ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
 				{
@@ -4235,10 +4223,8 @@ void helpers::render_title()
 								custom_theme_ui_error().clear();
 						}
 					}
-					ImGui::EndPopup();
-				}
-				ImGui::PopStyleColor(2);
-				ImGui::PopStyleVar(2);
+				ImGui::EndPopup();
+			}
 			}
 
 
@@ -4248,15 +4234,7 @@ void helpers::render_title()
 				theme_editor_popup_requested = true;
 			}
 			if (custom_themes::editor_open) {
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.f, 12.f));
-				ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-				ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 5.f));
 				const auto& th_te = aida::ui::resolved();
-				ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(th_te.bg_elevated));
-				ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(th_te.border_strong));
-				ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(th_te.panel_header));
-				ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(th_te.text_primary));
 
 				bool theme_editor_stay_open = custom_themes::editor_open;
 				if (aida::ui::design::begin_dialog_exact("Theme Editor###theme_editor",
@@ -4530,10 +4508,8 @@ void helpers::render_title()
 						ImGui::EndPopup();
 					}
 				}
-				ImGui::EndPopup();
-				ImGui::PopStyleColor(4);
-				ImGui::PopStyleVar(4);
-				if (!theme_editor_stay_open) {
+			ImGui::EndPopup();
+			if (!theme_editor_stay_open) {
 					custom_themes::editor_open = false;
 					theme_editor_popup_requested = false;
 				}
@@ -4738,15 +4714,11 @@ void helpers::render_title()
 					popup_menu_font_size + aida::ui::scale_px(12.f, metrics.scale));
 				const float popup_native_spacing_y = (std::max)(0.f,
 					popup_native_row_height - popup_menu_font_size);
-				ImGui::SetNextWindowPos(ImVec2(bmin.x, my1 + gap));
-				ImGui::SetNextWindowBgAlpha(1.0f);
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, metrics.corner_radius);
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(gap * 1.5f, gap * 2.f));
-				ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-					ImVec2(0.f, popup_native_spacing_y));
-				ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th_mb.panel_bg, 1.f)));
-				ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0,0,0,0));
-				ImGui::PushFont(popup_menu_font, popup_menu_font_size);
+			ImGui::SetNextWindowPos(ImVec2(bmin.x, my1 + gap));
+			ImGui::SetNextWindowBgAlpha(1.0f);
+			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+				ImVec2(0.f, popup_native_spacing_y));
+			ImGui::PushFont(popup_menu_font, popup_menu_font_size);
 
 				char popup_id[32];
 				snprintf(popup_id, sizeof(popup_id), "##menu_%d", i);
@@ -5774,9 +5746,8 @@ void helpers::render_title()
 					menu_bar::open_menu = -1;
 					menu_bar::any_open = false;
 				}
-				ImGui::PopFont();
-				ImGui::PopStyleColor(2);
-				ImGui::PopStyleVar(3);
+			ImGui::PopFont();
+			ImGui::PopStyleVar(1);
 			}
 
 			mx_cursor += btn_w;
@@ -6091,9 +6062,6 @@ void helpers::render_title()
 
 		ImGui::SetNextWindowPos({px, py});
 		ImGui::SetNextWindowSize({sw, sh});
-		ImGui::PushStyleColor(ImGuiCol_WindowBg, aida::ui::with_alpha(th_pa.bg_elevated, pa_anim * 0.99f));
-		ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(th_pa.border_strong, pa_anim));
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
 
 		ImGui::Begin("##pa_popup", nullptr,
@@ -6150,27 +6118,19 @@ void helpers::render_title()
 			}
 
 
-			ImGui::SetCursorPos(ImVec2(1.f, hdr_h + 1.f));
-			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14, 10));
-			ImGui::BeginChild("##pa_inner", ImVec2(ws.x - 2.f, ws.y - hdr_h - 2.f), false,
-				ImGuiWindowFlags_NoBackground);
+		ImGui::SetCursorPos(ImVec2(1.f, hdr_h + 1.f));
+		ImGui::BeginChild("##pa_inner", ImVec2(ws.x - 2.f, ws.y - hdr_h - 2.f), false,
+			ImGuiWindowFlags_NoBackground);
 			{
 
-				ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-				ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10, 7));
-				ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(th_pa.bg_base));
-				ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImGui::ColorConvertU32ToFloat4(aida::ui::lighten(th_pa.bg_base, th_pa.is_dark ? 8 : -8)));
-				ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImGui::ColorConvertU32ToFloat4(aida::ui::lighten(th_pa.bg_base, th_pa.is_dark ? 14 : -14)));
-				ImGui::SetNextItemWidth(-1);
-				ImGui::InputTextWithHint("##pa_filter", "Search processes...",
-					globals::ui::process_filter_buf, sizeof(globals::ui::process_filter_buf));
+			ImGui::SetNextItemWidth(-1);
+			ImGui::InputTextWithHint("##pa_filter", "Search processes...",
+				globals::ui::process_filter_buf, sizeof(globals::ui::process_filter_buf));
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-				aida::preview::semantics::register_last_item(
-					"aida.process.attach.search", "process-search", true);
+			aida::preview::semantics::register_last_item(
+				"aida.process.attach.search", "process-search", true);
 #endif
-				ImGui::PopStyleColor(3);
-				ImGui::PopStyleVar(2);
-				ImGui::Spacing();
+			ImGui::Spacing();
 
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -6261,20 +6221,9 @@ void helpers::render_title()
 				}
 
 
-				float list_h = ws.y - hdr_h - 108.f;
+			float list_h = ws.y - hdr_h - 108.f;
 
-				ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, ImGui::ColorConvertU32ToFloat4(th_pa.panel_header));
-				ImGui::PushStyleColor(ImGuiCol_TableBorderLight, ImGui::ColorConvertU32ToFloat4(th_pa.border_subtle));
-				ImGui::PushStyleColor(ImGuiCol_TableBorderStrong, ImGui::ColorConvertU32ToFloat4(th_pa.border_strong));
-				ImGui::PushStyleColor(ImGuiCol_TableRowBg, ImVec4(0, 0, 0, 0));
-				ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th_pa.hover_wash, 0.5f)));
-				ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(ax_pa * 0.2f, ay_pa * 0.2f, az_pa * 0.2f, 0.45f));
-				ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(ax_pa * 0.28f, ay_pa * 0.28f, az_pa * 0.28f, 0.55f));
-				ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(ax_pa * 0.35f, ay_pa * 0.35f, az_pa * 0.35f, 0.65f));
-				ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(8, 5));
-				ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.f);
-
-				bool do_attach = false;
+			bool do_attach = false;
 				if (ImGui::BeginTable("##pa_table", 3,
 					ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
 					ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp,
@@ -6338,12 +6287,10 @@ void helpers::render_title()
 					}
 					}
 					process_clipper.End();
-					ImGui::EndTable();
-				}
-				ImGui::PopStyleVar(2);
-				ImGui::PopStyleColor(8);
+				ImGui::EndTable();
+			}
 
-				ImGui::Spacing();
+			ImGui::Spacing();
 
 
 				bool can_attach = !pa_attach_inflight && pa_selected >= 0 &&
@@ -6417,13 +6364,11 @@ void helpers::render_title()
 #endif
 				}
 			}
-			ImGui::EndChild();
-			ImGui::PopStyleVar();
-		}
-		ImGui::End();
-		ImGui::PopStyleVar(2);
-		ImGui::PopStyleColor(2);
-	} else {
+		ImGui::EndChild();
+	}
+	ImGui::End();
+	ImGui::PopStyleVar(1);
+} else {
 		pa_open_frame = -1;
 	}
 
@@ -6489,10 +6434,6 @@ void helpers::render_title()
 		ImGui::SetNextWindowPos(ImVec2(px, py));
 		ImGui::SetNextWindowSize(ImVec2(sw, sh));
 		ImGui::SetNextWindowFocus();
-		ImGui::PushStyleColor(ImGuiCol_WindowBg, aida::ui::with_alpha(th_ds.bg_elevated, ds_anim * 0.96f));
-		ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(th_ds.border_strong, ds_anim));
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 12));
 
 		ImGui::Begin("Driver Status##drv_dlg", nullptr,
 				ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -6754,8 +6695,6 @@ void helpers::render_title()
 			}
 		}
 		ImGui::End();
-		ImGui::PopStyleVar(2);
-		ImGui::PopStyleColor(2);
 	}
 
 
@@ -6853,10 +6792,6 @@ void helpers::render_title()
 		ImGui::SetNextWindowSize(ImVec2(sw, sh));
 		ImGui::SetNextWindowFocus();
 		const auto& th_kb = aida::ui::resolved();
-		ImGui::PushStyleColor(ImGuiCol_WindowBg, aida::ui::with_alpha(th_kb.bg_elevated, kb_anim * 0.96f));
-		ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(th_kb.border_strong, kb_anim));
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18, 14));
 
 		ImGui::Begin("Keyboard Shortcuts##kb_dlg", nullptr,
 				ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -7214,8 +7149,6 @@ void helpers::render_title()
 #endif
 		}
 		ImGui::End();
-		ImGui::PopStyleVar(2);
-		ImGui::PopStyleColor(2);
 	}
 
 	g_render_section = "popups_initial_analysis";

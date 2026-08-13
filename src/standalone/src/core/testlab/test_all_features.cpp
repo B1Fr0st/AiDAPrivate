@@ -5014,9 +5014,7 @@ namespace test_all_features {
 
 			std::string phase_label = load_label_snapshot(g_phase_label);
 			if (!phase_label.empty()) {
-				ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
 				ImGui::Text("Phase: %s", phase_label.c_str());
-				ImGui::PopStyleColor();
 			}
 
 			ImGui::Dummy(ImVec2(0.f, 6.f));
@@ -5034,9 +5032,7 @@ namespace test_all_features {
 					ImGui::Text("Target pid: %u   Driver: NOT ATTACHED", tpid);
 					ImGui::PopStyleColor();
 				} else {
-					ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
 					ImGui::TextUnformatted("Target pid: (none)   Driver: not attached");
-					ImGui::PopStyleColor();
 				}
 			}
 
@@ -5050,9 +5046,7 @@ namespace test_all_features {
 				int skipped = g_skipped.load();
 				int done    = passed + failed + skipped;
 
-				ImGui::PushStyleColor(ImGuiCol_Text, t.text_secondary);
 				ImGui::Text("Total: %d", total);
-				ImGui::PopStyleColor();
 				ImGui::SameLine(0.f, 16.f);
 
 				ImGui::PushStyleColor(ImGuiCol_Text, t.success);
@@ -5081,9 +5075,7 @@ namespace test_all_features {
 			ImGui::Dummy(ImVec2(0.f, 4.f));
 
 
-			ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
 			ImGui::TextUnformatted("TEST LOG");
-			ImGui::PopStyleColor();
 
 			float log_h = oh - ImGui::GetCursorPosY() - 30.f;
 			if (log_h < 100.f) log_h = 100.f;
@@ -5151,10 +5143,8 @@ namespace test_all_features {
 			ImGui::EndChild();
 
 
-			ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
 			ImGui::Text("Log file: %s", log_path());
 			ImGui::Text("Target log: %s", target_log_path());
-			ImGui::PopStyleColor();
 		}
 		ImGui::End();
 

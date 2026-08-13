@@ -1860,13 +1860,6 @@ float render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy + 4.f));
 	ImGui::PushItemWidth(108.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(t.bg_elevated, a));
-	ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, aida::ui::with_alpha(t.hover_wash, a));
-	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, a));
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_strong, a));
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 5.f));
 	if (ImGui::BeginCombo("##vtype", memory_scanner::value_type_name(sc.config.value_type))) {
 		for (int i = 0; i < static_cast<int>(memory_scanner::value_type_t::COUNT); ++i) {
 			auto vt = static_cast<memory_scanner::value_type_t>(i);
@@ -1883,20 +1876,11 @@ float render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 		}
 		ImGui::EndCombo();
 	}
-	ImGui::PopStyleVar(2);
-	ImGui::PopStyleColor(5);
 	ImGui::PopItemWidth();
 	cx += 116.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy + 4.f));
 	ImGui::PushItemWidth(190.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(t.bg_elevated, a));
-	ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, aida::ui::with_alpha(t.hover_wash, a));
-	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, a));
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_strong, a));
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 5.f));
 	if (ImGui::BeginCombo("##smode", memory_scanner::scan_mode_name(sc.config.scan_mode))) {
 		for (int i = 0; i < static_cast<int>(memory_scanner::scan_mode_t::COUNT); ++i) {
 			auto sm = static_cast<memory_scanner::scan_mode_t>(i);
@@ -1911,8 +1895,6 @@ float render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 		}
 		ImGui::EndCombo();
 	}
-	ImGui::PopStyleVar(2);
-	ImGui::PopStyleColor(5);
 	ImGui::PopItemWidth();
 	cx += 200.f;
 
@@ -1932,16 +1914,7 @@ float render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 		dl->AddRect(ia, ib, aida::ui::with_alpha(t.border_focus, a * 0.55f), 8.f, 0, 1.5f);
 		ImGui::SetCursorScreenPos(ImVec2(cx + 4.f, input_y + 2.f));
 		ImGui::PushItemWidth(input_w - 8.f);
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
-		ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, IM_COL32(0, 0, 0, 0));
-		ImGui::PushStyleColor(ImGuiCol_FrameBgActive, IM_COL32(0, 0, 0, 0));
-		ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, a));
-		ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, aida::ui::with_alpha(t.accent_dim, a));
-		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 8.f));
-		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 		ImGui::InputTextWithHint("##val", "value", ui.value_buf, sizeof(ui.value_buf));
-		ImGui::PopStyleVar(2);
-		ImGui::PopStyleColor(5);
 		ImGui::PopItemWidth();
 		cx += input_w + 10.f;
 	}
@@ -1960,12 +1933,7 @@ float render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 		dl->AddRect(ia2, ib2, aida::ui::with_alpha(t.border_focus, a * 0.55f), 8.f, 0, 1.5f);
 		ImGui::SetCursorScreenPos(ImVec2(cx + 4.f, input_y + 2.f));
 		ImGui::PushItemWidth(input2_w - 8.f);
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
-		ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, a));
-		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 8.f));
 		ImGui::InputTextWithHint("##val2", "max", ui.value_buf2, sizeof(ui.value_buf2));
-		ImGui::PopStyleVar();
-		ImGui::PopStyleColor(2);
 		ImGui::PopItemWidth();
 		cx += input2_w + 10.f;
 	}
@@ -3534,11 +3502,6 @@ void process_add_dialog() {
 	}
 
 	const auto& t = aida::ui::resolved();
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_strong, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, 1.f));
-	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 12.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.f, 16.f));
 
 	if (aida::ui::design::begin_dialog_exact("##value_scan_add_dialog",
 		ImVec2(500.f, 440.f), ImVec2(360.f, 300.f), nullptr,
@@ -3609,9 +3572,6 @@ void process_add_dialog() {
 		(void)sc;
 		ImGui::EndPopup();
 	}
-
-	ImGui::PopStyleVar(2);
-	ImGui::PopStyleColor(3);
 }
 
 void process_edit_description_dialog() {
@@ -3633,11 +3593,6 @@ void process_edit_description_dialog() {
 	s_ed_was_open = true;
 
 	const auto& t = aida::ui::resolved();
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_strong, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, 1.f));
-	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 12.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.f, 16.f));
 
 	if (aida::ui::design::begin_dialog_exact("##value_scan_edit_desc",
 		ImVec2(520.f, 380.f), ImVec2(360.f, 280.f), nullptr,
@@ -3704,9 +3659,6 @@ void process_edit_description_dialog() {
 		}
 		ImGui::EndPopup();
 	}
-
-	ImGui::PopStyleVar(2);
-	ImGui::PopStyleColor(3);
 }
 
 void process_edit_value_dialog() {
@@ -3741,11 +3693,6 @@ void process_edit_value_dialog() {
 	s_ev_was_open = true;
 
 	const auto& t = aida::ui::resolved();
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_strong, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, 1.f));
-	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 12.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.f, 16.f));
 
 	if (aida::ui::design::begin_dialog_exact("##value_scan_edit_value",
 		ImVec2(520.f, 440.f), ImVec2(360.f, 300.f), nullptr,
@@ -3843,9 +3790,6 @@ void process_edit_value_dialog() {
 		}
 		ImGui::EndPopup();
 	}
-
-	ImGui::PopStyleVar(2);
-	ImGui::PopStyleColor(3);
 }
 
 void process_change_type_dialog() {
@@ -3865,13 +3809,6 @@ void process_change_type_dialog() {
 		ImGui::OpenPopup("##value_scan_change_type");
 	}
 	s_ct_was_open = true;
-
-	const auto& t = aida::ui::resolved();
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_strong, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, 1.f));
-	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 12.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.f, 16.f));
 
 	if (aida::ui::design::begin_dialog_exact("##value_scan_change_type",
 		ImVec2(500.f, 360.f), ImVec2(360.f, 260.f), nullptr,
@@ -3930,9 +3867,6 @@ void process_change_type_dialog() {
 		}
 		ImGui::EndPopup();
 	}
-
-	ImGui::PopStyleVar(2);
-	ImGui::PopStyleColor(3);
 }
 
 void process_result_context_menu() {

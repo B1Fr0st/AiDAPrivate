@@ -2219,7 +2219,6 @@ void init_standalone_chat()
                     ct.text_primary  = jt.value("text_primary",  (uint32_t)ct.text_primary);
                     ct.text_secondary= jt.value("text_secondary",(uint32_t)ct.text_secondary);
                     ct.text_dim      = jt.value("text_dim",      (uint32_t)ct.text_dim);
-                    ct.acrylic_color = jt.value("acrylic_color", (DWORD)ct.acrylic_color);
                     ct.icon_index    = jt.value("icon_index",    ct.icon_index);
                     ct.icon_file_path= jt.value("icon_file_path", std::string{});
                     const bool accent_valid = std::isfinite(ct.accent[0]) &&
@@ -6905,11 +6904,9 @@ void render_chat_view(float width, float height)
                 chat_edit::msg_idx = -1;
             }
         } else if (message.is_user) {
-            ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::resolved().text_primary);
             ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + available_width);
             ImGui::TextUnformatted(message.text.c_str());
             ImGui::PopTextWrapPos();
-            ImGui::PopStyleColor();
         } else {
             if (message.has_thinking && !message.thinking_text.empty() &&
                 ImGui::TreeNode("Reasoning")) {
@@ -7197,16 +7194,6 @@ void render_chat_view(float width, float height)
         ImVec2(composer_origin.x + body_width,
             composer_origin.y - chat_metrics.spacing_xs),
         composer_theme.border_subtle);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, scaled(5.f));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
-    ImGui::PushStyleColor(ImGuiCol_FrameBg,
-        ImGui::ColorConvertU32ToFloat4(composer_theme.bg_elevated));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
-        ImGui::ColorConvertU32ToFloat4(composer_theme.panel_header));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
-        ImGui::ColorConvertU32ToFloat4(composer_theme.panel_header));
-    ImGui::PushStyleColor(ImGuiCol_Border,
-        ImGui::ColorConvertU32ToFloat4(composer_theme.border_subtle));
     ImGui::SetNextItemWidth(input_width);
     ImGui::BeginDisabled(conversation_store_blocked);
     const bool enter = ImGui::InputTextMultiline("##registry_chat_input", g_chat_buf, sizeof(g_chat_buf),
@@ -7221,8 +7208,6 @@ void render_chat_view(float width, float height)
                 input_min.y + ImGui::GetStyle().FramePadding.y),
             composer_theme.text_dim, "Ask AiDA about the active workspace...");
     }
-    ImGui::PopStyleColor(4);
-    ImGui::PopStyleVar(2);
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
     static_cast<void>(aida::preview::semantics::register_last_item(
         "aida.ai.chat.composer", "chat-composer", false,
@@ -7238,13 +7223,6 @@ void render_chat_view(float width, float height)
     const ImU32 primary_fill = busy
         ? aida::ui::mix(composer_theme.panel_header, composer_theme.warning, 0.24f)
         : composer_theme.accent_dim;
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, scaled(5.f));
-    ImGui::PushStyleColor(ImGuiCol_Button,
-        ImGui::ColorConvertU32ToFloat4(primary_fill));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-        ImGui::ColorConvertU32ToFloat4(composer_theme.accent_hover));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-        ImGui::ColorConvertU32ToFloat4(composer_theme.accent_u32));
     if (conversation_store_blocked) {
         ImGui::BeginDisabled();
         ImGui::Button(conversation_store_pending
@@ -7290,8 +7268,6 @@ void render_chat_view(float width, float height)
             "Type a message to enable Send", "Enter");
         submit = (submit || enter) && has_text;
     }
-    ImGui::PopStyleColor(3);
-    ImGui::PopStyleVar();
     const bool compact_status = body_width < scaled(280.f);
     if (conversation_store_pending) ImGui::TextDisabled("Conversation transaction in progress");
     else if (conversation_persistence.failed) ImGui::TextDisabled("Conversation persistence requires retry");
@@ -7666,11 +7642,6 @@ void render_tool_approval_dialog()
 
     ImGui::OpenPopup("##tool_approval");
 
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::resolved().bg_elevated);
-    ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::resolved().border_strong);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.f, 12.f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
-
     if (aida::ui::design::begin_dialog_exact("##tool_approval",
             ImVec2(500.0f, 360.0f), ImVec2(360.0f, 280.0f), nullptr,
             ImGuiWindowFlags_NoTitleBar)) {
@@ -7694,11 +7665,9 @@ void render_tool_approval_dialog()
 
         if (!args_preview.empty()) {
             ImGui::Text("Arguments:");
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, aida::ui::with_alpha(aida::ui::resolved().bg_base, 0.78f));
             ImGui::BeginChild("##tool_args", ImVec2(-1.f, 100.f), ImGuiChildFlags_Borders);
             ImGui::TextWrapped("%s", args_preview.c_str());
             ImGui::EndChild();
-            ImGui::PopStyleColor();
         }
 
         aida::ui::design::end_dialog_body();
@@ -7721,8 +7690,6 @@ void render_tool_approval_dialog()
 
         ImGui::EndPopup();
     }
-    ImGui::PopStyleVar(2);
-    ImGui::PopStyleColor(2);
 }
 
 
@@ -8210,11 +8177,7 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
     }
     ImGui::SetNextWindowPos(popup_anchor, ImGuiCond_Always, popup_pivot);
     ImGui::SetNextWindowSizeConstraints(ImVec2(popup_min_w, popup_min_h), ImVec2(popup_max_w, clamp_h));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 10.f));
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::min(anim.popup_alpha * 2.f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.panel_bg, 0.98f)));
-    ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.border_strong, 0.9f)));
 
     if (ImGui::BeginPopup("##chat_model_pill_popup",
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -8312,7 +8275,6 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
             ImGui::SetCursorScreenPos(ImVec2(row_cur.x, row_cur.y));
             ImGui::Dummy(ImVec2(popup_inner_w, btn_h + 4.f));
         } else {
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.f, 0.f, 0.f, 0.f));
             ImGui::BeginChild("##chat_model_pill_provider_strip",
                 ImVec2(popup_inner_w, seg_h + 4.f),
                 false,
@@ -8393,20 +8355,13 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
             ImGui::SetCursorScreenPos(ImVec2(strip_cursor_x, strip_cursor_y));
             ImGui::Dummy(ImVec2(total_strip_w, seg_h));
             ImGui::EndChild();
-            ImGui::PopStyleColor();
         }
 
         ImGui::Spacing();
 
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 6.f));
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.bg_overlay, 0.9f)));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(th.text_primary));
         ImGui::SetNextItemWidth(popup_inner_w);
         if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
         ImGui::InputTextWithHint("##chat_model_pill_filter", "Search models...", s_filter, sizeof(s_filter));
-        ImGui::PopStyleColor(2);
-        ImGui::PopStyleVar(2);
 
         std::string filter_lower;
         for (const char* p = s_filter; *p; ++p)
@@ -8414,7 +8369,6 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
 
         ImGui::Spacing();
 
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.f, 0.f, 0.f, 0.f));
         float list_h = std::max(140.f, std::min(400.f, clamp_h - 60.f - seg_h - 10.f));
         ImGui::BeginChild("##chat_model_pill_list", ImVec2(popup_inner_w, list_h), false, ImGuiWindowFlags_NoBackground);
 
@@ -8554,12 +8508,10 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
         }
 
         ImGui::EndChild();
-        ImGui::PopStyleColor();
 
         ImGui::EndPopup();
     }
-    ImGui::PopStyleColor(2);
-    ImGui::PopStyleVar(3);
+    ImGui::PopStyleVar();
     ImGui::PopID();
 }
 
@@ -8669,11 +8621,7 @@ void chat_render_skills_pill(float anchor_x, float anchor_y, float alpha, char* 
     }
     ImGui::SetNextWindowPos(popup_anchor, ImGuiCond_Always, popup_pivot);
     ImGui::SetNextWindowSizeConstraints(ImVec2(popup_min_w, popup_min_h), ImVec2(popup_max_w, clamp_h));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 10.f));
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::min(anim.popup_alpha * 2.f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.panel_bg, 0.98f)));
-    ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.border_strong, 0.9f)));
 
     if (ImGui::BeginPopup("##chat_skills_pill_popup",
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -8681,22 +8629,15 @@ void chat_render_skills_pill(float anchor_x, float anchor_y, float alpha, char* 
     {
         static char s_filter[96] = {};
 
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 6.f));
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.bg_overlay, 0.9f)));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(th.text_primary));
         ImGui::SetNextItemWidth(360.f);
         if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
         ImGui::InputTextWithHint("##chat_skills_filter", "Search skills...", s_filter, sizeof(s_filter));
-        ImGui::PopStyleColor(2);
-        ImGui::PopStyleVar(2);
 
         std::string filter_lower;
         for (const char* p = s_filter; *p; ++p)
             filter_lower += static_cast<char>(std::tolower(static_cast<unsigned char>(*p)));
 
         ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.f, 0.f, 0.f, 0.f));
         float list_h = std::max(120.f, std::min(320.f, clamp_h - 60.f));
         ImGui::BeginChild("##chat_skills_list", ImVec2(360.f, list_h), false, ImGuiWindowFlags_NoBackground);
 
@@ -8796,12 +8737,10 @@ void chat_render_skills_pill(float anchor_x, float anchor_y, float alpha, char* 
         }
 
         ImGui::EndChild();
-        ImGui::PopStyleColor();
 
         ImGui::EndPopup();
     }
-    ImGui::PopStyleColor(2);
-    ImGui::PopStyleVar(3);
+    ImGui::PopStyleVar();
     ImGui::PopID();
 }
 
@@ -8933,11 +8872,7 @@ void chat_render_mcp_pill(float anchor_x, float anchor_y, float alpha)
     }
     ImGui::SetNextWindowPos(popup_anchor, ImGuiCond_Always, popup_pivot);
     ImGui::SetNextWindowSizeConstraints(ImVec2(popup_min_w, popup_min_h), ImVec2(popup_max_w, clamp_h));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.f, 10.f));
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::min(anim.popup_alpha * 2.f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.panel_bg, 0.98f)));
-    ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.border_strong, 0.9f)));
 
     if (ImGui::BeginPopup("##chat_mcp_pill_popup",
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -8995,7 +8930,6 @@ void chat_render_mcp_pill(float anchor_x, float anchor_y, float alpha)
 
         ImGui::EndPopup();
     }
-    ImGui::PopStyleColor(2);
-    ImGui::PopStyleVar(3);
+    ImGui::PopStyleVar();
     ImGui::PopID();
 }

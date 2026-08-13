@@ -1372,7 +1372,7 @@ if(WIN32)
         set(STANDALONE_SOURCES
             "${STANDALONE_ROOT}/main.cpp"
             "${STANDALONE_ROOT}/helpers/helpers.cpp"
-            "${STANDALONE_ROOT}/helpers/blur.cpp"
+        
             "${STANDALONE_ROOT}/helpers/imgui_dx11_d3dcompile_stub.cpp"
             "${STANDALONE_ROOT}/helpers/icon_loodr.cpp"
             "${STANDALONE_ROOT}/helpers/file_browser.cpp"

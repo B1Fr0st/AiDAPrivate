@@ -3338,17 +3338,10 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 			col, tab_name_str);
 
 		if (use_short_labels && hov) {
-			const auto& thz = aida::ui::resolved();
-			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 6.f));
-			ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(thz.bg_overlay));
 			if (ImGui::BeginTooltip()) {
-				ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(thz.text_primary));
 				ImGui::TextUnformatted(tab_full_name);
-				ImGui::PopStyleColor();
 				ImGui::EndTooltip();
 			}
-			ImGui::PopStyleColor();
-			ImGui::PopStyleVar();
 		}
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {

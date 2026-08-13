@@ -613,16 +613,12 @@ bool begin_expert_table(const char* stable_id, int columns, ImGuiTableFlags flag
     const ImGuiTableFlags defaults = ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable |
         ImGuiTableFlags_Hideable | ImGuiTableFlags_Sortable | ImGuiTableFlags_RowBg |
         ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
-    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding,
-        ImVec2(metrics().spacing_sm, (metrics().table_row_height - ImGui::GetFontSize()) * 0.5f));
     const bool open = ImGui::BeginTable(safe(stable_id), columns, defaults | flags, size);
-    if (!open) ImGui::PopStyleVar();
-    return open;
+    if (!open) return open;
 }
 
 void end_expert_table() {
     ImGui::EndTable();
-    ImGui::PopStyleVar();
 }
 
 bool tree_node(const char* stable_id, const char* label, bool selected, ImGuiTreeNodeFlags flags) {

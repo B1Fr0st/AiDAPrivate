@@ -358,9 +358,7 @@ void render(float pos_x, float pos_y, float width, float height,
         if (rows.empty()) {
             ImGui::TableNextRow(ImGuiTableRowFlags_None, row_h);
             ImGui::TableSetColumnIndex(0);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)));
             ImGui::TextUnformatted("No tracked browser processes.");
-            ImGui::PopStyleColor();
         }
 
         for (size_t i = 0; i < rows.size(); ++i) {

@@ -1719,14 +1719,6 @@ void render_pending_confirm_modal()
 
     const auto& tk = aida::ui::resolved();
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.f, 16.f));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 8.f));
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(tk.bg_overlay));
-    ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(tk.border_subtle));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(tk.panel_bg));
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tk.text_primary));
     ImGui::SetNextWindowBgAlpha(1.0f);
 
     bool open_flag_local = true;
@@ -1765,25 +1757,19 @@ void render_pending_confirm_modal()
             ImGui::TextUnformatted(fname.c_str());
         }
 
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tk.text_dim));
         std::string path_display = file_browser::pending_open_path;
         std::string path_clip = truncate_middle(path_display, 70);
         ImGui::TextWrapped("%s", path_clip.c_str());
-        ImGui::PopStyleColor();
 
         ImGui::Spacing();
         ImGui::TextWrapped("do you want to load this file?");
         ImGui::Spacing();
 
         if (already_open) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tk.text_secondary));
             ImGui::TextWrapped("Already open in a tab -- click 'Switch' to focus it.");
-            ImGui::PopStyleColor();
         } else if (analysis_session::session_count() >= analysis_session::kMaxSessions) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tk.text_secondary));
             ImGui::TextWrapped("Already at %zu open binaries. The oldest will be closed to make room.",
                                analysis_session::kMaxSessions);
-            ImGui::PopStyleColor();
         }
 
         aida::ui::design::end_dialog_body();
@@ -1826,9 +1812,6 @@ void render_pending_confirm_modal()
     } else {
         file_browser::pending_open_modal_visible = false;
     }
-
-    ImGui::PopStyleColor(4);
-    ImGui::PopStyleVar(4);
 }
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)

@@ -972,14 +972,6 @@ void render(float pos_x, float pos_y, float width, float height,
 	float cy = oy + 8.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(
-		aida::ui::with_alpha(th.panel_header, alpha)));
-	ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(
-		aida::ui::with_alpha(th.border_subtle, alpha)));
-	ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-		aida::ui::with_alpha(th.text_primary, alpha)));
 
 	ImGui::PushItemWidth(160.f);
 	ImGui::InputTextWithHint("##sr_addr", "Base address (hex)", sr.address_input, sizeof(sr.address_input));
@@ -992,9 +984,6 @@ void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PushItemWidth(70.f);
 	ImGui::InputTextWithHint("##sr_size", "Size", sr.size_input, sizeof(sr.size_input));
 	ImGui::PopItemWidth();
-
-	ImGui::PopStyleColor(3);
-	ImGui::PopStyleVar(2);
 
 	cy += 32.f;
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));

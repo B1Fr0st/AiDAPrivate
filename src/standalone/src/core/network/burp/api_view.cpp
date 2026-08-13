@@ -241,7 +241,6 @@ void render(float pos_x, float pos_y, float width, float height,
     s_state.active = true;
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
     ImGui::BeginChild("##api_root", ImVec2(width, height), false);
 
     float toolbar_h = 64.f;
@@ -675,7 +674,6 @@ void render(float pos_x, float pos_y, float width, float height,
         {
             ImFont* mono = aida::ui::fonts::code();
             if (mono) ImGui::PushFont(mono);
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(th.panel_header, alpha));
             ImGui::InputTextMultiline("##api_resp_text", retained_response.data(),
                                        retained_response.size() + 1,
                                        ImVec2(right_w - 16.f, content_h - 280.f),
@@ -713,7 +711,6 @@ void render(float pos_x, float pos_y, float width, float height,
                         ? network_view::exchange_context_origin_t::menu_key
                         : network_view::exchange_context_origin_t::shift_f10);
             }
-            ImGui::PopStyleColor();
             if (mono) ImGui::PopFont();
         }
     } else {
@@ -725,9 +722,7 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
     ImGui::EndChild();
-
     ImGui::EndChild();
-    ImGui::PopStyleColor();
 }
 
 }

@@ -324,16 +324,10 @@ namespace settings_overlay {
 						ImVec2(label_x, a.y + (row_h - 4.f - sz.y) * 0.5f),
 						is_active ? active_text : dim_text, truncated.c_str());
 					if (hov && label && *label) {
-						ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 6.f));
-						ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(th.bg_overlay));
 						if (ImGui::BeginTooltip()) {
-							ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(th.text_primary));
 							ImGui::TextUnformatted(label);
-							ImGui::PopStyleColor();
 							ImGui::EndTooltip();
 						}
-						ImGui::PopStyleColor();
-						ImGui::PopStyleVar();
 					}
 				} else {
 					dl->AddText(font, fs,
@@ -739,8 +733,6 @@ namespace settings_overlay {
 				ImVec2 command_sz = code_font->CalcTextSizeA(code_fs, FLT_MAX, command_w,
 					launch.c_str());
 				const float command_h = (std::min)(92.f, (std::max)(38.f, command_sz.y + 16.f));
-				ImGui::PushStyleColor(ImGuiCol_ChildBg,
-					ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.panel_header, 0.42f)));
 				ImGui::BeginChild("##market_launch_cmd", ImVec2(0.f, command_h), true,
 					ImGuiWindowFlags_NoSavedSettings);
 				ImGui::PushFont(code_font);
@@ -750,7 +742,6 @@ namespace settings_overlay {
 				ImGui::PopTextWrapPos();
 				ImGui::PopFont();
 				ImGui::EndChild();
-				ImGui::PopStyleColor();
 				ImGui::Dummy(ImVec2(0.f, 5.f));
 
 				const bool connected = st == mcp_client::connection_state_t::connected;
@@ -831,8 +822,6 @@ namespace settings_overlay {
 			const float dt = aida::ui::clock::dt();
 			ImGui::PushID("##mcp_settings_tab");
 			ImGui::PushFont(aida::ui::fonts::lg());
-			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 8.f));
-			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 7.f));
 
 			const ImVec2 mcp_tab_origin = ImGui::GetCursorScreenPos();
 
@@ -920,7 +909,6 @@ namespace settings_overlay {
 			if (avail_w < 320.f) {
 				aida::ui::responsive::draw_clamp_overlay(mcp_tab_origin,
 					ImVec2(content_w, content_h), "Widen Settings to edit MCP servers");
-				ImGui::PopStyleVar(2);
 				ImGui::PopFont();
 				ImGui::PopID();
 				return;
@@ -949,10 +937,6 @@ namespace settings_overlay {
 				s_mcp_logged_stack = false;
 			}
 
-			ImGui::PushStyleColor(ImGuiCol_ChildBg,
-				ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.panel_header, 0.22f)));
-			ImGui::PushStyleColor(ImGuiCol_Border,
-				ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.border_subtle, 0.85f)));
 			ImGui::BeginChild("##mcp_list", ImVec2(left_w, list_h), true,
 				ImGuiWindowFlags_NoSavedSettings);
 
@@ -1281,7 +1265,6 @@ namespace settings_overlay {
 			render_marketplace_server_review(mgr, statuses);
 
 			ImGui::EndChild();
-			ImGui::PopStyleColor(2);
 
 			ImGui::Dummy(ImVec2(0.f, 12.f));
 
@@ -1442,7 +1425,6 @@ namespace settings_overlay {
 					ImVec2(content_w, content_h), "Settings pane too narrow");
 			}
 
-			ImGui::PopStyleVar(2);
 			ImGui::PopFont();
 			ImGui::PopID();
 
@@ -1458,8 +1440,6 @@ namespace settings_overlay {
 
 			ImGui::PushID("##editor_theme_tab");
 			ImGui::PushFont(aida::ui::fonts::lg());
-			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.f, 10.f));
-			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 7.f));
 
 			ImGui::BeginChild("##editor_theme_scroll", ImVec2(content_w, content_h), false,
 				ImGuiWindowFlags_NoSavedSettings);
@@ -1481,10 +1461,6 @@ namespace settings_overlay {
 			const float field_w = (std::min)(240.f, (std::max)(140.f, card_w - 24.f));
 			bool changed = false;
 
-			ImGui::PushStyleColor(ImGuiCol_ChildBg,
-				ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.panel_header, 0.22f)));
-			ImGui::PushStyleColor(ImGuiCol_Border,
-				ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.border_subtle, 0.85f)));
 			ImGui::SetCursorPosX(ImGui::GetCursorPosX() + pad);
 			ImGui::BeginChild("##editor_code_card", ImVec2(card_w, 184.f), true,
 				ImGuiWindowFlags_NoSavedSettings);
@@ -1581,13 +1557,11 @@ namespace settings_overlay {
 				&g_sa_settings.ui_diagnostics_mode))
 				static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 			ImGui::EndChild();
-			ImGui::PopStyleColor(2);
 			ImGui::EndChild();
 
 			if (changed)
 				persist_editor_locked(s);
 
-			ImGui::PopStyleVar(2);
 			ImGui::PopFont();
 			ImGui::PopID();
 		}

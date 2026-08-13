@@ -12,8 +12,6 @@
 #include <TlHelp32.h>
 #include <algorithm>
 #include "helpers/helpers.h"
-#include "helpers/blur.h"
-#include <dwmapi.h>
 #include <shellscalingapi.h>
 #include "helpers/globals.h"
 #include "core/ui/clock.hpp"
@@ -21,7 +19,6 @@
 #include "core/ui/transition.hpp"
 #include "core/ui/theme.hpp"
 #include "core/ui/ui_thread_dispatcher.hpp"
-#include "core/ui/blur_layer.hpp"
 #include "core/ui/components.hpp"
 #include "core/ui/fonts.hpp"
 #include "core/ui/ide_shell.hpp"
@@ -92,7 +89,6 @@ namespace test_all_features {
 #include <intrin.h>
 #endif
 
-#pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "Shcore.lib")
 
 namespace aida_early_startup {
@@ -525,7 +521,6 @@ static constexpr uint32_t kAidaMessagePumpBudgetMessages = 192;
 static constexpr uint32_t kAidaMidFramePumpBudgetMessages = 32;
 static constexpr uint64_t kAidaRecentInputWakeMs = 250ULL;
 static constexpr uint64_t kAidaInteractiveRenderCadenceMs = 16ULL;
-static constexpr uint64_t kAidaInteractiveBlurPressureMs = 180ULL;
 static constexpr DWORD kAidaResizeCoalesceMs = 16;
 static constexpr uint64_t kAidaResizeChurnWindowMs = 1000ULL;
 static constexpr uint32_t kAidaResizeChurnThreshold = 4;
@@ -1678,12 +1673,9 @@ struct resize_perf_state_t {
     uint64_t skipped_redundant = 0;
     uint64_t coalesced = 0;
     uint64_t render_target_recreates = 0;
-    uint64_t blur_resize_calls = 0;
     uint64_t churn_window_start_ms = 0;
     uint32_t churn_window_recreates = 0;
     uint64_t last_churn_log_ms = 0;
-    int blur_w = 0;
-    int blur_h = 0;
 };
 
 static resize_perf_state_t g_resize_perf;
@@ -2218,31 +2210,6 @@ static void rebuild_fonts(float dpi_scale)
 
 bool g_imgui_dx11_initialized = false;
 
-static DWORD compute_acrylic_color_for_theme()
-{
-    const auto& t = aida::ui::resolved();
-    return ((DWORD)t.acrylic_color & 0x00FFFFFFu) | (0xFFu << 24);
-}
-
-void set_acrylic_color(HWND hwnd)
-{
-    if (!aida::ui_thread::require_owner("dwm", "set_acrylic_color", "enter"))
-        return;
-    struct ACCENT_POLICY { DWORD AccentState; DWORD AccentFlags; DWORD GradientColor; DWORD AnimationId; };
-    struct WINCOMPATTRDATA { DWORD Attribute; PVOID pData; ULONG DataSize; };
-
-    auto SetWindowCompositionAttribute = (BOOL(WINAPI*)(HWND, void*))
-        GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
-    if (!SetWindowCompositionAttribute) return;
-
-    DWORD color = compute_acrylic_color_for_theme();
-    ACCENT_POLICY accent = { 3, 2, color, 0 };
-
-    WINCOMPATTRDATA data = { 19, &accent, sizeof(accent) };
-    SetWindowCompositionAttribute(hwnd, &data);
-    diag::log_tagged_fmt("ui", "acrylic_set color=0x%08X alpha=0xFF (forced opaque)", color);
-}
-
 static bool os_prefers_dark()
 {
     HKEY hk;
@@ -2265,16 +2232,12 @@ static void apply_initial_theme()
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-    aida::ui::apply_immediate(aida::ui::detail::make_aida_dark());
+    aida::ui::apply_immediate(aida::ui::detail::make_default());
     diag::log_tagged_critical_fmt("theme",
         "apply_initial_theme_exit pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-}
-
-static void apply_os_theme_animated()
-{
 }
 
 static void crash_log_write(const char* msg)
@@ -2937,7 +2900,6 @@ namespace aida_tracer {
     inline std::atomic<uint64_t> g_dx11_draw_cmd_count{0};
     inline std::atomic<uint64_t> g_dx11_user_callback_count{0};
     inline std::atomic<uint64_t> g_dx11_reset_callback_count{0};
-    inline std::atomic<uint64_t> g_dx11_expected_blur_callback_count{0};
     inline std::atomic<uint64_t> g_dx11_unexpected_callback_count{0};
     inline std::atomic<UINT_PTR> g_dx11_first_callback{0};
     inline std::atomic<UINT_PTR> g_dx11_first_callback_data{0};
@@ -3406,7 +3368,6 @@ namespace aida_tracer {
         uint64_t draw_cmds = 0;
         uint64_t user_callbacks = 0;
         uint64_t reset_callbacks = 0;
-        uint64_t expected_blur_callbacks = 0;
         uint64_t unexpected_callbacks = 0;
         UINT_PTR first_callback = 0;
         UINT_PTR first_callback_data = 0;
@@ -3418,7 +3379,6 @@ namespace aida_tracer {
         uint32_t bad_flags = 0;
         int bad_list = -1;
         int bad_cmd = -1;
-        ImDrawCallback expected_blur_callback = Blur::ExpectedCallback();
 
         if (!dd) {
             bad_flags |= 0x00000001u;
@@ -3444,7 +3404,6 @@ namespace aida_tracer {
                 g_dx11_draw_cmd_count.store(0, std::memory_order_release);
                 g_dx11_user_callback_count.store(0, std::memory_order_release);
                 g_dx11_reset_callback_count.store(0, std::memory_order_release);
-                g_dx11_expected_blur_callback_count.store(0, std::memory_order_release);
                 g_dx11_unexpected_callback_count.store(0, std::memory_order_release);
                 g_dx11_first_callback.store(0, std::memory_order_release);
                 g_dx11_first_callback_data.store(0, std::memory_order_release);
@@ -3511,13 +3470,6 @@ namespace aida_tracer {
                     if (cmd.UserCallback) {
                         if (cmd.UserCallback == ImDrawCallback_ResetRenderState) {
                             ++reset_callbacks;
-                        } else if (expected_blur_callback && cmd.UserCallback == expected_blur_callback) {
-                            ++user_callbacks;
-                            ++expected_blur_callbacks;
-                            if (first_callback == 0) {
-                                first_callback = reinterpret_cast<UINT_PTR>(cmd.UserCallback);
-                                first_callback_data = reinterpret_cast<UINT_PTR>(cmd.UserCallbackData);
-                            }
                         } else {
                             ++user_callbacks;
                             ++unexpected_callbacks;
@@ -3538,7 +3490,6 @@ namespace aida_tracer {
         g_dx11_draw_cmd_count.store(draw_cmds, std::memory_order_release);
         g_dx11_user_callback_count.store(user_callbacks, std::memory_order_release);
         g_dx11_reset_callback_count.store(reset_callbacks, std::memory_order_release);
-        g_dx11_expected_blur_callback_count.store(expected_blur_callbacks, std::memory_order_release);
         g_dx11_unexpected_callback_count.store(unexpected_callbacks, std::memory_order_release);
         g_dx11_first_callback.store(first_callback, std::memory_order_release);
         g_dx11_first_callback_data.store(first_callback_data, std::memory_order_release);
@@ -3551,7 +3502,7 @@ namespace aida_tracer {
 
         if (bad_flags != 0 || unexpected_callbacks != 0) {
             diag::log_tagged_critical_fmt("render",
-                "dx11_drawdata_inspect frame=%llu bad=0x%08lX bad_list=%d bad_cmd=%d lists=%d total_vtx=%d total_idx=%d draw_cmds=%llu callbacks=%llu expected_blur_callbacks=%llu unexpected_callbacks=%llu reset_callbacks=%llu first_cb=0x%llX cb_data=0x%llX first_unexpected_cb=0x%llX unexpected_cb_data=0x%llX first_tex=0x%llX tex_hash=0x%016llX max_elem=%llu full_test=%d",
+                "dx11_drawdata_inspect frame=%llu bad=0x%08lX bad_list=%d bad_cmd=%d lists=%d total_vtx=%d total_idx=%d draw_cmds=%llu callbacks=%llu unexpected_callbacks=%llu reset_callbacks=%llu first_cb=0x%llX cb_data=0x%llX first_unexpected_cb=0x%llX unexpected_cb_data=0x%llX first_tex=0x%llX tex_hash=0x%016llX max_elem=%llu full_test=%d",
                 static_cast<unsigned long long>(frame),
                 static_cast<unsigned long>(bad_flags),
                 bad_list,
@@ -3561,7 +3512,6 @@ namespace aida_tracer {
                 dd ? dd->TotalIdxCount : -1,
                 static_cast<unsigned long long>(draw_cmds),
                 static_cast<unsigned long long>(user_callbacks),
-                static_cast<unsigned long long>(expected_blur_callbacks),
                 static_cast<unsigned long long>(unexpected_callbacks),
                 static_cast<unsigned long long>(reset_callbacks),
                 static_cast<unsigned long long>(first_callback),
@@ -3589,7 +3539,6 @@ namespace aida_tracer {
             static std::atomic<uint64_t> s_expected_callback_suppressed{0};
             uint64_t callback_hash = 14695981039346656037ULL;
             callback_hash = mix_u64(callback_hash, user_callbacks);
-            callback_hash = mix_u64(callback_hash, expected_blur_callbacks);
             callback_hash = mix_u64(callback_hash, reset_callbacks);
             callback_hash = mix_u64(callback_hash, first_callback);
             callback_hash = mix_u64(callback_hash, max_elem_count);
@@ -3601,10 +3550,9 @@ namespace aida_tracer {
                 s_last_expected_callback_hash.store(callback_hash, std::memory_order_release);
                 s_last_expected_callback_log_ms.store(now_ms, std::memory_order_release);
                 diag::log_tagged_fmt("render",
-                    "dx11_drawdata_callbacks_summary frame=%llu callbacks=%llu expected_blur_callbacks=%llu unexpected_callbacks=%llu reset_callbacks=%llu first_cb=0x%llX cb_data=0x%llX tex_hash=0x%016llX max_elem=%llu suppressed=%llu full_test=%d",
+                    "dx11_drawdata_callbacks_summary frame=%llu callbacks=%llu unexpected_callbacks=%llu reset_callbacks=%llu first_cb=0x%llX cb_data=0x%llX tex_hash=0x%016llX max_elem=%llu suppressed=%llu full_test=%d",
                     static_cast<unsigned long long>(frame),
                     static_cast<unsigned long long>(user_callbacks),
-                    static_cast<unsigned long long>(expected_blur_callbacks),
                     static_cast<unsigned long long>(unexpected_callbacks),
                     static_cast<unsigned long long>(reset_callbacks),
                     static_cast<unsigned long long>(first_callback),
@@ -4620,7 +4568,7 @@ static void record_resize_recreate(const char* source, UINT w, UINT h, uint64_t 
         now_ms - g_resize_perf.last_churn_log_ms >= kAidaResizeChurnWindowMs) {
         g_resize_perf.last_churn_log_ms = now_ms;
         diag::log_tagged_fmt("render",
-            "resize_churn source=%s frame=%llu w=%u h=%u window_ms=%llu recreates=%u requests=%llu applied=%llu coalesced=%llu skipped=%llu rt_recreates=%llu blur_resizes=%llu",
+            "resize_churn source=%s frame=%llu w=%u h=%u window_ms=%llu recreates=%u requests=%llu applied=%llu coalesced=%llu skipped=%llu rt_recreates=%llu",
             source ? source : "<null>",
             static_cast<unsigned long long>(frame_number),
             w,
@@ -4631,8 +4579,7 @@ static void record_resize_recreate(const char* source, UINT w, UINT h, uint64_t 
             static_cast<unsigned long long>(g_resize_perf.applied),
             static_cast<unsigned long long>(g_resize_perf.coalesced),
             static_cast<unsigned long long>(g_resize_perf.skipped_redundant),
-            static_cast<unsigned long long>(g_resize_perf.render_target_recreates),
-            static_cast<unsigned long long>(g_resize_perf.blur_resize_calls));
+            static_cast<unsigned long long>(g_resize_perf.render_target_recreates));
     }
 }
 
@@ -5468,7 +5415,6 @@ struct draw_data_metrics_t {
     int draw_cmds = 0;
     int callbacks = 0;
     int reset_callbacks = 0;
-    int expected_blur_callbacks = 0;
     int unexpected_callbacks = 0;
     int total_vtx = 0;
     int total_idx = 0;
@@ -5495,7 +5441,6 @@ static draw_data_metrics_t collect_draw_data_metrics(ImDrawData* draw_data, bool
         }
         return out;
     }
-    ImDrawCallback expected_blur_callback = Blur::ExpectedCallback();
     for (int list_index = 0; list_index < list_count; ++list_index) {
         const ImDrawList* list = draw_data->CmdLists[list_index];
         if (!list)
@@ -5509,10 +5454,7 @@ static draw_data_metrics_t collect_draw_data_metrics(ImDrawData* draw_data, bool
                 ++out.reset_callbacks;
             else {
                 ++out.callbacks;
-                if (expected_blur_callback && cmd.UserCallback == expected_blur_callback)
-                    ++out.expected_blur_callbacks;
-                else
-                    ++out.unexpected_callbacks;
+                ++out.unexpected_callbacks;
             }
         }
     }
@@ -6693,23 +6635,12 @@ int main(int, char**)
         static_cast<unsigned long long>(GetTickCount64()));
     aida_early_startup::mark("post_gate_show_window_pre");
     ::ShowWindow(hwnd, SW_SHOW);
-    if (!aida::ui_thread::require_owner("dwm", "startup_window_attributes", "show_window"))
-        return 1;
-    const MARGINS margin = { -1 };
-    DwmExtendFrameIntoClientArea(hwnd, &margin);
-    DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_ROUND;
-    DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
-
-    COLORREF border_color = RGB(33, 35, 39);
-    DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border_color, sizeof(border_color));
-
-    set_acrylic_color(hwnd);
     ::UpdateWindow(hwnd);
     startup_log_critical_fmt("show_window_post hwnd=0x%llX last_err=%lu",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
         static_cast<unsigned long>(GetLastError()));
     aida_hotkey_monitor::start(hwnd);
-    crash_log_write("window_shown_acrylic_set");
+    crash_log_write("window_shown");
 
     {
         ::DragAcceptFiles(hwnd, TRUE);
@@ -6842,16 +6773,7 @@ int main(int, char**)
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(blend_state)),
         static_cast<unsigned long>(GetLastError()));
     crash_log_fmt("blend_state=%p", blend_state);
-    startup_log_critical_fmt("blur_init_pre device=0x%llX ctx=0x%llX",
-        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_pd3dDevice)),
-        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_pd3dDeviceContext)));
-    if (!aida::ui_thread::require_owner("blur", "init", "startup"))
-        return 1;
-    Blur::Init(g_pd3dDevice, g_pd3dDeviceContext, 100, 130);
-    startup_log_critical_fmt("blur_init_post last_err=%lu",
-        static_cast<unsigned long>(GetLastError()));
-    crash_log_write("blur_init_ok");
-    aida::ui_thread::mark_ready(hwnd, "main", "ui_dispatcher", "post_blur_init");
+    aida::ui_thread::mark_ready(hwnd, "main", "ui_dispatcher", "post_init");
 
     static std::atomic<bool> bg_init_done{false};
     globals::ui::bg_init_done = &bg_init_done;
@@ -7067,30 +6989,6 @@ int main(int, char**)
         aida_tracer::mark_render_phase("frame_top");
         if (frame_number < 5)
             crash_log_fmt("frame_begin #%llu", frame_number);
-
-        {
-            static DWORD s_last_acrylic_applied = 0;
-            DWORD now_acrylic = ((DWORD)aida::ui::resolved().acrylic_color & 0x00FFFFFFu) | (0xFFu << 24);
-            if (themes::changed || s_last_acrylic_applied != now_acrylic)
-            {
-                if (!aida::ui_thread::require_owner("dwm", "acrylic_reapply", "frame_begin"))
-                    continue;
-                themes::changed = false;
-                s_last_acrylic_applied = now_acrylic;
-
-                struct ACCENT_POLICY_T { DWORD AccentState; DWORD AccentFlags; DWORD GradientColor; DWORD AnimationId; };
-                struct WINCOMPATTRDATA_T { DWORD Attribute; PVOID pData; ULONG DataSize; };
-                auto SetWCA = (BOOL(WINAPI*)(HWND, void*))
-                    GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
-                if (SetWCA) {
-                    ACCENT_POLICY_T ap = { 3, 2, now_acrylic, 0 };
-                    WINCOMPATTRDATA_T wd = { 19, &ap, sizeof(ap) };
-                    SetWCA(hwnd, &wd);
-                    diag::log_tagged_fmt("ui", "acrylic_reapplied color=0x%08X", now_acrylic);
-                }
-            }
-        }
-
 
         aida_tracer::mark_render_phase("peek_message_begin");
         MSG msg;
@@ -7566,9 +7464,6 @@ int main(int, char**)
                 ide_resize_applied = true;
 
             ::SetWindowRgn(hwnd, nullptr, TRUE);
-            DWM_WINDOW_CORNER_PREFERENCE cp = globals::ui::maximized ? DWMWCP_DONOTROUND : DWMWCP_ROUND;
-            if (aida::ui_thread::require_owner("dwm", "corner_preference", "layout_size_change"))
-                DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
             if (!resize_swapchain_and_target(static_cast<UINT>(iw), static_cast<UINT>(ih), frame_number, "layout_size_change")) {
                 Sleep(1);
                 continue;
@@ -7710,18 +7605,6 @@ int main(int, char**)
             activation_progress_pre ||
             ai_thinking_pre ||
             ui_dispatch_pending_pre;
-        const bool blur_pressure_pre =
-            wake_fast_pre ||
-            cursor_over_aida_pre ||
-            full_test_running_pre ||
-            bulk_busy_pre ||
-            activation_progress_pre;
-        if (!aida::ui_thread::require_owner("blur", "interaction_pressure", "pre_frame"))
-            continue;
-        if (blur_pressure_pre)
-            Blur::SetInteractionPressure(true, dirty_now_ms + kAidaInteractiveBlurPressureMs);
-        else
-            Blur::SetInteractionPressure(false, dirty_now_ms);
         DWORD idle_wait_request_ms = kAidaIdleWaitMs;
         if (wake_fast_pre)
             idle_wait_request_ms = kAidaInteractiveWaitMs;
@@ -7854,7 +7737,6 @@ int main(int, char**)
             themes::resolved.text_primary = __t.text_primary;
             themes::resolved.text_secondary = __t.text_secondary;
             themes::resolved.text_dim = __t.text_dim;
-            themes::resolved.acrylic_color = (DWORD)__t.acrylic_color;
             globals::ui::accent = __t.accent;
         }
 
@@ -8230,9 +8112,8 @@ int main(int, char**)
                     const auto overlay_perf = test_all_features::overlay_perf_snapshot();
                     const gpu_frame_sample_t gpu = latest_gpu_frame_sample(frame_number);
                     const auto log_stats = diag::async_log_stats();
-                    const auto blur_stats = Blur::SnapshotStats();
                     diag::log_tagged_fmt("render",
-                        "frame_pacing_sample frame=%llu frames_delta=%llu skipped_delta=%llu skipped_total=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d cpu_wall_ms=%llu cpu_busy_100ns=%llu cpu_gle=%lu logical_processors=%lu gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f gpu_frame=%llu gpu_ready_frame=%llu gpu_disjoint=%d gpu_data_hr=0x%08X gpu_create_hr=0x%08X gpu_frequency=%llu gpu_samples=%llu gpu_misses=%llu sync=%u flags=0x%08X frame_ms=%llu present_ms=%llu pre_wait_request_ms=%lu pre_wait_actual_ms=%lu pre_wait_result=0x%08lX pre_wait_gle=%lu pre_wait_input=%d dirty_mask=0x%08X idle_wait_request_ms=%lu foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX block_mask=0x%08X bulk_busy=%d full_test=%d modal=%d activation=%d ai_thinking=%d pumped=%u pumped_input=%u pumped_resize=%u pumped_paint=%u draw_lists=%d draw_cmds=%d draw_vtx=%d draw_idx=%d callbacks=%d reset_callbacks=%d overlay_visible=%d overlay_running=%d overlay_total=%zu overlay_cached=%zu overlay_rendered=%zu overlay_log_version=%llu overlay_dirty=0x%016llX overlay_snapshot_changed=%d overlay_snapshot_busy=%d overlay_lock_busy=%llu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu blur_resizes=%llu threads=%lu thread_err=%lu taskflow_active=%u taskflow_submitted=%llu taskflow_rejected=%llu taskflow_failed=%llu taskflow_timed_out=%llu wq_active=%u wq_pending=%llu wq_oldest_ms=%llu wq_label_count=%u svc_active=%u svc_pending=%llu svc_oldest_ms=%llu svc_label_count=%u cq_active=%u cq_pending=%llu cq_oldest_ms=%llu cq_label_count=%u",
+                        "frame_pacing_sample frame=%llu frames_delta=%llu skipped_delta=%llu skipped_total=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d cpu_wall_ms=%llu cpu_busy_100ns=%llu cpu_gle=%lu logical_processors=%lu gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f gpu_frame=%llu gpu_ready_frame=%llu gpu_disjoint=%d gpu_data_hr=0x%08X gpu_create_hr=0x%08X gpu_frequency=%llu gpu_samples=%llu gpu_misses=%llu sync=%u flags=0x%08X frame_ms=%llu present_ms=%llu pre_wait_request_ms=%lu pre_wait_actual_ms=%lu pre_wait_result=0x%08lX pre_wait_gle=%lu pre_wait_input=%d dirty_mask=0x%08X idle_wait_request_ms=%lu foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX block_mask=0x%08X bulk_busy=%d full_test=%d modal=%d activation=%d ai_thinking=%d pumped=%u pumped_input=%u pumped_resize=%u pumped_paint=%u draw_lists=%d draw_cmds=%d draw_vtx=%d draw_idx=%d callbacks=%d reset_callbacks=%d overlay_visible=%d overlay_running=%d overlay_total=%zu overlay_cached=%zu overlay_rendered=%zu overlay_log_version=%llu overlay_dirty=0x%016llX overlay_snapshot_changed=%d overlay_snapshot_busy=%d overlay_lock_busy=%llu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu threads=%lu thread_err=%lu taskflow_active=%u taskflow_submitted=%llu taskflow_rejected=%llu taskflow_failed=%llu taskflow_timed_out=%llu wq_active=%u wq_pending=%llu wq_oldest_ms=%llu wq_label_count=%u svc_active=%u svc_pending=%llu svc_oldest_ms=%llu svc_label_count=%u cq_active=%u cq_pending=%llu cq_oldest_ms=%llu cq_label_count=%u",
                         static_cast<unsigned long long>(frame_number),
                         static_cast<unsigned long long>(frame_delta),
                         static_cast<unsigned long long>(skipped_delta),
@@ -8304,7 +8185,6 @@ int main(int, char**)
                         static_cast<unsigned long long>(g_resize_perf.coalesced),
                         static_cast<unsigned long long>(g_resize_perf.skipped_redundant),
                         static_cast<unsigned long long>(g_resize_perf.render_target_recreates),
-                        static_cast<unsigned long long>(g_resize_perf.blur_resize_calls),
                         static_cast<unsigned long>(thread_count),
                         static_cast<unsigned long>(thread_err),
                         static_cast<unsigned>(taskflow.total_active),
@@ -8401,40 +8281,6 @@ int main(int, char**)
                         static_cast<unsigned long long>(frame_number),
                         log_stats.top_tags.empty() ? "<none>" : log_stats.top_tags.c_str());
                     diag::log_tagged_fmt("render",
-                        "frame_pacing_blur frame=%llu callbacks=%d expected_blur_callbacks=%d unexpected_callbacks=%d reset_callbacks=%d draw_requests=%llu blur_callbacks=%llu suppressed_full_test=%llu slow=%llu slow_suppressed=%llu cache_reuse=%llu adaptive_fallback=%llu interactive_fallback=%llu throttle_fallback=%llu last_cache_age_ms=%llu pressure_until_ms=%llu input_pressure_until_ms=%llu invalid=%llu no_rtv=%llu total_area=%llu last_area=%llu total_ms=%llu copy_ms=%llu h_ms=%llu v_ms=%llu restore_ms=%llu last_total_ms=%llu last_copy_ms=%llu last_h_ms=%llu last_v_ms=%llu last_restore_ms=%llu removed=0x%08lX",
-                        static_cast<unsigned long long>(frame_number),
-                        draw_metrics.callbacks,
-                        draw_metrics.expected_blur_callbacks,
-                        draw_metrics.unexpected_callbacks,
-                        draw_metrics.reset_callbacks,
-                        static_cast<unsigned long long>(blur_stats.draw_requests),
-                        static_cast<unsigned long long>(blur_stats.callbacks),
-                        static_cast<unsigned long long>(blur_stats.suppressed_full_test),
-                        static_cast<unsigned long long>(blur_stats.slow_callbacks),
-                        static_cast<unsigned long long>(blur_stats.slow_suppressed),
-                        static_cast<unsigned long long>(blur_stats.cache_reuse),
-                        static_cast<unsigned long long>(blur_stats.adaptive_fallback),
-                        static_cast<unsigned long long>(blur_stats.interactive_fallback),
-                        static_cast<unsigned long long>(blur_stats.throttle_fallback),
-                        static_cast<unsigned long long>(blur_stats.last_cache_age_ms),
-                        static_cast<unsigned long long>(blur_stats.pressure_until_ms),
-                        static_cast<unsigned long long>(blur_stats.input_pressure_until_ms),
-                        static_cast<unsigned long long>(blur_stats.invalid_callbacks),
-                        static_cast<unsigned long long>(blur_stats.no_rtv),
-                        static_cast<unsigned long long>(blur_stats.total_area),
-                        static_cast<unsigned long long>(blur_stats.last_area),
-                        static_cast<unsigned long long>(blur_stats.total_elapsed_ms),
-                        static_cast<unsigned long long>(blur_stats.copy_elapsed_ms),
-                        static_cast<unsigned long long>(blur_stats.horizontal_elapsed_ms),
-                        static_cast<unsigned long long>(blur_stats.vertical_elapsed_ms),
-                        static_cast<unsigned long long>(blur_stats.restore_elapsed_ms),
-                        static_cast<unsigned long long>(blur_stats.last_elapsed_ms),
-                        static_cast<unsigned long long>(blur_stats.last_copy_ms),
-                        static_cast<unsigned long long>(blur_stats.last_horizontal_ms),
-                        static_cast<unsigned long long>(blur_stats.last_vertical_ms),
-                        static_cast<unsigned long long>(blur_stats.last_restore_ms),
-                        static_cast<unsigned long>(blur_stats.last_device_removed));
-                    diag::log_tagged_fmt("render",
                         "frame_pacing_taskflow_family frame=%llu family=work submitted=%llu rejected=%llu failed=%llu timed_out=%llu active=%u pending=%llu oldest_ms=%llu label_count=%u labels={%.900s}",
                         static_cast<unsigned long long>(frame_number),
                         static_cast<unsigned long long>(taskflow.total_submitted),
@@ -8503,7 +8349,7 @@ int main(int, char**)
                     if (s_last_runtime_acceptance_log_ms == 0 || tick_now_ms - s_last_runtime_acceptance_log_ms >= kAidaRuntimeAcceptanceLogIntervalMs) {
                         s_last_runtime_acceptance_log_ms = tick_now_ms;
                         diag::log_tagged_fmt("render",
-                            "runtime_acceptance_sample frame=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f sync=%u flags=0x%08X dirty_mask=0x%08X skipped_total=%llu overlay_visible=%d overlay_running=%d overlay_rendered=%zu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu blur_resizes=%llu threads=%lu taskflow_active=%u taskflow_submitted=%llu taskflow_rejected=%llu wq_active=%u wq_pending=%llu svc_active=%u svc_pending=%llu cq_active=%u cq_pending=%llu",
+                            "runtime_acceptance_sample frame=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f sync=%u flags=0x%08X dirty_mask=0x%08X skipped_total=%llu overlay_visible=%d overlay_running=%d overlay_rendered=%zu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu threads=%lu taskflow_active=%u taskflow_submitted=%llu taskflow_rejected=%llu wq_active=%u wq_pending=%llu svc_active=%u svc_pending=%llu cq_active=%u cq_pending=%llu",
                             static_cast<unsigned long long>(frame_number),
                             fps,
                             cpu.cpu_percent,
@@ -8525,7 +8371,6 @@ int main(int, char**)
                             static_cast<unsigned long long>(g_resize_perf.coalesced),
                             static_cast<unsigned long long>(g_resize_perf.skipped_redundant),
                             static_cast<unsigned long long>(g_resize_perf.render_target_recreates),
-                            static_cast<unsigned long long>(g_resize_perf.blur_resize_calls),
                             static_cast<unsigned long>(thread_count),
                             static_cast<unsigned>(taskflow.total_active),
                             static_cast<unsigned long long>(taskflow.total_submitted),
@@ -8623,10 +8468,6 @@ int main(int, char**)
     aida_shutdown_diag::mark("shutdown_executor");
     aida::infra::executor::shutdown();
     diag::log_tagged_critical("main", "shutdown_executor_done");
-    aida_shutdown_diag::mark("shutdown_blur");
-    if (aida::ui_thread::require_owner("blur", "shutdown", "shutdown"))
-        Blur::Shutdown();
-    diag::log_tagged_critical("main", "shutdown_blur_done");
     aida_shutdown_diag::mark("shutdown_imgui_dx11");
     if (aida::ui_thread::require_owner("dx11", "imgui_dx11_shutdown", "shutdown"))
         ImGui_ImplDX11_Shutdown();
@@ -8707,8 +8548,6 @@ void CleanupDeviceD3D()
     if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
     if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
     if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
-    g_resize_perf.blur_w = 0;
-    g_resize_perf.blur_h = 0;
 }
 
 void CreateRenderTarget()
@@ -8781,31 +8620,15 @@ void CreateRenderTarget()
         pBackBuffer->Release();
         return;
     }
-    int bw = (int)(d.Width  / 4u);
-    int bh = (int)(d.Height / 4u);
-    if (bw < 64) bw = 64;
-    if (bh < 64) bh = 64;
-    const bool blur_size_changed = bw != g_resize_perf.blur_w || bh != g_resize_perf.blur_h;
-    if (blur_size_changed) {
-        Blur::Resize(bw, bh);
-        g_resize_perf.blur_w = bw;
-        g_resize_perf.blur_h = bh;
-        ++g_resize_perf.blur_resize_calls;
-    }
-    aida::ui::blur::mark_supported(true);
 
     pBackBuffer->Release();
     diag::log_tagged_critical_fmt("render",
-        "create_render_target_ok backbuffer=0x%llX rtv=0x%llX desc=%ux%u blur=%dx%d blur_resize=%d rt_recreates=%llu blur_resizes=%llu",
+        "create_render_target_ok backbuffer=0x%llX rtv=0x%llX desc=%ux%u rt_recreates=%llu",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(pBackBuffer)),
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_mainRenderTargetView)),
         d.Width,
         d.Height,
-        bw,
-        bh,
-        blur_size_changed ? 1 : 0,
-        static_cast<unsigned long long>(g_resize_perf.render_target_recreates),
-        static_cast<unsigned long long>(g_resize_perf.blur_resize_calls));
+        static_cast<unsigned long long>(g_resize_perf.render_target_recreates));
 }
 
 void CleanupRenderTarget()
@@ -9157,9 +8980,6 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (!aida::ui_thread::require_owner("ui_state", "wm_size", "WndProc"))
             return finish("size_affinity_denied", 0);
         globals::ui::maximized = now_zoomed;
-        DWM_WINDOW_CORNER_PREFERENCE cp = now_zoomed ? DWMWCP_DONOTROUND : DWMWCP_ROUND;
-        if (aida::ui_thread::require_owner("dwm", "corner_preference", "WM_SIZE"))
-            DwmSetWindowAttribute(hWnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
         g_ResizeWidth = (UINT)LOWORD(lParam);
         g_ResizeHeight = (UINT)HIWORD(lParam);
         g_ResizeRequestTickMs = static_cast<uint64_t>(GetTickCount64());
@@ -9216,8 +9036,6 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (wParam == TRUE) {
             g_SwapChainOccluded = false;
             if (::IsWindow(hWnd) && !::IsIconic(hWnd)) {
-                aida_tracer::set_wndproc_state("activateapp_acrylic", hWnd, msg, wParam, lParam);
-                set_acrylic_color(hWnd);
                 aida_tracer::set_wndproc_state("activateapp_invalidate", hWnd, msg, wParam, lParam);
                 ::InvalidateRect(hWnd, nullptr, FALSE);
             }
@@ -9248,8 +9066,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             const wchar_t* p = reinterpret_cast<const wchar_t*>(lParam);
             if (p && (wcscmp(p, L"ImmersiveColorSet") == 0 ||
                       wcscmp(p, L"WindowsThemeElement") == 0)) {
-                aida_tracer::set_wndproc_state("settingchange_apply_theme", hWnd, msg, wParam, lParam);
-                apply_os_theme_animated();
+                aida_tracer::set_wndproc_state("settingchange_theme_detected", hWnd, msg, wParam, lParam);
             }
         }
         return finish("settingchange", 0);

@@ -1070,7 +1070,6 @@ void render(float, float, float width, float height,
     ImGui::PushID(id.c_str());
     ImGui::BeginChild("##workspace_hex", ImVec2(width, height), false);
     const auto& theme = aida::ui::resolved();
-    ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(theme.text_primary, alpha));
 
     std::string current_source_name;
     bool live_source_header = false;
@@ -1248,11 +1247,6 @@ void render(float, float, float width, float height,
         aida::ui::inline_notice("hex_error", "Hex view unavailable", error.c_str(),
             aida::ui::status_kind_t::error);
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImGui::ColorConvertU32ToFloat4(theme.panel_header));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-        ImVec2(aida::ui::metrics::table::cell_pad_x,
-            aida::ui::metrics::table::cell_pad_y));
     ImGui::BeginChild("##hex_header", ImVec2(0.0f, aida::ui::metrics::table::header_h),
         true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::TextDisabled("Address");
@@ -1261,8 +1255,6 @@ void render(float, float, float width, float height,
     ImGui::SameLine(650.0f);
     ImGui::TextDisabled("ASCII");
     ImGui::EndChild();
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor();
     ImGui::BeginChild("##hex_rows", ImVec2(0.0f, 0.0f), false,
         ImGuiWindowFlags_HorizontalScrollbar);
     std::uint64_t byte_count = 0;
@@ -1282,7 +1274,6 @@ void render(float, float, float width, float height,
                         : "The workspace provider has not published readable bytes.",
             nullptr, ImVec2(0.0f, 152.0f));
         ImGui::EndChild();
-        ImGui::PopStyleColor();
         ImGui::EndChild();
         ImGui::PopID();
         return;
@@ -1637,7 +1628,6 @@ void render(float, float, float width, float height,
     }
     aida::ui::application_ui::render_retained_entity_context_menu("hex.byte");
     ImGui::EndChild();
-    ImGui::PopStyleColor();
     ImGui::EndChild();
     ImGui::PopID();
 }

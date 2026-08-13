@@ -132,14 +132,6 @@ void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::with_alpha(th.border_subtle, alpha));
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(
-		aida::ui::with_alpha(th.panel_header, alpha)));
-	ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(
-		aida::ui::with_alpha(th.border_subtle, alpha)));
-	ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-		aida::ui::with_alpha(th.text_primary, alpha)));
 
 	ImGui::PushItemWidth(150.f);
 	ImGui::InputTextWithHint("##fz_addr", "Target address", fz.addr_input, sizeof(fz.addr_input));
@@ -161,9 +153,6 @@ void render(float pos_x, float pos_y, float width, float height,
 	ImGui::InputTextWithHint("##fz_iter", "max iter", fz.max_iter_str, sizeof(fz.max_iter_str));
 	ImGui::PopItemWidth();
 
-	ImGui::PopStyleColor(3);
-	ImGui::PopStyleVar(2);
-
 	cy += 28.f;
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 
@@ -172,12 +161,7 @@ void render(float pos_x, float pos_y, float width, float height,
 	};
 	for (int i = 0; i < static_cast<int>(fuzzer_engine::mutation_strategy_t::COUNT); ++i) {
 		if (i > 0) ImGui::SameLine();
-		ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-			aida::ui::with_alpha(th.text_primary, alpha)));
-		ImGui::PushStyleColor(ImGuiCol_CheckMark, ImGui::ColorConvertU32ToFloat4(
-			aida::ui::with_alpha(th.accent_u32, alpha)));
 		ImGui::Checkbox(strat_names_full[i], &fz.config.strategies[i]);
-		ImGui::PopStyleColor(2);
 	}
 
 	cy += 28.f;

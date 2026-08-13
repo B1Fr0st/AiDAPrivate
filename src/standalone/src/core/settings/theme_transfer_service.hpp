@@ -22,7 +22,6 @@ struct theme_t {
     std::uint32_t text_primary = 0;
     std::uint32_t text_secondary = 0;
     std::uint32_t text_dim = 0;
-    std::uint32_t acrylic_color = 0;
     int icon_index = -1;
     std::string icon_file_path;
 };
