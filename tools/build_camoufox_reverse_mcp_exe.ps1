@@ -697,7 +697,7 @@ function Invoke-SourceMcpContractCheck {
     $psi.Environment["PYTHONIOENCODING"] = "utf-8"
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
-    $timeoutMs = 7000
+    $timeoutMs = 30000
     Write-Output "source_mcp_contract_check_command=$PythonExe -B -m camoufox_reverse_mcp --aida-contract-check"
     Write-Output "source_mcp_contract_check_timeout_ms=$timeoutMs"
     if (-not $proc.Start()) {

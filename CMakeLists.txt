@@ -1124,6 +1124,7 @@ if(Python3_FOUND)
         message(STATUS "encrypt_drivers: WhosWho <- ${WHOSWHO_BINARY}")
         add_custom_command(
             OUTPUT "${CMAKE_BINARY_DIR}/whoswho_embedded.stamp"
+            BYPRODUCTS "${CMAKE_CURRENT_SOURCE_DIR}/src/whoswho_embedded.h"
             COMMAND ${Python3_EXECUTABLE} "${WHOSWHO_SCRIPT}" --from-binary "${WHOSWHO_BINARY}"
             COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/whoswho_embedded.stamp"
             DEPENDS "${WHOSWHO_SCRIPT}"
