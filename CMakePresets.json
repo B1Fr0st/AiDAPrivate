@@ -15,7 +15,7 @@
         "CMAKE_MAKE_PROGRAM": "C:/Program Files/Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe",
         "AIDA_ENABLE_LTCG": "OFF",
         "AIDA_FAST_LINK":   "ON",
-        "AIDA_CAMOUFOX_BUILD_REVERSE_MCP_EXE": "ON",
+        "AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE": "ON",
         "AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS": "ON",
         "BUILD_AIDA_PLUGIN": "OFF"
       },

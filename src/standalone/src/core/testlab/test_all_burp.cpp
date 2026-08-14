@@ -506,14 +506,10 @@ namespace {
             st.module_version.empty() ||
             st.browser_path.empty())
             return false;
-        if (st.module_version == "frozen-executable")
-            return true;
         return !st.python_path.empty();
     }
 
     std::string camoufox_launcher_kind(const aida::burp::camoufox::install::status_t& st) {
-        if (st.module_version == "frozen-executable")
-            return "frozen_executable";
         if (!st.python_path.empty())
             return "python_module";
         return "unresolved";
@@ -522,8 +518,6 @@ namespace {
     std::string camoufox_mcp_executable_label(const aida::burp::camoufox::install::status_t& st, const aida::burp::camoufox::bridge_status_t* bridge = nullptr) {
         if (bridge && !bridge->server_command.empty())
             return bridge->server_command;
-        if (st.module_version == "frozen-executable")
-            return "<frozen-executable>";
         if (!st.python_path.empty())
             return st.python_path + " -m camoufox_reverse_mcp";
         return "<empty>";

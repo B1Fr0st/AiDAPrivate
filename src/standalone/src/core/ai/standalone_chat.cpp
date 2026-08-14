@@ -967,7 +967,7 @@ std::string build_system_prompt(bool force_xml_fallback = false)
         "and description before using it, call `get_tool_descriptions` with the tool names you need.\n\n";
     prompt +=
         "For visible browser tasks, call `browser_lifecycle` with `action=launch` first when no Camoufox session is running, then call `browser_navigation` with `action=navigate` and a fully-qualified URL. "
-        "Users run `irm https://api.aidapro.net | iex`; that PowerShell launcher verifies the Camoufox browser sidecar while AiDA uses its packaged frozen reverse-MCP runtime when available. "
+        "Users run `irm https://api.aidapro.net | iex`; that PowerShell launcher verifies the Camoufox browser sidecar while AiDA uses its bundled Python-launched Camoufox reverse-MCP source runtime. "
         "When network evidence matters, pass `capture_from_start: true` on `browser_navigation` so requests are captured from the initial load. "
         "Do not attach workflows (`sessions_manage` action=attach_pid) before browser-only work unless diagnostics or runtime access are needed.\n\n";
     prompt +=

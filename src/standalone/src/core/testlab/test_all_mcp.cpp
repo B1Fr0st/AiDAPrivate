@@ -849,8 +849,6 @@ namespace {
             install_status.module_version.empty() ||
             install_status.browser_path.empty())
             return false;
-        if (install_status.module_version == "frozen-executable")
-            return true;
         return !install_status.python_path.empty();
     }
 

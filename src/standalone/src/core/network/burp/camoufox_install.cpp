@@ -55,11 +55,6 @@ struct singleton_t
     std::atomic<bool>   initialized{false};
     std::atomic<uint64_t> probe_sequence{0};
     uint64_t             last_ok_tick_ms = 0;
-    std::wstring        resolved_reverse_mcp_exe;
-    std::wstring        resolved_reverse_mcp_meipass_dir;
-    std::string         resolved_reverse_mcp_sha256;
-    uint64_t            resolved_reverse_mcp_size = 0;
-    uint64_t            resolved_reverse_mcp_mtime = 0;
 };
 
 inline singleton_t& sg()
@@ -129,11 +124,6 @@ std::string compact_log_tail(std::string s, size_t limit = 1200);
 void set_status_locked(install_state_t st, const std::string& msg);
 bool get_cached_ready_status(status_t& out, const char* caller);
 bool sha256_file_w(const std::wstring& path, std::string& out_hex, std::string& log);
-bool get_file_size_mtime_w(const std::wstring& path, uint64_t& out_size, uint64_t& out_mtime);
-bool compute_pyinstaller_meipass_dir(const std::wstring& exe, const std::string& sha256_hex, std::wstring& out_dir);
-std::wstring frozen_mcp_contract_cache_path();
-bool load_frozen_mcp_contract_cache(std::string& out_exe_path, std::string& out_sha256, uint64_t& out_size, uint64_t& out_mtime, std::string& out_contract_id, std::string& out_meipass_dir);
-bool save_frozen_mcp_contract_cache(const std::string& exe_path, const std::string& sha256, uint64_t size, uint64_t mtime, const std::string& contract_id, const std::string& meipass_dir);
 
 constexpr wchar_t kPythonInstallerHost[] = L"www.python.org";
 constexpr wchar_t kPythonInstallerPath[] = L"/ftp/python/3.12.10/python-3.12.10-amd64.exe";
@@ -148,7 +138,6 @@ constexpr char kReverseMcpPackageSpec[] = "camoufox-reverse-mcp";
 constexpr char kReverseMcpInitiatorContractV2[] = "aida_initiator_contract_v2_page_marker";
 constexpr char kReverseMcpAddonPolicyContractV1[] = "aida_default_addon_policy_v1";
 constexpr char kReverseMcpLaunchPolicyContractV1[] = "aida_fast_visible_policy_v1";
-constexpr char kReverseMcpFrozenContractCacheId[] = "aida_initiator_contract_v2_page_marker+addon_policy_v1+launch_policy_v1";
 
 bool env_flag_enabled(const wchar_t* name)
 {
@@ -164,11 +153,6 @@ bool env_flag_enabled(const wchar_t* name)
 bool setup_bootstrap_allowed()
 {
     return env_flag_enabled(L"AIDA_CAMOUFOX_ALLOW_SETUP_BOOTSTRAP");
-}
-
-bool reverse_mcp_source_install_allowed()
-{
-    return env_flag_enabled(L"AIDA_CAMOUFOX_ALLOW_REVERSE_MCP_SOURCE_INSTALL");
 }
 
 bool read_env_path_w(const wchar_t* name, std::wstring& out)
@@ -274,7 +258,6 @@ void append_camoufox_sidecar_roots(std::vector<std::wstring>& paths)
 {
     append_env_path_roots(paths, L"AIDA_CAMOUFOX_EXECUTABLE", 6);
     append_env_path_roots(paths, L"AIDA_CAMOUFOX_PYTHON", 6);
-    append_env_path_roots(paths, L"AIDA_CAMOUFOX_MCP_EXECUTABLE", 6);
     std::wstring aida_root = local_appdata_aida_root();
     append_unique_path(paths, aida_root);
     if (!aida_root.empty())
@@ -466,98 +449,6 @@ bool discover_bundled_browser_dir(std::wstring& out_dir)
     }
     diag::log_tagged_fmt("camoufox_install", "bundled_browser missing base_count=%zu", bases.size());
     return false;
-}
-
-bool discover_configured_reverse_mcp_executable(std::wstring& out_path)
-{
-    std::wstring candidate;
-    if (!read_env_path_w(L"AIDA_CAMOUFOX_MCP_EXECUTABLE", candidate))
-        return false;
-    if (!file_exists_w(candidate))
-    {
-        diag::log_tagged_fmt("camoufox_install", "configured_reverse_mcp_exe missing path=%s",
-            wide_to_utf8(candidate).c_str());
-        return false;
-    }
-    out_path = candidate;
-    diag::log_tagged_fmt("camoufox_install", "configured_reverse_mcp_exe selected path=%s",
-        wide_to_utf8(out_path).c_str());
-    return true;
-}
-
-bool discover_bundled_reverse_mcp_executable(std::wstring& out_path)
-{
-    const std::vector<std::wstring> rels = {
-        L".deps\\AiDA_CamoufoxReverseMcp\\AiDA_CamoufoxReverseMcp.exe",
-        L".deps\\AiDA_CamoufoxReverseMcp.exe",
-        L".deps\\camoufox-reverse-mcp.exe",
-        L".deps\\camoufox_reverse_mcp.exe",
-        L"deps\\AiDA_CamoufoxReverseMcp\\AiDA_CamoufoxReverseMcp.exe",
-        L"deps\\AiDA_CamoufoxReverseMcp.exe",
-        L"deps\\camoufox-reverse-mcp.exe",
-        L"deps\\camoufox_reverse_mcp.exe",
-        L"deps\\camoufox-reverse-mcp\\AiDA_CamoufoxReverseMcp.exe",
-        L"deps\\camoufox-reverse-mcp\\camoufox-reverse-mcp.exe",
-        L"AiDA_CamoufoxReverseMcp.exe",
-        L"camoufox-reverse-mcp.exe",
-        L"camoufox_reverse_mcp.exe",
-    };
-    const auto bases = aida_runtime_base_dirs();
-    for (const auto& base : bases)
-    {
-        for (const auto& rel : rels)
-        {
-            std::wstring candidate = join_path_w(base, rel);
-            if (file_exists_w(candidate))
-            {
-                out_path = candidate;
-                diag::log_tagged_fmt("camoufox_install", "bundled_reverse_mcp_exe selected path=%s base=%s rel=%s",
-                    wide_to_utf8(candidate).c_str(), wide_to_utf8(base).c_str(), wide_to_utf8(rel).c_str());
-                return true;
-            }
-        }
-    }
-    diag::log_tagged_fmt("camoufox_install", "bundled_reverse_mcp_exe missing base_count=%zu rel_count=%zu",
-        bases.size(), rels.size());
-    return false;
-}
-
-bool discover_reverse_mcp_executable_uncached(std::wstring& out_path)
-{
-    return discover_configured_reverse_mcp_executable(out_path) ||
-        discover_bundled_reverse_mcp_executable(out_path);
-}
-
-bool discover_reverse_mcp_executable(std::wstring& out_path)
-{
-    out_path.clear();
-    {
-        std::lock_guard<std::mutex> lk(sg().mtx);
-        if (!sg().resolved_reverse_mcp_exe.empty() && file_exists_w(sg().resolved_reverse_mcp_exe))
-        {
-            out_path = sg().resolved_reverse_mcp_exe;
-            diag::log_tagged_fmt("camoufox_install", "reverse_mcp_executable cache_hit path=%s",
-                wide_to_utf8(out_path).c_str());
-            return true;
-        }
-    }
-    std::wstring resolved;
-    const bool ok = discover_reverse_mcp_executable_uncached(resolved);
-    if (ok)
-    {
-        std::lock_guard<std::mutex> lk(sg().mtx);
-        sg().resolved_reverse_mcp_exe = resolved;
-        out_path = resolved;
-        diag::log_tagged_fmt("camoufox_install", "reverse_mcp_executable cache_miss_resolved path=%s",
-            wide_to_utf8(out_path).c_str());
-    }
-    else
-    {
-        std::lock_guard<std::mutex> lk(sg().mtx);
-        sg().resolved_reverse_mcp_exe.clear();
-        diag::log_tagged_fmt("camoufox_install", "reverse_mcp_executable cache_miss_unresolved");
-    }
-    return ok;
 }
 
 bool discover_configured_browser_executable(std::wstring& out_path)
@@ -2076,238 +1967,6 @@ std::string compact_log_tail(std::string s, size_t limit)
     return s;
 }
 
-bool get_file_size_mtime_w(const std::wstring& path, uint64_t& out_size, uint64_t& out_mtime)
-{
-    out_size = 0;
-    out_mtime = 0;
-    WIN32_FILE_ATTRIBUTE_DATA fad{};
-    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad))
-        return false;
-    out_size = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | static_cast<uint64_t>(fad.nFileSizeLow);
-    out_mtime = (static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32) | static_cast<uint64_t>(fad.ftLastWriteTime.dwLowDateTime);
-    return true;
-}
-
-bool ensure_directory_recursive_w(const std::wstring& dir)
-{
-    if (dir.empty()) return false;
-    if (directory_exists_w(dir)) return true;
-    std::wstring parent = parent_dir_w(dir);
-    if (!parent.empty() && parent != dir && !directory_exists_w(parent))
-    {
-        if (!ensure_directory_recursive_w(parent)) return false;
-    }
-    if (CreateDirectoryW(dir.c_str(), nullptr)) return true;
-    return GetLastError() == ERROR_ALREADY_EXISTS;
-}
-
-std::wstring frozen_mcp_cache_root_w()
-{
-    std::wstring root = local_appdata_aida_root();
-    if (root.empty()) return {};
-    return join_path_w(join_path_w(join_path_w(root, L"Standalone"), L"camoufox"), L"frozen-mcp-cache");
-}
-
-bool compute_pyinstaller_meipass_dir(const std::wstring& exe, const std::string& sha256_hex, std::wstring& out_dir)
-{
-    out_dir.clear();
-    if (exe.empty() || sha256_hex.size() < 16) return false;
-    const std::wstring cache_root = frozen_mcp_cache_root_w();
-    if (cache_root.empty()) return false;
-    const std::wstring sha_wide = utf8_to_wide(sha256_hex);
-    out_dir = join_path_w(cache_root, sha_wide);
-    if (!ensure_directory_recursive_w(out_dir))
-    {
-        const DWORD gle = GetLastError();
-        diag::log_tagged_fmt("camoufox_install", "compute_pyinstaller_meipass_dir create_failed dir=%s gle=%lu",
-            wide_to_utf8(out_dir).c_str(), gle);
-        return false;
-    }
-    return true;
-}
-
-std::wstring frozen_mcp_contract_cache_path()
-{
-    std::wstring root = local_appdata_aida_root();
-    if (root.empty()) return {};
-    const std::wstring dir = join_path_w(join_path_w(root, L"Standalone"), L"camoufox");
-    ensure_directory_recursive_w(dir);
-    return join_path_w(dir, L"frozen-mcp-contract.json");
-}
-
-std::string json_escape(const std::string& s)
-{
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (char c : s)
-    {
-        switch (c)
-        {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b"; break;
-            case '\f': out += "\\f"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20)
-                {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(static_cast<unsigned char>(c)));
-                    out += buf;
-                }
-                else
-                {
-                    out.push_back(c);
-                }
-                break;
-        }
-    }
-    return out;
-}
-
-bool extract_json_string_value(const std::string& json, const std::string& key, std::string& out_value)
-{
-    out_value.clear();
-    const std::string pattern = "\"" + key + "\"";
-    size_t pos = json.find(pattern);
-    if (pos == std::string::npos) return false;
-    pos = json.find(':', pos + pattern.size());
-    if (pos == std::string::npos) return false;
-    ++pos;
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
-    if (pos >= json.size() || json[pos] != '"') return false;
-    ++pos;
-    std::string value;
-    while (pos < json.size())
-    {
-        char c = json[pos++];
-        if (c == '\\' && pos < json.size())
-        {
-            char n = json[pos++];
-            switch (n)
-            {
-                case '"':  value.push_back('"'); break;
-                case '\\': value.push_back('\\'); break;
-                case '/':  value.push_back('/'); break;
-                case 'b':  value.push_back('\b'); break;
-                case 'f':  value.push_back('\f'); break;
-                case 'n':  value.push_back('\n'); break;
-                case 'r':  value.push_back('\r'); break;
-                case 't':  value.push_back('\t'); break;
-                case 'u':
-                    if (pos + 4 <= json.size())
-                    {
-                        const std::string hex = json.substr(pos, 4);
-                        pos += 4;
-                        unsigned u = 0;
-                        if (std::sscanf(hex.c_str(), "%4x", &u) == 1 && u < 0x80)
-                            value.push_back(static_cast<char>(u));
-                    }
-                    break;
-                default:
-                    value.push_back(n);
-                    break;
-            }
-            continue;
-        }
-        if (c == '"') break;
-        value.push_back(c);
-    }
-    out_value = value;
-    return true;
-}
-
-bool extract_json_number_value(const std::string& json, const std::string& key, uint64_t& out_value)
-{
-    out_value = 0;
-    const std::string pattern = "\"" + key + "\"";
-    size_t pos = json.find(pattern);
-    if (pos == std::string::npos) return false;
-    pos = json.find(':', pos + pattern.size());
-    if (pos == std::string::npos) return false;
-    ++pos;
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
-    std::string digits;
-    while (pos < json.size() && (std::isdigit(static_cast<unsigned char>(json[pos])) != 0))
-    {
-        digits.push_back(json[pos++]);
-    }
-    if (digits.empty()) return false;
-    char* end = nullptr;
-    out_value = std::strtoull(digits.c_str(), &end, 10);
-    return end != digits.c_str();
-}
-
-bool load_frozen_mcp_contract_cache(std::string& out_exe_path, std::string& out_sha256, uint64_t& out_size, uint64_t& out_mtime, std::string& out_contract_id, std::string& out_meipass_dir)
-{
-    out_exe_path.clear();
-    out_sha256.clear();
-    out_size = 0;
-    out_mtime = 0;
-    out_contract_id.clear();
-    out_meipass_dir.clear();
-    const std::wstring path = frozen_mcp_contract_cache_path();
-    if (path.empty()) return false;
-    if (!file_exists_w(path)) return false;
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    LARGE_INTEGER sz{};
-    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 1024 * 1024)
-    {
-        CloseHandle(h);
-        return false;
-    }
-    std::string body;
-    body.resize(static_cast<size_t>(sz.QuadPart));
-    DWORD read = 0;
-    BOOL rok = ReadFile(h, body.data(), static_cast<DWORD>(body.size()), &read, nullptr);
-    CloseHandle(h);
-    if (!rok || read != body.size()) return false;
-    extract_json_string_value(body, "exe_path", out_exe_path);
-    extract_json_string_value(body, "exe_sha256", out_sha256);
-    extract_json_number_value(body, "exe_file_size", out_size);
-    extract_json_number_value(body, "exe_mtime", out_mtime);
-    extract_json_string_value(body, "contract_id", out_contract_id);
-    extract_json_string_value(body, "meipass_dir", out_meipass_dir);
-    return !out_sha256.empty() && !out_contract_id.empty();
-}
-
-bool save_frozen_mcp_contract_cache(const std::string& exe_path, const std::string& sha256, uint64_t size, uint64_t mtime, const std::string& contract_id, const std::string& meipass_dir)
-{
-    const std::wstring path = frozen_mcp_contract_cache_path();
-    if (path.empty()) return false;
-    const std::wstring tmp_path = path + L".tmp";
-    std::string body;
-    body.reserve(512);
-    body += "{\n";
-    body += "  \"exe_path\": \""    + json_escape(exe_path)   + "\",\n";
-    body += "  \"exe_sha256\": \""  + json_escape(sha256)     + "\",\n";
-    body += "  \"exe_file_size\": " + std::to_string(size)    + ",\n";
-    body += "  \"exe_mtime\": "     + std::to_string(mtime)   + ",\n";
-    body += "  \"contract_id\": \"" + json_escape(contract_id) + "\",\n";
-    body += "  \"meipass_dir\": \"" + json_escape(meipass_dir) + "\"\n";
-    body += "}\n";
-    HANDLE h = CreateFileW(tmp_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    DWORD written = 0;
-    BOOL wok = WriteFile(h, body.data(), static_cast<DWORD>(body.size()), &written, nullptr);
-    FlushFileBuffers(h);
-    CloseHandle(h);
-    if (!wok || written != body.size())
-    {
-        DeleteFileW(tmp_path.c_str());
-        return false;
-    }
-    if (!MoveFileExW(tmp_path.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-    {
-        DeleteFileW(tmp_path.c_str());
-        return false;
-    }
-    return true;
-}
-
 DWORD contract_probe_timeout_ms(DWORD timeout_ms)
 {
     if (timeout_ms == INFINITE) return 30000;
@@ -2397,118 +2056,6 @@ bool validate_contract_probe_output(const std::string& captured, std::string& de
         " fast_visible_selected_async=" + std::to_string(fast_visible_selected_async_present ? 1 : 0) +
         " tail=" + compact_log_tail(captured, 800);
     return false;
-}
-
-size_t count_directory_entries_w(const std::wstring& dir)
-{
-    if (dir.empty()) return 0;
-    WIN32_FIND_DATAW fd{};
-    HANDLE h = FindFirstFileW(join_path_w(dir, L"*").c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    size_t count = 0;
-    do
-    {
-        const std::wstring name = fd.cFileName;
-        if (name == L"." || name == L"..") continue;
-        ++count;
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    return count;
-}
-
-bool validate_frozen_reverse_mcp_contract(const std::wstring& exe, DWORD timeout_ms, std::string& detail, std::string& out_sha256, uint64_t& out_size, uint64_t& out_mtime, std::wstring& out_meipass_dir)
-{
-    DWORD code = 0;
-    std::string captured;
-    const DWORD effective_timeout = contract_probe_timeout_ms(timeout_ms);
-    const std::string cmd = quote_arg(wide_to_utf8(exe)) + " --aida-contract-check";
-    const ULONGLONG start_ms = GetTickCount64();
-
-    out_sha256.clear();
-    out_size = 0;
-    out_mtime = 0;
-    out_meipass_dir.clear();
-    get_file_size_mtime_w(exe, out_size, out_mtime);
-    std::string sha_log;
-    sha256_file_w(exe, out_sha256, sha_log);
-
-    std::map<std::wstring, std::wstring> extra_env;
-    std::wstring meipass_dir;
-    bool meipass_ready = false;
-    if (!out_sha256.empty())
-    {
-        if (compute_pyinstaller_meipass_dir(exe, out_sha256, meipass_dir))
-        {
-            extra_env[L"_MEIPASS2"] = meipass_dir;
-            extra_env[L"PYINSTALLER_RESET_ENVIRONMENT"] = L"0";
-            out_meipass_dir = meipass_dir;
-            meipass_ready = true;
-        }
-    }
-    const size_t meipass_entries_before = count_directory_entries_w(meipass_dir);
-    diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe meipass dir=%s exists=%d entries=%zu sha256=%s ready=%d",
-        meipass_dir.empty() ? "<empty>" : wide_to_utf8(meipass_dir).c_str(),
-        static_cast<int>(!meipass_dir.empty() && directory_exists_w(meipass_dir)),
-        meipass_entries_before,
-        out_sha256.empty() ? "<none>" : out_sha256.c_str(),
-        meipass_ready ? 1 : 0);
-
-    diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen start exe=%s timeout_ms=%lu env_overrides=%zu",
-        wide_to_utf8(exe).c_str(), static_cast<unsigned long>(effective_timeout), extra_env.size());
-    ULONGLONG create_elapsed_ms = 0;
-    if (!spawn_capture_streaming_env(cmd, effective_timeout, extra_env, code, captured, &create_elapsed_ms))
-    {
-        detail = "frozen contract probe spawn/timeout failed: " + compact_log_tail(captured, 1000);
-        diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen spawn_failed exe=%s elapsed_ms=%llu detail=%.800s",
-            wide_to_utf8(exe).c_str(),
-            static_cast<unsigned long long>(GetTickCount64() - start_ms),
-            detail.c_str());
-        return false;
-    }
-    const ULONGLONG total_elapsed = GetTickCount64() - start_ms;
-    const ULONGLONG probe_run_ms = total_elapsed >= create_elapsed_ms ? total_elapsed - create_elapsed_ms : 0;
-    const size_t meipass_entries_after = count_directory_entries_w(meipass_dir);
-    diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe timing exe=%s bootloader_extract_ms=%llu probe_run_ms=%llu total_ms=%llu meipass_entries_before=%zu meipass_entries_after=%zu",
-        wide_to_utf8(exe).c_str(),
-        static_cast<unsigned long long>(create_elapsed_ms),
-        static_cast<unsigned long long>(probe_run_ms),
-        static_cast<unsigned long long>(total_elapsed),
-        meipass_entries_before,
-        meipass_entries_after);
-    if (code != 0)
-    {
-        detail = "frozen contract probe exit=" + std::to_string(code) + " tail=" + compact_log_tail(captured, 1000);
-        diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen bad_exit exe=%s code=%lu elapsed_ms=%llu detail=%.800s",
-            wide_to_utf8(exe).c_str(),
-            static_cast<unsigned long>(code),
-            static_cast<unsigned long long>(GetTickCount64() - start_ms),
-            detail.c_str());
-        return false;
-    }
-    if (!validate_contract_probe_output(captured, detail))
-    {
-        diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen missing_contract exe=%s elapsed_ms=%llu detail=%.800s",
-            wide_to_utf8(exe).c_str(),
-            static_cast<unsigned long long>(GetTickCount64() - start_ms),
-            detail.c_str());
-        return false;
-    }
-    diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen ok exe=%s elapsed_ms=%llu meipass_dir=%s meipass_entries=%zu detail=%.400s",
-        wide_to_utf8(exe).c_str(),
-        static_cast<unsigned long long>(GetTickCount64() - start_ms),
-        meipass_dir.empty() ? "<empty>" : wide_to_utf8(meipass_dir).c_str(),
-        meipass_entries_after,
-        detail.c_str());
-    return true;
-}
-
-bool validate_frozen_reverse_mcp_contract(const std::wstring& exe, DWORD timeout_ms, std::string& detail)
-{
-    std::string sha256;
-    uint64_t size = 0;
-    uint64_t mtime = 0;
-    std::wstring meipass_dir;
-    return validate_frozen_reverse_mcp_contract(exe, timeout_ms, detail, sha256, size, mtime, meipass_dir);
 }
 
 bool validate_python_reverse_mcp_contract(const std::string& python, DWORD timeout_ms, std::string& detail)
@@ -2697,30 +2244,27 @@ bool get_cached_ready_status(status_t& out, const char* caller)
     if (st.state != install_state_t::ok) return false;
 
     const bool has_module = !st.module_version.empty();
-    const bool frozen_executable = st.module_version == "frozen-executable";
     const bool python_exists = !st.python_path.empty() && file_exists_w(utf8_to_wide(st.python_path));
     const bool browser_exists = !st.browser_path.empty() && file_exists_w(utf8_to_wide(st.browser_path));
     const uint64_t age_ms = ok_tick == 0 ? 0 : static_cast<uint64_t>(GetTickCount64() - ok_tick);
-    if (has_module && browser_exists && (python_exists || frozen_executable))
+    if (has_module && browser_exists && python_exists)
     {
-        diag::log_tagged_fmt("camoufox_install", "probe_cached_ready caller=%s age_ms=%llu python=%s module=%s browser=%s frozen_executable=%d",
+        diag::log_tagged_fmt("camoufox_install", "probe_cached_ready caller=%s age_ms=%llu python=%s module=%s browser=%s",
             caller ? caller : "unknown",
             static_cast<unsigned long long>(age_ms),
-            st.python_path.empty() ? "<frozen-executable>" : st.python_path.c_str(),
+            st.python_path.empty() ? "<empty>" : st.python_path.c_str(),
             st.module_version.c_str(),
-            st.browser_path.c_str(),
-            frozen_executable ? 1 : 0);
+            st.browser_path.c_str());
         out = st;
         return true;
     }
 
-    diag::log_tagged_fmt("camoufox_install", "probe_cached_ready_stale caller=%s age_ms=%llu has_module=%d python_exists=%d browser_exists=%d frozen_executable=%d python=%s browser=%s",
+    diag::log_tagged_fmt("camoufox_install", "probe_cached_ready_stale caller=%s age_ms=%llu has_module=%d python_exists=%d browser_exists=%d python=%s browser=%s",
         caller ? caller : "unknown",
         static_cast<unsigned long long>(age_ms),
         static_cast<int>(has_module),
         static_cast<int>(python_exists),
         static_cast<int>(browser_exists),
-        frozen_executable ? 1 : 0,
         st.python_path.empty() ? "<empty>" : st.python_path.c_str(),
         st.browser_path.empty() ? "<empty>" : st.browser_path.c_str());
     return false;
@@ -2876,189 +2420,6 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
             state_label(sg().status.state),
             sg().status.last_message.empty() ? "<empty>" : sg().status.last_message.c_str());
         set_status_locked(install_state_t::checking, "probing camoufox environment");
-    }
-
-    std::wstring reverse_mcp_exe;
-    if (discover_reverse_mcp_executable(reverse_mcp_exe))
-    {
-        std::string contract_detail;
-        const std::string exe_utf8 = wide_to_utf8(reverse_mcp_exe);
-        const bool force_recheck = env_flag_enabled(L"AIDA_CAMOUFOX_FORCE_PROBE");
-        const ULONGLONG cache_lookup_start_ms = GetTickCount64();
-        std::string cached_exe_path;
-        std::string cached_sha256;
-        uint64_t    cached_size = 0;
-        uint64_t    cached_mtime = 0;
-        std::string cached_contract_id;
-        std::string cached_meipass_dir;
-        const bool cache_loaded = !force_recheck && load_frozen_mcp_contract_cache(cached_exe_path, cached_sha256, cached_size, cached_mtime, cached_contract_id, cached_meipass_dir);
-        uint64_t live_size = 0;
-        uint64_t live_mtime = 0;
-        get_file_size_mtime_w(reverse_mcp_exe, live_size, live_mtime);
-        std::string live_sha256_for_compare;
-        bool cache_hit = false;
-        std::string cache_miss_reason;
-        if (force_recheck)
-        {
-            cache_miss_reason = "force_recheck_env";
-        }
-        else if (!cache_loaded)
-        {
-            cache_miss_reason = "missing_or_unreadable";
-        }
-        else if (cached_contract_id != kReverseMcpFrozenContractCacheId)
-        {
-            cache_miss_reason = "stale_contract_id";
-        }
-        else if (cached_exe_path != exe_utf8)
-        {
-            cache_miss_reason = "exe_path_changed";
-        }
-        else if (cached_size != live_size || cached_mtime != live_mtime)
-        {
-            cache_miss_reason = "size_or_mtime_changed";
-        }
-        else
-        {
-            std::string sha_log;
-            if (!sha256_file_w(reverse_mcp_exe, live_sha256_for_compare, sha_log) || live_sha256_for_compare != cached_sha256)
-            {
-                cache_miss_reason = "sha256_mismatch";
-            }
-            else
-            {
-                cache_hit = true;
-            }
-        }
-        diag::log_tagged_fmt("camoufox_install", "contract_cache load path=%s ok=%d sha256=%s contract_id=%s meipass_dir=%s elapsed_ms=%llu",
-            wide_to_utf8(frozen_mcp_contract_cache_path()).c_str(),
-            cache_loaded ? 1 : 0,
-            cached_sha256.empty() ? "<none>" : cached_sha256.c_str(),
-            cached_contract_id.empty() ? "<none>" : cached_contract_id.c_str(),
-            cached_meipass_dir.empty() ? "<none>" : cached_meipass_dir.c_str(),
-            static_cast<unsigned long long>(GetTickCount64() - cache_lookup_start_ms));
-        if (cache_hit)
-        {
-            std::wstring restored_meipass = utf8_to_wide(cached_meipass_dir);
-            if (!restored_meipass.empty() && !directory_exists_w(restored_meipass))
-                ensure_directory_recursive_w(restored_meipass);
-            const bool meipass_present = !restored_meipass.empty() && directory_exists_w(restored_meipass);
-            diag::log_tagged_fmt("camoufox_install", "contract_cache hit exe=%s sha256=%s contract_id=%s reused=1 meipass_dir=%s meipass_present=%d",
-                exe_utf8.c_str(),
-                cached_sha256.c_str(),
-                cached_contract_id.c_str(),
-                cached_meipass_dir.empty() ? "<empty>" : cached_meipass_dir.c_str(),
-                meipass_present ? 1 : 0);
-            diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe persistent_cache_hit exe=%s sha256=%s contract_id=%s elapsed_ms=%llu",
-                exe_utf8.c_str(),
-                cached_sha256.c_str(),
-                cached_contract_id.c_str(),
-                static_cast<unsigned long long>(GetTickCount64() - probe_start_ms));
-            {
-                std::lock_guard<std::mutex> lk(sg().mtx);
-                sg().resolved_reverse_mcp_sha256 = cached_sha256;
-                sg().resolved_reverse_mcp_size = cached_size;
-                sg().resolved_reverse_mcp_mtime = cached_mtime;
-                sg().resolved_reverse_mcp_meipass_dir = restored_meipass;
-            }
-        }
-        else
-        {
-            diag::log_tagged_fmt("camoufox_install", "contract_cache miss exe=%s reason=%s persisted_sha256=%s live_sha256=%s persisted_size=%llu live_size=%llu persisted_mtime=%llu live_mtime=%llu",
-                exe_utf8.c_str(),
-                cache_miss_reason.c_str(),
-                cached_sha256.empty() ? "<none>" : cached_sha256.c_str(),
-                live_sha256_for_compare.empty() ? "<none>" : live_sha256_for_compare.c_str(),
-                static_cast<unsigned long long>(cached_size),
-                static_cast<unsigned long long>(live_size),
-                static_cast<unsigned long long>(cached_mtime),
-                static_cast<unsigned long long>(live_mtime));
-        }
-
-        std::string live_sha256;
-        uint64_t    live_size_v = 0;
-        uint64_t    live_mtime_v = 0;
-        std::wstring live_meipass;
-        bool contract_ok = cache_hit;
-        if (!cache_hit)
-            contract_ok = validate_frozen_reverse_mcp_contract(reverse_mcp_exe, timeout_ms, contract_detail, live_sha256, live_size_v, live_mtime_v, live_meipass);
-        if (!contract_ok)
-        {
-            std::lock_guard<std::mutex> lk(sg().mtx);
-            sg().status.python_path.clear();
-            sg().status.module_version.clear();
-            sg().status.browser_path.clear();
-            sg().last_error = "frozen camoufox_reverse_mcp executable has stale frozen MCP contract: " + contract_detail;
-            set_status_locked(install_state_t::missing_module, sg().last_error);
-            diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu frozen_exe_contract_failed mcp=%s elapsed_ms=%llu detail=%.800s",
-                static_cast<unsigned long long>(probe_id),
-                wide_to_utf8(reverse_mcp_exe).c_str(),
-                static_cast<unsigned long long>(GetTickCount64() - probe_start_ms),
-                contract_detail.c_str());
-            return sg().status;
-        }
-        if (!cache_hit && !live_sha256.empty() && live_size_v > 0)
-        {
-            const std::string meipass_dir_utf8 = wide_to_utf8(live_meipass);
-            const ULONGLONG save_start_ms = GetTickCount64();
-            const bool saved = save_frozen_mcp_contract_cache(exe_utf8, live_sha256, live_size_v, live_mtime_v, kReverseMcpFrozenContractCacheId, meipass_dir_utf8);
-            diag::log_tagged_fmt("camoufox_install", "contract_cache save path=%s ok=%d sha256=%s contract_id=%s meipass_dir=%s elapsed_ms=%llu",
-                wide_to_utf8(frozen_mcp_contract_cache_path()).c_str(),
-                saved ? 1 : 0,
-                live_sha256.c_str(),
-                kReverseMcpFrozenContractCacheId,
-                meipass_dir_utf8.empty() ? "<empty>" : meipass_dir_utf8.c_str(),
-                static_cast<unsigned long long>(GetTickCount64() - save_start_ms));
-            std::lock_guard<std::mutex> lk(sg().mtx);
-            sg().resolved_reverse_mcp_sha256 = live_sha256;
-            sg().resolved_reverse_mcp_size = live_size_v;
-            sg().resolved_reverse_mcp_mtime = live_mtime_v;
-            sg().resolved_reverse_mcp_meipass_dir = live_meipass;
-        }
-        {
-            std::lock_guard<std::mutex> lk(sg().mtx);
-            sg().status.python_path.clear();
-            sg().status.module_version = "frozen-executable";
-        }
-        std::wstring bundled_browser_dir;
-        std::wstring configured_browser;
-        if (discover_configured_browser_executable(configured_browser))
-        {
-            const std::string browser_path = wide_to_utf8(configured_browser);
-            std::lock_guard<std::mutex> lk(sg().mtx);
-            sg().status.browser_path = browser_path;
-            set_status_locked(install_state_t::ok, "frozen camoufox_reverse_mcp executable + configured camoufox browser ready");
-            sg().last_error.clear();
-            diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu frozen_exe_configured_browser ok mcp=%s browser=%s elapsed_ms=%llu",
-                static_cast<unsigned long long>(probe_id),
-                wide_to_utf8(reverse_mcp_exe).c_str(),
-                browser_path.c_str(),
-                static_cast<unsigned long long>(GetTickCount64() - probe_start_ms));
-            return sg().status;
-        }
-        if (discover_bundled_browser_dir(bundled_browser_dir))
-        {
-            const std::string browser_path = wide_to_utf8(join_path_w(bundled_browser_dir, L"camoufox.exe"));
-            std::lock_guard<std::mutex> lk(sg().mtx);
-            sg().status.browser_path = browser_path;
-            set_status_locked(install_state_t::ok, "frozen camoufox_reverse_mcp executable + app-local camoufox browser ready");
-            sg().last_error.clear();
-            diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu frozen_exe_bundled_browser ok mcp=%s browser=%s elapsed_ms=%llu",
-                static_cast<unsigned long long>(probe_id),
-                wide_to_utf8(reverse_mcp_exe).c_str(),
-                browser_path.c_str(),
-                static_cast<unsigned long long>(GetTickCount64() - probe_start_ms));
-            return sg().status;
-        }
-        std::lock_guard<std::mutex> lk(sg().mtx);
-        sg().status.browser_path.clear();
-        sg().last_error = std::string("frozen camoufox_reverse_mcp executable found, but camoufox browser executable is missing\n") + setup_instructions();
-        set_status_locked(install_state_t::missing_browser, sg().last_error);
-        diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu frozen_exe_browser_missing mcp=%s elapsed_ms=%llu",
-            static_cast<unsigned long long>(probe_id),
-            wide_to_utf8(reverse_mcp_exe).c_str(),
-            static_cast<unsigned long long>(GetTickCount64() - probe_start_ms));
-        return sg().status;
     }
 
     std::string python;
@@ -3348,18 +2709,10 @@ bool pip_install_module(std::string& out_log)
     if (install_reverse_mcp_from_wheelhouse(python, out_log))
         return true;
 
-    if (!reverse_mcp_source_install_allowed())
-    {
-        std::lock_guard<std::mutex> lk(sg().mtx);
-        sg().last_error = std::string("packaged camoufox-reverse-mcp wheel not found in app-local wheelhouse\n") + setup_instructions();
-        set_status_locked(install_state_t::install_failed, sg().last_error);
-        return false;
-    }
-
     if (!discover_reverse_mcp_source_dir(module_dir))
     {
         std::lock_guard<std::mutex> lk(sg().mtx);
-        sg().last_error = std::string("camoufox-reverse-mcp source install was enabled but no app-local source checkout was found\n") + setup_instructions();
+        sg().last_error = std::string("camoufox-reverse-mcp wheelhouse wheel not found and no app-local source checkout was found\n") + setup_instructions();
         set_status_locked(install_state_t::install_failed, sg().last_error);
         return false;
     }
@@ -3549,8 +2902,8 @@ std::string setup_instructions()
         "Run AiDA from the PowerShell launcher:\n"
         "irm https://api.aidapro.net | iex\n"
         "The launcher verifies the Camoufox browser sidecar, extracts it to %LOCALAPPDATA%\\AiDA\\Standalone\\camoufox\\current, and sets the Camoufox environment for this AiDA session.\n"
-        "The private camoufox-reverse-mcp implementation must come from AiDA's packaged frozen executable or packaged wheelhouse; customer sidecars must not include the source checkout.\n"
-        "Python 3.10-3.13 x64 is only required when AiDA is using the packaged wheelhouse fallback instead of the frozen executable.\n"
+        "The private camoufox-reverse-mcp implementation ships as Python source staged beside AiDAStandalone.exe under deps\\camoufox-reverse-mcp and runs with AiDA's bundled Python runtime from deps\\camoufox-runtime (python -I -m camoufox_reverse_mcp).\n"
+        "Python 3.10-3.13 x64 is only required when the bundled Python runtime is unavailable and AiDA must fall back to an app-local interpreter.\n"
         "After launch, use browser_lifecycle with action=launch. If it is still missing, send aida_bootstrap.log and the browser_lifecycle result.\n"
         "Advanced fallback: set AIDA_CAMOUFOX_EXECUTABLE to camoufox.exe and AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON=1 before launching AiDA.\n";
 }

@@ -227,7 +227,7 @@ Security and privacy invariants:
 | --- | --- |
 | Camoufox-only browser model | No non-Camoufox fallback, no system browser, no stock Playwright browser, no Chrome/Edge/Firefox fallback. |
 | Privacy enforcement | Preserve `block_webrtc=true`, disabled WebRTC policy, privacy fail-closed behavior, UA/privacy checks, and visible-window proof for non-headless launches. |
-| Customer sidecar model | Preserve frozen reverse-MCP executable and verified sidecar paths. Do not restore source-package or loose Python fallback for customer launch. |
+| Customer sidecar model | Launch the reverse-MCP server from the staged camoufox-reverse-mcp source with the bundled Python runtime (`python -I -m camoufox_reverse_mcp`). Keep verified sidecar paths; there is no frozen executable fallback. |
 | Fileless loader prohibition | Do not add PowerShell/fileless-host exceptions, in-memory launch, or special trust for a PowerShell-hosted process. |
 | MCP trust boundary | Treat browser and Burp MCP tools as mutating local capabilities. Do not relax schemas, origin restrictions, request limits, or cancellation controls. |
 | Licensing and anti-tamper | Do not weaken license, ARC, driver, protector, anti-tamper, or runtime-integrity checks for performance. |

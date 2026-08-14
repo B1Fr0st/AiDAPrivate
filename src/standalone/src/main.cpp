@@ -6135,13 +6135,11 @@ static void log_disk_backed_startup_state(const char* phase)
     char module[MAX_PATH] = {};
     char cwd[MAX_PATH] = {};
     char camoufox_exe[MAX_PATH] = {};
-    char camoufox_mcp[MAX_PATH] = {};
     char camoufox_python[MAX_PATH] = {};
     char camoufox_setup[32] = {};
     GetModuleFileNameA(nullptr, module, static_cast<DWORD>(sizeof(module)));
     GetCurrentDirectoryA(static_cast<DWORD>(sizeof(cwd)), cwd);
     GetEnvironmentVariableA("AIDA_CAMOUFOX_EXECUTABLE", camoufox_exe, static_cast<DWORD>(sizeof(camoufox_exe)));
-    GetEnvironmentVariableA("AIDA_CAMOUFOX_MCP_EXECUTABLE", camoufox_mcp, static_cast<DWORD>(sizeof(camoufox_mcp)));
     GetEnvironmentVariableA("AIDA_CAMOUFOX_PYTHON", camoufox_python, static_cast<DWORD>(sizeof(camoufox_python)));
     GetEnvironmentVariableA("AIDA_CAMOUFOX_ALLOW_SETUP_BOOTSTRAP", camoufox_setup, static_cast<DWORD>(sizeof(camoufox_setup)));
 
@@ -6163,14 +6161,13 @@ static void log_disk_backed_startup_state(const char* phase)
         VirtualQuery(image, &mbi, sizeof(mbi));
 
     diag::log_tagged_critical_fmt("main",
-        "disk_backed_startup_state phase=%s pid=%lu tid=%lu module=%s cwd=%s camoufox_exe=%s camoufox_mcp=%s camoufox_python=%s camoufox_setup=%s image_base=0x%016llX alloc_base=0x%016llX mbi_base=0x%016llX mbi_size=0x%llX mbi_state=0x%08lX mbi_protect=0x%08lX teb=0x%016llX peb=0x%016llX tls_vector=0x%016llX tls_slot51=0x%016llX",
+        "disk_backed_startup_state phase=%s pid=%lu tid=%lu module=%s cwd=%s camoufox_exe=%s camoufox_python=%s camoufox_setup=%s image_base=0x%016llX alloc_base=0x%016llX mbi_base=0x%016llX mbi_size=0x%llX mbi_state=0x%08lX mbi_protect=0x%08lX teb=0x%016llX peb=0x%016llX tls_vector=0x%016llX tls_slot51=0x%016llX",
         phase ? phase : "",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         module,
         cwd,
         camoufox_exe,
-        camoufox_mcp,
         camoufox_python,
         camoufox_setup,
         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(image)),

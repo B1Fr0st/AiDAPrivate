@@ -31,7 +31,6 @@ struct launch_config_t {
     bool enable_trace = false;
     std::string python_executable;
     std::string browser_executable;
-    std::string server_executable;
     std::string server_module = "camoufox_reverse_mcp";
     std::vector<std::string> extra_args;
     int launch_timeout_ms = 120000;

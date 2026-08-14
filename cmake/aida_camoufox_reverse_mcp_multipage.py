@@ -3964,7 +3964,6 @@ def main() -> None:
     bases = [
         ROOT / "deps" / "camoufox-reverse-mcp" / "src" / "camoufox_reverse_mcp",
         ROOT / "deps" / "camoufox-runtime" / "Lib" / "site-packages" / "camoufox_reverse_mcp",
-        ROOT / "deps" / "AiDA_CamoufoxReverseMcp" / "_internal" / "camoufox_reverse_mcp",
     ]
     patched = 0
     for base in bases:

@@ -2170,7 +2170,6 @@ json camoufox_args(const json& params, bool preserve_action)
     args.erase("launch_timeout_ms");
     args.erase("python_executable");
     args.erase("browser_executable");
-    args.erase("server_executable");
     args.erase("server_module");
     args.erase("publish_to_burp");
     args.erase("burp_source");
@@ -2389,7 +2388,6 @@ camoufox::launch_config_t launch_config_from_mcp_params(const json& params)
     cfg.enable_trace = json_bool_param(params, "enable_trace", cfg.enable_trace);
     cfg.python_executable = json_string_param(params, "python_executable", cfg.python_executable);
     cfg.browser_executable = json_string_param(params, "browser_executable", cfg.browser_executable);
-    cfg.server_executable = json_string_param(params, "server_executable", cfg.server_executable);
     cfg.launch_timeout_ms = json_int_param(params, "launch_timeout_ms", cfg.launch_timeout_ms);
     cfg.window_width = json_int_param(params, "window_width", json_int_param(params, "width", cfg.window_width));
     cfg.window_height = json_int_param(params, "window_height", json_int_param(params, "height", cfg.window_height));
@@ -3278,7 +3276,6 @@ void register_camoufox_reverse_tools(mcp_standalone::server_t& srv)
              {"enable_trace", "boolean", "Enable engine-level property access tracing", false},
              {"python_executable", "string", "Optional Python path for developer sessions", false},
              {"browser_executable", "string", "Optional camoufox.exe path", false},
-             {"server_executable", "string", "Optional AiDA-owned frozen reverse-MCP executable path", false},
              {"launch_timeout_ms", "number", "Requested launch timeout in milliseconds", false},
              {"window_width", "number", "Initial browser window width", false},
              {"window_height", "number", "Initial browser window height", false}},

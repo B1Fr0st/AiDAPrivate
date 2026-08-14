@@ -19,9 +19,6 @@
 !build-host.ps1
 !build-host.cmd
 !CMakePresets.json
-!/packaging/
-/packaging/*
-!/packaging/c03_camoufox_reverse_mcp_build.lock.json
 
 # ==========================================
 # 2. EXCLUSIONS (These override the allows)
@@ -94,6 +91,7 @@ models.json
 /libdecomp/
 /libs/
 /mapper/
+/packaging/
 /sources/
 
 # Excluded specific files

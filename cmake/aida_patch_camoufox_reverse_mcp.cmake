@@ -6,7 +6,6 @@ set(AIDA_CAMOUFOX_REPO_MCP_ROOT "${CMAKE_CURRENT_LIST_DIR}/../camoufox-reverse-m
 set(AIDA_CAMOUFOX_STAGE_MCP_ROOTS
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-reverse-mcp/src/camoufox_reverse_mcp"
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-runtime/Lib/site-packages/camoufox_reverse_mcp"
-    "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/AiDA_CamoufoxReverseMcp/_internal/camoufox_reverse_mcp"
 )
 set(AIDA_CAMOUFOX_SOURCE_SYNC_FILES
     "browser.py"
@@ -282,7 +281,6 @@ endforeach()
 set(AIDA_CAMOUFOX_NAV_PATCH_FILES
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-reverse-mcp/src/camoufox_reverse_mcp/tools/navigation.py"
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-runtime/Lib/site-packages/camoufox_reverse_mcp/tools/navigation.py"
-    "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/AiDA_CamoufoxReverseMcp/_internal/camoufox_reverse_mcp/tools/navigation.py"
 )
 
 foreach(AIDA_CAMOUFOX_NAV_PATCH_FILE IN LISTS AIDA_CAMOUFOX_NAV_PATCH_FILES)
@@ -403,7 +401,6 @@ endforeach()
 set(AIDA_CAMOUFOX_PATCH_FILES
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-reverse-mcp/src/camoufox_reverse_mcp/browser.py"
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-runtime/Lib/site-packages/camoufox_reverse_mcp/browser.py"
-    "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/AiDA_CamoufoxReverseMcp/_internal/camoufox_reverse_mcp/browser.py"
 )
 
 foreach(AIDA_CAMOUFOX_PATCH_FILE IN LISTS AIDA_CAMOUFOX_PATCH_FILES)
@@ -2055,7 +2052,6 @@ endforeach()
 set(AIDA_CAMOUFOX_HOOKING_PATCH_FILES
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-reverse-mcp/src/camoufox_reverse_mcp/tools/hooking.py"
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-runtime/Lib/site-packages/camoufox_reverse_mcp/tools/hooking.py"
-    "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/AiDA_CamoufoxReverseMcp/_internal/camoufox_reverse_mcp/tools/hooking.py"
 )
 
 foreach(AIDA_CAMOUFOX_HOOKING_PATCH_FILE IN LISTS AIDA_CAMOUFOX_HOOKING_PATCH_FILES)
