@@ -148,7 +148,8 @@ workspace_result_t<std::string> normalize_module_path(std::string value) {
         return workspace_result_t<std::string>::success(folded);
     auto normalized = normalize_utf8_path(value, false);
     if (normalized)
-        return normalized;
+        return workspace_result_t<std::string>::success(
+            normalize_target_name(normalized.take_value()));
     return workspace_result_t<std::string>::failure(normalized.error());
 }
 
