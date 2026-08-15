@@ -1423,7 +1423,7 @@ workspace_result_t<std::shared_ptr<analysis_workspace_t>> workspace_registry_t::
     identity_input.image_base = image_base;
     identity_input.process = metadata.process;
     auto attested_module = metadata.module;
-    attested_module.content_hash = attestation.value().header_hash;
+    attested_module.content_hash = metadata.capture_hash;
     identity_input.module = std::move(attested_module);
     auto identity_result = make_workspace_identity(std::move(identity_input));
     if (!identity_result)
@@ -1433,7 +1433,6 @@ workspace_result_t<std::shared_ptr<analysis_workspace_t>> workspace_registry_t::
     auto provider = provider_result.take_value();
     workspace_provider_binding_t binding{provider_hash,
         provider->identity().normalized_source, provider->size()};
-    binding.live_module_generation_hash = attestation.value().header_hash;
     auto workspace_result = analysis_workspace_t::create(
         identity_result.take_value(),
         std::static_pointer_cast<const byte_provider_t>(provider), {}, std::move(binding));
