@@ -211,6 +211,17 @@ function Write-Summary {
     Write-Host "SUMMARY $StableSummaryPath"
 }
 
+$runtimeLogs = @(
+    (Join-Path $BuildDir "aida_debug.log"),
+    (Join-Path $BuildDir "aida_early_startup.log"),
+    (Join-Path $BuildDir "WindMapper_debug.log")
+)
+foreach ($logPath in $runtimeLogs) {
+    if (Test-Path -LiteralPath $logPath) {
+        Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $steps = New-Object System.Collections.Generic.List[object]
 $BuildParallelArg = ""
 if (-not [string]::IsNullOrWhiteSpace($env:AIDA_BUILD_JOBS)) {
