@@ -126,7 +126,7 @@ workspace_result_t<process_identity_t> query_process_identity(std::uint32_t pid)
     process_identity_t identity;
     identity.pid = pid;
     identity.creation_time_100ns = filetime_value(creation);
-    identity.normalized_process_path = normalized_result.take_value();
+    identity.normalized_process_path = normalize_target_name(normalized_result.take_value());
     return workspace_result_t<process_identity_t>::success(std::move(identity));
 }
 

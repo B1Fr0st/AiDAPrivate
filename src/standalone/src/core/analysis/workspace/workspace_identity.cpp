@@ -620,8 +620,8 @@ make_workspace_identity(workspace_identity_input_t input) {
         if (!process_path || !module_path)
             return workspace_result_t<std::shared_ptr<const workspace_identity_t>>::failure(
                 !process_path ? process_path.error() : module_path.error());
-        input.process->normalized_process_path = process_path.take_value();
-        input.module->normalized_path = module_path.take_value();
+        input.process->normalized_process_path = normalize_target_name(process_path.take_value());
+        input.module->normalized_path = normalize_target_name(module_path.take_value());
         auto module_name = utf8_to_wide(input.module->normalized_name);
         if (!module_name)
             return workspace_result_t<std::shared_ptr<const workspace_identity_t>>::failure(
