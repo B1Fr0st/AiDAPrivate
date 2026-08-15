@@ -14671,7 +14671,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
         });
         stale_result["isError"] = true;
         stale_result["_meta"]["diagnostics"] = diagnostics;
-        stale_result["structuredContent"]["error"] = {
+        stale_result["_meta"]["error"] = json{
             {"code", "MCP_LATE_RESULT_DISCARDED"},
             {"message", "MCP late tool result was fenced and discarded before delivery."},
             {"details", delivery_evidence}
@@ -14744,7 +14744,6 @@ json server_t::handle_tools_call(const json& id, const json& params)
         if (has_structured_tool_error(tr)) {
             json err = structured_tool_error(tr);
             result["_meta"]["error"] = err;
-            result["structuredContent"]["error"] = std::move(err);
         }
     }
     if (tr.meta.is_object()) {

@@ -35,6 +35,7 @@ json summary_to_json(const analysis_session::session_summary_t& s)
 {
 	json o;
 	o["id"] = s.id;
+	o["binary_id"] = s.binary_id;
 	o["kind"] = (s.kind == analysis_session::session_kind_t::live_attach) ? "live" : "file";
 	o["path"] = s.path;
 	o["filename"] = s.filename;
