@@ -407,9 +407,7 @@ live_snapshot_provider_t::capture(const live_snapshot_request_t& request,
     metadata.capture_size = request.capture_size;
     metadata.capture_time_100ns = filetime_value(capture_time);
     metadata.capture_hash = hash_result.take_value();
-    if (metadata.capture_address == metadata.module.base &&
-        metadata.capture_size == metadata.module.size)
-        metadata.module.content_hash = metadata.capture_hash;
+    metadata.module.content_hash = metadata.capture_hash;
     byte_provider_identity_t provider_identity;
     provider_identity.normalized_source =
         "live://" + std::to_string(request.pid) + "/" + metadata.module.normalized_name + "@" +
