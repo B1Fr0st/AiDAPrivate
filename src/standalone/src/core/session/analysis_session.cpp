@@ -2789,9 +2789,23 @@ acquire_static_workspace(const std::string& path,
         const std::uint32_t hardware_lanes = std::thread::hardware_concurrency();
         settings.decode_worker_lanes = (std::clamp)(hardware_lanes / 2u, 2u, 8u);
         settings.overlap_strings_with_decode = false;
+        const double budget_ratio = static_cast<double>(adaptive.max_analysis_memory_bytes) /
+            static_cast<double>(16ULL * 1024ULL * 1024ULL * 1024ULL);
+        settings.max_decoded_instructions = static_cast<std::uint64_t>(
+            settings.max_decoded_instructions * budget_ratio);
+        settings.max_coverage_spans = static_cast<std::uint64_t>(
+            settings.max_coverage_spans * budget_ratio);
+        settings.max_strings = static_cast<std::uint64_t>(
+            settings.max_strings * budget_ratio);
+        settings.max_seed_count = static_cast<std::uint64_t>(
+            settings.max_seed_count * budget_ratio);
+        settings.max_decode_queue = static_cast<std::uint64_t>(
+            settings.max_decode_queue * budget_ratio);
         diag::log_tagged_fmt("analysis_session",
-            "adaptive_budget_low_memory decode_worker_lanes=%u overlap_strings_with_decode=0 hardware_concurrency=%u",
-            settings.decode_worker_lanes, hardware_lanes);
+            "adaptive_budget_low_memory decode_worker_lanes=%u overlap_strings_with_decode=0 hardware_concurrency=%u budget_ratio=%.3f max_decoded=%llu max_strings=%llu",
+            settings.decode_worker_lanes, hardware_lanes, budget_ratio,
+            static_cast<unsigned long long>(settings.max_decoded_instructions),
+            static_cast<unsigned long long>(settings.max_strings));
     }
     open_static_workspace_request_t request;
     request.source_path = path;
