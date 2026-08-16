@@ -12588,7 +12588,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
     }
 
     if (explicit_target && !session_manager) {
-        if (tool.read_only && !tool.workspace_handler) {
+        if (!tool.workspace_handler) {
             auto workspace = analysis_session::active_workspace();
             if (workspace && !workspace->closing() && !workspace->closed()) {
                 set_tool_metrics_lane(metrics, "shared_workspace_read", 0);
