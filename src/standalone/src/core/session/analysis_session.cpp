@@ -888,12 +888,19 @@ workspace_result_t<bool> reopen_persisted_analysis(
     const std::shared_ptr<workspace_database_t>& database,
     const cancellation_token_t& cancel)
 {
+    diag::log_tagged("analysis_session", "reopen_persisted load_snapshot begin");
     auto loaded = database->load_snapshot(workspace->normalized_image(), workspace->image(), cancel);
+    diag::log_tagged_fmt("analysis_session", "reopen_persisted load_snapshot ok=%d has_value=%d",
+        loaded ? 1 : 0, (loaded && loaded.value()) ? 1 : 0);
     if (!loaded)
         return workspace_result_t<bool>::failure(loaded.error());
     if (!loaded.value())
         return workspace_result_t<bool>::success(false);
     const auto& snapshot = loaded.value();
+    if (snapshot->functions.empty() && snapshot->strings.empty()) {
+        diag::log_tagged("analysis_session", "reopen_persisted snapshot has 0 functions and 0 strings — ignoring stale DB, starting fresh baseline");
+        return workspace_result_t<bool>::success(false);
+    }
     const auto current_publication = workspace->analysis_publication();
     if (!current_publication || !current_publication->provider)
         return workspace_result_t<bool>::failure(make_workspace_error(
@@ -2849,23 +2856,33 @@ acquire_static_workspace(const std::string& path,
         return workspace_result_t<static_workspace_acquisition_t>::success(
             std::move(result));
     }
+    diag::log_tagged("analysis_session", "acquire_static reopen_persisted begin");
     auto reopened = reopen_persisted_analysis(workspace, database, cancel);
+    diag::log_tagged_fmt("analysis_session", "acquire_static reopen_persisted ok=%d value=%d",
+        reopened ? 1 : 0, (reopened && reopened.value()) ? 1 : 0);
     if (!reopened) return fail(reopened.error());
     if (reopened.value()) {
+        diag::log_tagged("analysis_session", "acquire_static skipping baseline (reopen returned true)");
         result.joined_existing = true;
         return workspace_result_t<static_workspace_acquisition_t>::success(
             std::move(result));
     }
     progress = workspace->progress();
+    diag::log_tagged_fmt("analysis_session", "acquire_static readiness=%u after reopen",
+        static_cast<unsigned>(progress.readiness));
     if (progress.readiness == workspace_readiness_t::analyzing ||
         progress.readiness == workspace_readiness_t::baseline_ready ||
         progress.readiness == workspace_readiness_t::partial) {
+        diag::log_tagged("analysis_session", "acquire_static skipping baseline (already analyzing/ready)");
         result.joined_existing = true;
         return workspace_result_t<static_workspace_acquisition_t>::success(
             std::move(result));
     }
+    diag::log_tagged("analysis_session", "acquire_static starting baseline_analysis_service_t::start");
     auto started = baseline_analysis_service_t::start(workspace, settings,
         cancel.deadline());
+    diag::log_tagged_fmt("analysis_session", "acquire_static baseline start ok=%d",
+        started ? 1 : 0);
     if (!started) {
         if (started.error().code == workspace_error_code_t::analysis_in_progress) {
             progress = workspace->progress();

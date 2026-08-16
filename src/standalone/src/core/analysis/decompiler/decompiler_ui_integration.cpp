@@ -1766,8 +1766,14 @@ decompiler_ui_integration_t::production_for_workspace(
         }
     }
     auto created = create_production(workspace);
-    if (!created)
+    if (!created) {
+        diag::log_tagged_fmt("decompiler_ui", "create_production failed phase=%s code=%u msg=%s",
+            created.error().phase.c_str(),
+            static_cast<unsigned>(created.error().code),
+            created.error().message.c_str());
         return created;
+    }
+    diag::log_tagged("decompiler_ui", "create_production ok");
     std::shared_ptr<decompiler_ui_integration_t> evicted;
     {
         std::lock_guard lock(production_cache_mutex);

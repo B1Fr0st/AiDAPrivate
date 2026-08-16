@@ -337,11 +337,19 @@ baseline_analysis_service_t::start(
         return workspace_result_t<aida::infra::taskflow_runtime::job_handle_t>::failure(
             std::move(error));
     }
+    diag::log_tagged_fmt("baseline_pipeline", "start entry workspace=%p generation=%llu analysis_revision=%llu",
+        reinterpret_cast<void*>(workspace.get()),
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long long>(analysis_revision));
     auto analysis_run = workspace->try_begin_analysis(generation);
     if (!analysis_run) {
+        diag::log_tagged_fmt("baseline_pipeline", "try_begin_analysis failed code=%u msg=%s",
+            static_cast<unsigned>(analysis_run.error().code),
+            analysis_run.error().message.c_str());
         return workspace_result_t<aida::infra::taskflow_runtime::job_handle_t>::failure(
             analysis_run.error());
     }
+    diag::log_tagged("baseline_pipeline", "try_begin_analysis ok");
     analysis_fabric_metrics_t::instance().ensure_sampler_started();
     const auto task_priority = settings.task_priority;
     const auto enable_parallel_fact_passes = settings.enable_parallel_fact_passes;
