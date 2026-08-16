@@ -354,11 +354,17 @@ baseline_analysis_service_t::start(
     const auto task_priority = settings.task_priority;
     const auto enable_parallel_fact_passes = settings.enable_parallel_fact_passes;
     const auto overlap_strings_with_decode = settings.overlap_strings_with_decode;
+    diag::log_tagged("baseline_pipeline", "pe_baseline_analyzer_t::create begin");
     auto created = pe_baseline_analyzer_t::create(workspace, std::move(settings),
         generation, analysis_revision, deadline);
-    if (!created)
+    if (!created) {
+        diag::log_tagged_fmt("baseline_pipeline", "pe_baseline_analyzer_t::create failed code=%u msg=%s",
+            static_cast<unsigned>(created.error().code),
+            created.error().message.c_str());
         return workspace_result_t<aida::infra::taskflow_runtime::job_handle_t>::failure(
             created.error());
+    }
+    diag::log_tagged("baseline_pipeline", "pe_baseline_analyzer_t::create ok");
     auto analyzer = created.take_value();
     auto lifecycle = std::make_shared<baseline_job_lifecycle_t>(analyzer);
     auto state = std::make_shared<baseline_job_state_t>(analyzer,
@@ -366,11 +372,15 @@ baseline_analysis_service_t::start(
     state->retain_lifecycle(lifecycle);
     auto registered = workspace->register_lifecycle_participant(lifecycle);
     if (!registered) {
+        diag::log_tagged_fmt("baseline_pipeline", "register_lifecycle_participant failed code=%u msg=%s",
+            static_cast<unsigned>(registered.error().code),
+            registered.error().message.c_str());
         analyzer->report_failure(registered.error());
         state->mark_terminal();
         return workspace_result_t<aida::infra::taskflow_runtime::job_handle_t>::failure(
             registered.error());
     }
+    diag::log_tagged("baseline_pipeline", "register_lifecycle_participant ok");
     aida::infra::taskflow_runtime::graph_descriptor_t graph;
     graph.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
     graph.owner_subsystem = "analysis_workspace";
@@ -530,8 +540,10 @@ baseline_analysis_service_t::start(
     graph_schedule->submitted_ns.store(analysis_metrics_t::steady_now_ns(),
         std::memory_order_release);
     analyzer->metrics()->set(analysis_metric_t::tasks_scheduled, graph.nodes.size());
+    diag::log_tagged_fmt("baseline_pipeline", "submit_graph nodes=%zu domain=feature_worker", graph.nodes.size());
     auto submitted = aida::infra::taskflow_runtime::submit_graph(std::move(graph));
     if (!submitted.submitted) {
+        diag::log_tagged_fmt("baseline_pipeline", "submit_graph REJECTED reason=%s", submitted.reject_reason.c_str());
         if (submitted.handle.id != 0) {
             lifecycle->set_handle(submitted.handle);
             lifecycle->request_cancel();
@@ -553,6 +565,7 @@ baseline_analysis_service_t::start(
             std::move(error));
     }
     lifecycle->set_handle(submitted.handle);
+    diag::log_tagged_fmt("baseline_pipeline", "submit_graph ok job_id=%llu", static_cast<unsigned long long>(submitted.handle.id));
     return workspace_result_t<aida::infra::taskflow_runtime::job_handle_t>::success(
         submitted.handle);
 }
