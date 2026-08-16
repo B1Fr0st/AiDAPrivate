@@ -3128,7 +3128,8 @@ bool open_attach_session(
         ? aida::analysis::architecture_mode_t::x86_64
         : aida::analysis::architecture_mode_t::x86_32;
     request.snapshot.capture_size = (std::min<std::uint64_t>)(source_identity.module.size,
-                                                               64ull * 1024ull);
+                                                               4ull * 1024ull * 1024ull);
+    request.snapshot.maximum_capture_size = 4ull * 1024ull * 1024ull;
     request.format = is_64_bit
         ? aida::analysis::format_id_t::pe32_plus
         : aida::analysis::format_id_t::pe32;

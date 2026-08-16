@@ -12588,6 +12588,13 @@ static tool_result_t invoke_tool_with_concurrency_policy(
     }
 
     if (explicit_target && !session_manager) {
+        if (tool.read_only && !tool.workspace_handler) {
+            auto workspace = analysis_session::active_workspace();
+            if (workspace && !workspace->closing() && !workspace->closed()) {
+                set_tool_metrics_lane(metrics, "shared_workspace_read", 0);
+                return invoke_tool_with_registry_scope(tool, arguments, handler, metrics, "shared_workspace_read");
+            }
+        }
         set_tool_metrics_lane(metrics, "explicit_target_workspace_handler_required", 0);
         diag::log_tagged_fmt("mcp_srv",
             "tool_policy_lane tool='%s' lane=explicit_target_workspace_handler_required read_only=%d explicit_target=1 disposition=not_started",
