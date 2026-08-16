@@ -798,9 +798,12 @@ workspace_result_t<void> install_workspace_services(
         return workspace_result_t<void>::success();
     };
 
+    diag::log_tagged("analysis_session", "install_workspace_services begin");
     auto database = workspace->database();
     if (!database) {
+        diag::log_tagged("analysis_session", "install_workspace_services opening database");
         auto opened = workspace_database_t::open(expected);
+        diag::log_tagged_fmt("analysis_session", "install_workspace_services database opened ok=%d", opened ? 1 : 0);
         if (!opened)
             return workspace_result_t<void>::failure(opened.error());
         auto registered = workspace->register_lifecycle_participant(opened.value());
@@ -843,8 +846,10 @@ workspace_result_t<void> install_workspace_services(
             "analysis_session.services.queue"));
     }
 
+    diag::log_tagged("analysis_session", "install_workspace_services overlay begin");
     if (!workspace->overlay()) {
         auto opened = overlay_journal_t::open(workspace, database);
+        diag::log_tagged_fmt("analysis_session", "install_workspace_services overlay opened ok=%d", opened ? 1 : 0);
         if (!opened && !workspace->overlay())
             return workspace_result_t<void>::failure(opened.error());
     }
@@ -855,9 +860,11 @@ workspace_result_t<void> install_workspace_services(
             "analysis_session.services.overlay"));
     }
 
+    diag::log_tagged("analysis_session", "install_workspace_services decompiler begin");
     if (!workspace->decompiler()) {
         auto created = decompiler_service_t::create(
             workspace, database, expected.versions);
+        diag::log_tagged_fmt("analysis_session", "install_workspace_services decompiler created ok=%d", created ? 1 : 0);
         if (!created && !workspace->decompiler())
             return workspace_result_t<void>::failure(created.error());
     }
@@ -867,9 +874,11 @@ workspace_result_t<void> install_workspace_services(
             "Workspace decompiler installation did not publish a service",
             "analysis_session.services.decompiler"));
     }
+    diag::log_tagged("analysis_session", "install_workspace_services batch_orchestrator begin");
     if (!workspace->background_decompile()) {
         (void)decompile_batch_orchestrator_t::create(workspace, workspace->background_metrics());
     }
+    diag::log_tagged("analysis_session", "install_workspace_services end");
     database_out = std::move(database);
     return workspace_result_t<void>::success();
 }
@@ -3204,11 +3213,13 @@ bool open_attach_session(
         rollback_attach(workspace);
         return false;
     }
+    diag::log_tagged("analysis_session", "open_attach workbench attach begin");
     {
         aida::workbench::workbench_shell_workspace_context_t workbench_context;
         const auto workbench_attached =
             aida::workbench::workbench_shell_runtime_t::instance()
                 .attach_analysis_workspace(workspace, workbench_context);
+        diag::log_tagged_fmt("analysis_session", "open_attach workbench attach done ok=%d", workbench_attached ? 1 : 0);
         if (!workbench_attached) {
             diag::log_tagged_fmt(
                 "analysis_session",
@@ -3218,6 +3229,7 @@ bool open_attach_session(
                 static_cast<unsigned long long>(workbench_attached.subject));
         }
     }
+    diag::log_tagged("analysis_session", "open_attach session create begin");
     auto session = std::make_shared<analysis_session_t>();
     bool session_limit_reached = false;
     size_t session_index = static_cast<size_t>(-1);
@@ -3265,7 +3277,9 @@ bool open_attach_session(
         return false;
     }
     std::string activation_error;
+    diag::log_tagged("analysis_session", "open_attach activate_session begin");
     if (!activate_session_transaction(session_index, &activation_error)) {
+        diag::log_tagged_fmt("analysis_session", "open_attach activate_session failed error='%s'", activation_error.c_str());
         {
             std::lock_guard<std::mutex> lock(state().mutex);
             const auto iterator = std::find(state().sessions.begin(), state().sessions.end(), session);
@@ -3278,8 +3292,10 @@ bool open_attach_session(
         rollback_attach(workspace);
         return false;
     }
+    diag::log_tagged("analysis_session", "open_attach activate_session done");
     const bool stealth = stealth_engine::ensure_default_enabled(pid,
         "analysis_session.open_attach");
+    diag::log_tagged_fmt("analysis_session", "open_attach stealth done stealth=%d", stealth ? 1 : 0);
     diag::log_tagged_fmt("analysis_session",
         "open_attach_session session=%s source_pid=%u process_creation_100ns=%llu process_path=%s module_name=%s module_path=%s module_base=0x%llX module_size=%llu capture_time_100ns=%llu capture_size=%llu capture_sha256=%s staleness=NONE stealth=%d",
         session->id.c_str(), pid,

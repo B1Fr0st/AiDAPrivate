@@ -446,7 +446,7 @@ void schedule_drain(const std::shared_ptr<queue_state_t>& state) {
     }
 
     aida::infra::taskflow_runtime::graph_descriptor_t graph;
-    graph.domain = aida::infra::taskflow_runtime::executor_domain_t::service;
+    graph.domain = aida::infra::taskflow_runtime::executor_domain_t::general;
     graph.owner_subsystem = "analysis_persistence";
     graph.label = "analysis.persistence.drain";
     graph.phase = "persistence";
