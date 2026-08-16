@@ -2784,53 +2784,14 @@ acquire_static_workspace(const std::string& path,
     }
     baseline_analysis_settings_t settings;
     const auto& adaptive = adaptive_budget_fields();
-    settings.max_analysis_memory_bytes = adaptive.max_analysis_memory_bytes;
+    settings.max_analysis_memory_bytes = 16ULL * 1024ULL * 1024ULL * 1024ULL;
     if (adaptive.low_memory) {
         const std::uint32_t hardware_lanes = std::thread::hardware_concurrency();
         settings.decode_worker_lanes = (std::clamp)(hardware_lanes / 2u, 2u, 8u);
         settings.overlap_strings_with_decode = false;
-        const double budget_ratio = static_cast<double>(adaptive.max_analysis_memory_bytes) /
-            static_cast<double>(16ULL * 1024ULL * 1024ULL * 1024ULL);
-        settings.max_decoded_instructions = static_cast<std::uint64_t>(
-            settings.max_decoded_instructions * budget_ratio);
-        settings.max_coverage_spans = static_cast<std::uint64_t>(
-            settings.max_coverage_spans * budget_ratio);
-        settings.max_strings = static_cast<std::uint64_t>(
-            settings.max_strings * budget_ratio);
-        settings.max_seed_count = static_cast<std::uint64_t>(
-            settings.max_seed_count * budget_ratio);
-        settings.max_decode_queue = static_cast<std::uint64_t>(
-            settings.max_decode_queue * budget_ratio);
-        settings.tile_decode_limits.maximum_instructions = static_cast<std::uint64_t>(
-            settings.tile_decode_limits.maximum_instructions * budget_ratio);
-        settings.tile_decode_limits.maximum_operand_facts = static_cast<std::uint64_t>(
-            settings.tile_decode_limits.maximum_operand_facts * budget_ratio);
-        settings.tile_decode_limits.maximum_target_facts = static_cast<std::uint64_t>(
-            settings.tile_decode_limits.maximum_target_facts * budget_ratio);
-        settings.tile_decode_limits.maximum_edges = static_cast<std::uint64_t>(
-            settings.tile_decode_limits.maximum_edges * budget_ratio);
-        settings.tile_decode_limits.maximum_coverage_spans = static_cast<std::uint64_t>(
-            settings.tile_decode_limits.maximum_coverage_spans * budget_ratio);
-        settings.function_limits.max_result_bytes = static_cast<std::uint64_t>(
-            settings.function_limits.max_result_bytes * budget_ratio);
-        settings.call_graph_limits.max_result_bytes = static_cast<std::uint64_t>(
-            settings.call_graph_limits.max_result_bytes * budget_ratio);
-        settings.data_limits.max_result_bytes = static_cast<std::uint64_t>(
-            settings.data_limits.max_result_bytes * budget_ratio);
-        settings.xref_limits.max_result_bytes = static_cast<std::uint64_t>(
-            settings.xref_limits.max_result_bytes * budget_ratio);
-        settings.string_limits.max_result_bytes = static_cast<std::uint64_t>(
-            settings.string_limits.max_result_bytes * budget_ratio);
-        settings.symbol_type_limits.max_result_bytes = static_cast<std::uint64_t>(
-            settings.symbol_type_limits.max_result_bytes * budget_ratio);
-        settings.search_limits.max_index_bytes = static_cast<std::uint64_t>(
-            settings.search_limits.max_index_bytes * budget_ratio);
         diag::log_tagged_fmt("analysis_session",
-            "adaptive_budget_low_memory decode_worker_lanes=%u overlap_strings_with_decode=0 hardware_concurrency=%u budget_ratio=%.3f max_decoded=%llu max_strings=%llu max_operand_facts=%llu",
-            settings.decode_worker_lanes, hardware_lanes, budget_ratio,
-            static_cast<unsigned long long>(settings.max_decoded_instructions),
-            static_cast<unsigned long long>(settings.max_strings),
-            static_cast<unsigned long long>(settings.tile_decode_limits.maximum_operand_facts));
+            "adaptive_budget_low_memory decode_worker_lanes=%u overlap_strings_with_decode=0 hardware_concurrency=%u (memory budget overridden to 16GB default for settings compatibility)",
+            settings.decode_worker_lanes, hardware_lanes);
     }
     open_static_workspace_request_t request;
     request.source_path = path;
