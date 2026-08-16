@@ -2215,6 +2215,10 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_phase(const std::atomic<
         decode_seeds.push_back(
             {seed.address, seed.provenance, seed.confidence, seed.stable_source_id});
     }
+    diag::log_tagged_fmt("baseline_pipeline", "decode_phase begin seeds=%zu executable_bytes=%llu workers=%u",
+        decode_seeds.size(),
+        static_cast<unsigned long long>(impl_->executable_bytes()),
+        workers);
     progressive_materialize_bridge_t materialize_bridge(*impl_);
     auto decoded = orchestrator.value().run_shared(*impl_->provider_snapshot,
         *impl_->image_layout, *impl_->decode_partition, std::move(decode_seeds),
