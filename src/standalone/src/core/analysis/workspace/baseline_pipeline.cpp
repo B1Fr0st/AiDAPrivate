@@ -358,9 +358,13 @@ baseline_analysis_service_t::start(
     auto created = pe_baseline_analyzer_t::create(workspace, std::move(settings),
         generation, analysis_revision, deadline);
     if (!created) {
-        diag::log_tagged_fmt("baseline_pipeline", "pe_baseline_analyzer_t::create failed code=%u msg=%s",
+        std::string details;
+        for (const auto& d : created.error().details)
+            details += d.first + "=" + d.second + " ";
+        diag::log_tagged_fmt("baseline_pipeline", "pe_baseline_analyzer_t::create failed code=%u msg=%s details=%s",
             static_cast<unsigned>(created.error().code),
-            created.error().message.c_str());
+            created.error().message.c_str(),
+            details.c_str());
         return workspace_result_t<aida::infra::taskflow_runtime::job_handle_t>::failure(
             created.error());
     }
