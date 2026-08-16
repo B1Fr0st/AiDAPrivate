@@ -5344,9 +5344,17 @@ namespace mcp_standalone
                 lease.identity.normalized_source_path =
                     context.workspace->identity().normalized_source_path();
                 lease.identity.sha256 = context.binary_id.to_hex();
-                lease.identity.generation = wave_c_workspace_generation(context);
-                lease.identity.analysis_revision = context.analysis_revision;
-                lease.identity.overlay_revision = context.overlay_revision;
+                lease.image = context.workspace->normalized_image();
+                lease.analysis = context.workspace->snapshot();
+                if (lease.analysis) {
+                    lease.identity.generation = lease.analysis->generation;
+                    lease.identity.analysis_revision = lease.analysis->analysis_revision;
+                    lease.identity.overlay_revision = lease.analysis->overlay_revision;
+                } else {
+                    lease.identity.generation = wave_c_workspace_generation(context);
+                    lease.identity.analysis_revision = context.analysis_revision;
+                    lease.identity.overlay_revision = context.overlay_revision;
+                }
                 lease.identity.live =
                     context.kind == aida::analysis::target_kind_t::live_snapshot;
                 if (lease.identity.live) {

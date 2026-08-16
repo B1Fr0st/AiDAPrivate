@@ -2,6 +2,7 @@
 
 #include "../ida_contracts_generated.hpp"
 #include "../../../analysis/workspace/compact_ir.hpp"
+#include "../../../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <array>
@@ -675,10 +676,6 @@ validation_failure_t validate_lease(const survey_generation_lease_t& lease,
         return invalid_value("lease.pid", "valid_process_id_required", 0);
     }
     if (lease.analysis) {
-        if (!lease.image) {
-            return invalid_value(
-                "lease.image", "analysis_image_lease_required", nullptr);
-        }
         if (lease.analysis->generation != lease.identity.generation) {
             return invalid_value(
                 "lease.analysis.generation", "immutable_generation_mismatch",
@@ -1615,6 +1612,22 @@ protocol::mcp_result_t survey_handlers_t::dispatch(
     }
     auto lease = std::move(acquired).take_value();
     if (auto failure = validate_lease(lease, limits_)) {
+        diag::log_tagged_fmt("survey",
+            "lease_inconsistent has_analysis=%d has_image=%d generation=%llu analysis_gen=%llu"
+            " analysis_rev=%llu identity_rev=%llu overlay_rev=%llu identity_overlay=%llu"
+            " workspace_id='%s' bin_name='%s' source_path='%s' pid=%d",
+            lease.analysis ? 1 : 0,
+            lease.image ? 1 : 0,
+            static_cast<unsigned long long>(lease.identity.generation),
+            lease.analysis ? static_cast<unsigned long long>(lease.analysis->generation) : 0ULL,
+            lease.analysis ? static_cast<unsigned long long>(lease.analysis->analysis_revision) : 0ULL,
+            static_cast<unsigned long long>(lease.identity.analysis_revision),
+            lease.analysis ? static_cast<unsigned long long>(lease.analysis->overlay_revision) : 0ULL,
+            static_cast<unsigned long long>(lease.identity.overlay_revision),
+            lease.identity.workspace_id.c_str(),
+            lease.identity.bin_name.c_str(),
+            lease.identity.normalized_source_path.c_str(),
+            lease.identity.pid ? static_cast<int>(*lease.identity.pid) : -1);
         return protocol::mcp_result_t::failure(
             protocol::result_error_code_t::handler_failed,
             "Survey generation lease is inconsistent.",
