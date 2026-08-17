@@ -2091,8 +2091,8 @@ workspace_result_t<void> pe_baseline_analyzer_t::seed_phase(const std::atomic<bo
     impl_->seeds = merged.take_sorted(fact_workers);
     const auto exec_bytes = impl_->executable_bytes();
     const std::uint64_t seed_cap = (std::min)(
-        static_cast<std::uint64_t>(512),
-        (std::max)(static_cast<std::uint64_t>(16), exec_bytes / 64));
+        static_cast<std::uint64_t>(128),
+        (std::max)(static_cast<std::uint64_t>(16), exec_bytes / 512));
     if (impl_->seeds.size() > seed_cap) {
         diag::log_tagged_fmt("baseline_pipeline",
             "seed_cap applying cap=%llu original=%llu exec_bytes=%llu",
@@ -2136,10 +2136,13 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_phase(const std::atomic<
         impl_->settings.max_decode_queue,
         static_cast<std::uint64_t>((std::numeric_limits<std::uint32_t>::max)()));
     auto limits = impl_->settings.tile_decode_limits;
+    const auto frontier_seed_cap = static_cast<std::uint64_t>(
+        impl_->seeds.size() * 8);
     limits.maximum_frontier_seeds = (std::min)({
         limits.maximum_frontier_seeds,
         impl_->settings.max_seed_count,
-        impl_->settings.max_decode_queue});
+        impl_->settings.max_decode_queue,
+        (std::max)(frontier_seed_cap, static_cast<std::uint64_t>(128))});
     limits.maximum_frontier_wave = (std::min)(
         limits.maximum_frontier_wave, executor_queue_limit);
     limits.maximum_decode_requests = (std::min)(
