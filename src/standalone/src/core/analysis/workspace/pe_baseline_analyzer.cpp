@@ -2089,6 +2089,18 @@ workspace_result_t<void> pe_baseline_analyzer_t::seed_phase(const std::atomic<bo
         output.candidates = seed_candidate_set_t{};
     }
     impl_->seeds = merged.take_sorted(fact_workers);
+    const auto exec_bytes = impl_->executable_bytes();
+    const std::uint64_t seed_cap = (std::min)(
+        static_cast<std::uint64_t>(512),
+        (std::max)(static_cast<std::uint64_t>(16), exec_bytes / 64));
+    if (impl_->seeds.size() > seed_cap) {
+        diag::log_tagged_fmt("baseline_pipeline",
+            "seed_cap applying cap=%llu original=%llu exec_bytes=%llu",
+            static_cast<unsigned long long>(seed_cap),
+            static_cast<unsigned long long>(impl_->seeds.size()),
+            static_cast<unsigned long long>(exec_bytes));
+        impl_->seeds.resize(static_cast<std::size_t>(seed_cap));
+    }
     auto progress = impl_->update_progress_slot(baseline_progress_slot_t::seed,
         "seed", impl_->seeds.size(), impl_->seeds.size(), 0,
         impl_->executable_bytes());
