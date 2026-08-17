@@ -1999,6 +1999,15 @@ workspace_result_t<void> pe_baseline_analyzer_t::seed_phase(const std::atomic<bo
                 break;
             }
             case 4: {
+                const auto existing_seeds = producer_outputs[0].candidates.size() +
+                    producer_outputs[1].candidates.size() +
+                    producer_outputs[2].candidates.size();
+                if (existing_seeds >= 32) {
+                    diag::log_tagged_fmt("baseline_pipeline",
+                        "seed_producer skipping relocation seeds (existing=%llu >= 32)",
+                        static_cast<unsigned long long>(existing_seeds));
+                    break;
+                }
                 for (const auto& relocation : impl_->image->relocations) {
                     if (!relocation.target)
                         continue;
@@ -2048,6 +2057,10 @@ workspace_result_t<void> pe_baseline_analyzer_t::seed_phase(const std::atomic<bo
     const auto fact_workers = impl_->settings.fact_pass_worker_budget;
     parallel_executor_t::run(producer_outputs.size(), fact_workers,
         "baseline.seed", run_producer);
+    for (std::size_t i = 0; i < producer_outputs.size(); ++i) {
+        diag::log_tagged_fmt("baseline_pipeline", "seed_producer[%zu] count=%zu",
+            i, producer_outputs[i].candidates.size());
+    }
     for (auto& output : producer_outputs) {
         if (output.error)
             return workspace_result_t<void>::failure(std::move(*output.error));
