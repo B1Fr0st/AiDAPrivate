@@ -3223,8 +3223,11 @@ workspace_result_t<void> supervise_phase(decode_run_context_t& ctx,
                 orchestrator_error(workspace_error_code_t::integrity_failure,
                     "tile decode orchestration failed"));
         }
-        if (ctx.pool != nullptr && ctx.pool->has_fatal())
+        if (ctx.pool != nullptr && ctx.pool->has_fatal()) {
+            if (ctx.pool != nullptr)
+                ctx.pool->request_stop();
             return workspace_result_t<void>::failure(ctx.pool->fatal_error());
+        }
         if (ctx.cancellation->stop_requested())
             return workspace_result_t<void>::failure(
                 cancellation_error(*ctx.cancellation, cancel_message));
