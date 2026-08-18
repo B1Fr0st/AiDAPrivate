@@ -1529,6 +1529,10 @@ void pool_completion_signal(void* context)
 
 void record_run_failure(decode_run_context_t& ctx, workspace_error_t error)
 {
+    ::diag::log_tagged_fmt("tile_decode",
+        "record_run_failure code=%u msg=%s",
+        static_cast<unsigned>(error.code),
+        error.message.c_str());
     {
         std::lock_guard<std::mutex> lock(ctx.failure_mutex);
         if (!ctx.first_error.has_value())
@@ -2455,9 +2459,8 @@ workspace_result_t<bool> shard_lease_recursive_wave(
         const bool watermark_tracked =
             seed.tile_id >= shard.tile_begin && seed.tile_id < shard.tile_end;
         if (!watermark_tracked) {
-            return workspace_result_t<bool>::failure(
-                orchestrator_error(workspace_error_code_t::integrity_failure,
-                    "recursive decode seed references a foreign tile", seed.rva));
+            ++shard.stats.wave_seeds_coalesced;
+            continue;
         }
         const auto tile_local =
             static_cast<std::size_t>(seed.tile_id - shard.tile_begin);
@@ -2866,6 +2869,12 @@ workspace_result_t<bool> shard_lease_step(decode_run_context_t& ctx,
             shard.requests_in_flight.erase(request_it);
             if (!completion.succeeded()) {
                 auto error = *completion.error;
+                ::diag::log_tagged_fmt("tile_decode",
+                    "completion_error request_id=%llu tile_id=%u code=%u msg=%s",
+                    static_cast<unsigned long long>(request.request_id),
+                    static_cast<unsigned>(request.tile_id),
+                    static_cast<unsigned>(error.code),
+                    error.message.c_str());
                 error.details.emplace_back("request_id",
                     std::to_string(request.request_id));
                 error.details.emplace_back("tile_id",
@@ -2874,8 +2883,14 @@ workspace_result_t<bool> shard_lease_step(decode_run_context_t& ctx,
             }
             auto processed = shard_process_records(ctx, shard, request,
                 completion.records, request.pass == tile_decode_pass_t::recursive);
-            if (!processed)
+            if (!processed) {
+                ::diag::log_tagged_fmt("tile_decode",
+                    "shard_process_records failed request_id=%llu code=%u msg=%s",
+                    static_cast<unsigned long long>(request.request_id),
+                    static_cast<unsigned>(processed.error().code),
+                    processed.error().message.c_str());
                 return workspace_result_t<bool>::failure(processed.error());
+            }
             shard.in_flight.fetch_sub(1, std::memory_order_acq_rel);
             if (out_of_order_gap)
                 ++shard.stats.gap_out_of_order_apply_count;
@@ -3197,8 +3212,13 @@ workspace_result_t<void> supervise_phase(decode_run_context_t& ctx,
     for (;;) {
         if (ctx.failed.load(std::memory_order_acquire)) {
             std::lock_guard<std::mutex> lock(ctx.failure_mutex);
-            if (ctx.first_error.has_value())
+            if (ctx.first_error.has_value()) {
+                ::diag::log_tagged_fmt("tile_decode",
+                    "supervise_phase returning failure code=%u msg=%s",
+                    static_cast<unsigned>(ctx.first_error->code),
+                    ctx.first_error->message.c_str());
                 return workspace_result_t<void>::failure(*ctx.first_error);
+            }
             return workspace_result_t<void>::failure(
                 orchestrator_error(workspace_error_code_t::integrity_failure,
                     "tile decode orchestration failed"));
@@ -4016,12 +4036,21 @@ tile_decode_orchestrator_t::run_impl(
         } else {
             recursive_phase_ns = stage1_ns;
         }
-        ::diag::log_tagged_fmt("tile_decode",
-            driven ? "phase=stage1 done wall_us=%llu tiles=%llu shards=%u"
-                   : "phase=stage1 failed wall_us=%llu tiles=%llu shards=%u",
-            static_cast<unsigned long long>(stage1_ns / 1000ULL),
-            static_cast<unsigned long long>(range_tile_count),
-            shard_count);
+        if (driven) {
+            ::diag::log_tagged_fmt("tile_decode",
+                "phase=stage1 done wall_us=%llu tiles=%llu shards=%u",
+                static_cast<unsigned long long>(stage1_ns / 1000ULL),
+                static_cast<unsigned long long>(range_tile_count),
+                shard_count);
+        } else {
+            ::diag::log_tagged_fmt("tile_decode",
+                "phase=stage1 failed wall_us=%llu tiles=%llu shards=%u code=%u msg=%s",
+                static_cast<unsigned long long>(stage1_ns / 1000ULL),
+                static_cast<unsigned long long>(range_tile_count),
+                shard_count,
+                static_cast<unsigned>(driven.error().code),
+                driven.error().message.c_str());
+        }
         if (!driven)
             return workspace_result_t<tile_decode_orchestration_result_t>::failure(
                 driven.error());
@@ -4047,9 +4076,10 @@ tile_decode_orchestrator_t::run_impl(
         decode_run_context_t::phase_reconcile, "reconcile",
         "cross-tile instruction reconciliation cancelled",
         "cross-tile instruction reconciliation cancelled", reconcile_phase_ns);
-    if (!driven)
-        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-            driven.error());
+        if (!driven) {
+            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                driven.error());
+        }
 
     {
         const auto fixup_begin = std::chrono::steady_clock::now();

@@ -159,7 +159,8 @@ tile_decode_completion_t decode_item(decode_worker_pool_t::worker_state_t& worke
         completion.error = worker.create_error;
         return completion;
     }
-    if (impl.cancellation.stop_requested()) {
+    if (impl.stop.load(std::memory_order_acquire) ||
+        impl.cancellation.stop_requested()) {
         completion.error = pool_cancelled_error();
         return completion;
     }
@@ -336,6 +337,8 @@ void worker_main_body(decode_worker_pool_t::worker_state_t& worker,
         const auto worker_count =
             static_cast<std::uint32_t>(impl.workers.size());
         for (;;) {
+            if (impl.stop.load(std::memory_order_acquire))
+                break;
             impl.hook_active.fetch_add(1, std::memory_order_seq_cst);
             void* hook_context = nullptr;
             const auto hook = pool_hook(impl, hook_context);
@@ -349,6 +352,8 @@ void worker_main_body(decode_worker_pool_t::worker_state_t& worker,
             } else {
                 impl.hook_active.fetch_sub(1, std::memory_order_seq_cst);
             }
+            if (impl.stop.load(std::memory_order_acquire))
+                break;
             decode_work_item_t item;
             if (try_pop_own(worker, item)) {
                 run_item(worker, impl, std::move(item));
@@ -719,8 +724,6 @@ void decode_worker_pool_t::clear_lease_hook() noexcept
     impl_->hook.store(nullptr, std::memory_order_release);
     for (auto& worker : impl_->workers)
         worker->cv.notify_all();
-    while (impl_->hook_active.load(std::memory_order_seq_cst) != 0)
-        std::this_thread::yield();
 }
 
 void decode_worker_pool_t::set_completion_signal(completion_signal_t signal,
@@ -733,8 +736,6 @@ void decode_worker_pool_t::set_completion_signal(completion_signal_t signal,
 void decode_worker_pool_t::clear_completion_signal() noexcept
 {
     impl_->completion_signal.store(nullptr, std::memory_order_seq_cst);
-    while (impl_->completion_signal_active.load(std::memory_order_seq_cst) != 0)
-        std::this_thread::yield();
 }
 
 decode_worker_pool_statistics_t decode_worker_pool_t::statistics() const noexcept

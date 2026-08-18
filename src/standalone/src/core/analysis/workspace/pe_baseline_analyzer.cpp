@@ -2136,19 +2136,31 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_phase(const std::atomic<
         impl_->settings.max_decode_queue,
         static_cast<std::uint64_t>((std::numeric_limits<std::uint32_t>::max)()));
     auto limits = impl_->settings.tile_decode_limits;
-    const auto frontier_seed_cap = static_cast<std::uint64_t>(
-        impl_->seeds.size() * 8);
+    const auto exec_bytes_for_limits = impl_->executable_bytes();
+    const auto frontier_seed_cap = (std::max)(
+        static_cast<std::uint64_t>(512),
+        exec_bytes_for_limits / 8);
     limits.maximum_frontier_seeds = (std::min)({
         limits.maximum_frontier_seeds,
         impl_->settings.max_seed_count,
         impl_->settings.max_decode_queue,
-        (std::max)(frontier_seed_cap, static_cast<std::uint64_t>(128))});
-    limits.maximum_frontier_wave = (std::min)(
-        limits.maximum_frontier_wave, executor_queue_limit);
-    limits.maximum_decode_requests = (std::min)(
-        limits.maximum_decode_requests, impl_->settings.max_decode_queue);
-    limits.maximum_instructions = (std::min)(
-        limits.maximum_instructions, impl_->settings.max_decoded_instructions);
+        frontier_seed_cap});
+    const auto wave_cap = (std::max)(static_cast<std::uint64_t>(64),
+        static_cast<std::uint64_t>(impl_->seeds.size() * 2));
+    limits.maximum_frontier_wave = (std::min)({
+        limits.maximum_frontier_wave, executor_queue_limit, wave_cap});
+    const auto decode_request_cap = (std::max)(
+        static_cast<std::uint64_t>(256), exec_bytes_for_limits / 4);
+    limits.maximum_decode_requests = (std::min)({
+        limits.maximum_decode_requests,
+        impl_->settings.max_decode_queue,
+        decode_request_cap});
+    const auto instruction_cap = (std::max)(
+        static_cast<std::uint64_t>(1024), exec_bytes_for_limits * 4);
+    limits.maximum_instructions = (std::min)({
+        limits.maximum_instructions,
+        impl_->settings.max_decoded_instructions,
+        instruction_cap});
     limits.maximum_coverage_spans = (std::min)(
         limits.maximum_coverage_spans, impl_->settings.max_coverage_spans);
     auto orchestrator = tile_decode_orchestrator_t::create(limits);
@@ -2161,7 +2173,7 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_phase(const std::atomic<
     options.worker_count = workers;
     options.maximum_frontier_wave = limits.maximum_frontier_wave;
     options.analysis_budget.max_queued_tasks =
-        static_cast<std::uint32_t>(executor_queue_limit);
+        static_cast<std::uint32_t>((std::min)(executor_queue_limit, wave_cap));
     options.analysis_budget.max_worker_slots = workers + 1U;
     options.analysis_budget.reserved_control_worker_slots = 1;
     options.analysis_budget.max_private_bytes = impl_->settings.max_analysis_memory_bytes;
@@ -2252,8 +2264,13 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_phase(const std::atomic<
         *impl_->image_layout, *impl_->decode_partition, std::move(decode_seeds),
         *executor.value(), impl_->cancellation.token(), nullptr,
         &materialize_bridge);
-    if (!decoded)
+    if (!decoded) {
+        diag::log_tagged_fmt("baseline_pipeline",
+            "decode_phase run_shared failed, destroying executor code=%u msg=%s",
+            static_cast<unsigned>(decoded.error().code),
+            decoded.error().message.c_str());
         return workspace_result_t<void>::failure(decoded.error());
+    }
     if (const auto bridge_failure = materialize_bridge.failure())
         return workspace_result_t<void>::failure(*bridge_failure);
     auto result = decoded.take_value();
