@@ -34,10 +34,13 @@ function Resolve-VsVarsPath {
     if (-not [string]::IsNullOrWhiteSpace($Requested)) {
         $candidates.Add($Requested)
     }
+    $years = @("18", "2022")
     $editions = @("Professional", "Community", "Enterprise", "BuildTools")
-    foreach ($edition in $editions) {
-        $candidates.Add("C:\Program Files\Microsoft Visual Studio\2022\$edition\VC\Auxiliary\Build\vcvars64.bat")
-        $candidates.Add("C:\Program Files (x86)\Microsoft Visual Studio\2022\$edition\VC\Auxiliary\Build\vcvars64.bat")
+    foreach ($year in $years) {
+        foreach ($edition in $editions) {
+            $candidates.Add("C:\Program Files\Microsoft Visual Studio\$year\$edition\VC\Auxiliary\Build\vcvars64.bat")
+            $candidates.Add("C:\Program Files (x86)\Microsoft Visual Studio\$year\$edition\VC\Auxiliary\Build\vcvars64.bat")
+        }
     }
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
     if (Test-Path -LiteralPath $vswhere) {
