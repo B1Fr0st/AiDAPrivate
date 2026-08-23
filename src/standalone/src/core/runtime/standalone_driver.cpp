@@ -161,6 +161,11 @@ namespace
         return env_flag_enabled("AIDA_FULL_TEST_RUNNING");
     }
 
+    bool driver_bridge_disabled_by_env()
+    {
+        return env_flag_enabled("AIDA_DRIVER_OFF");
+    }
+
     struct process_ctx_t {
         HANDLE      h_process = nullptr;
         bool        kernel_attached = false;
@@ -3960,6 +3965,14 @@ namespace driver_bridge
                 g_kernel_mode ? 1 : 0,
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return true;
+        }
+
+        if (driver_bridge_disabled_by_env())
+        {
+            set_last_error_locked("driver bridge disabled by AIDA_DRIVER_OFF; kernel features unavailable", true);
+            driver_critical_fmt("initialize_exit reason=env_disabled elapsed_ms=%llu",
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+            return false;
         }
 
         g_remote_call_lower_executor_stop.store(false, std::memory_order_release);
