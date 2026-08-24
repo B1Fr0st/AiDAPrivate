@@ -2024,24 +2024,7 @@ namespace auth_view {
 					return;
 				}
 				try {
-					std::string base_url;
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-					base_url = entry_copy.fallback_base;
-#else
-					aida::auth::auth_info_t tmp_info;
-					tmp_info.api_key = captured_key->value;
-					std::string resolved = aida::provider::transforms::resolve_endpoint(
-						captured_id, preferred_model_id(captured_id), tmp_info);
-					if (!tmp_info.api_key.empty())
-						SecureZeroMemory(tmp_info.api_key.data(), tmp_info.api_key.size());
-					tmp_info.api_key.clear();
-					if (!resolved.empty() && resolved.rfind("http", 0) == 0) base_url = resolved;
-					if (base_url.empty()) {
-						const auto* provider = aida::provider::catalog::get_provider(captured_id);
-						if (provider && !provider->base_url.empty()) base_url = provider->base_url;
-					}
-#endif
-					if (base_url.empty()) base_url = entry_copy.fallback_base;
+					std::string base_url = entry_copy.fallback_base;
 					while (!base_url.empty() && base_url.back() == '/') base_url.pop_back();
 					std::string url = base_url + entry_copy.models_path;
 					if (!entry_copy.key_query_param.empty()) {
